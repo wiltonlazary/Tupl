@@ -1,0 +1,3 @@
+[submodule "lz4"]
+	path = lz4
+	url = git://github.com/jpountz/lz4-java.git
