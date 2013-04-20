@@ -211,16 +211,8 @@ public class CompressedPageArray extends PageArray {
     }
 
     private static byte[] keyFor(long index) {
-        // TODO: Re-use Utils.writeInt48BE.
         byte[] key = new byte[6];
-        int w = (int)(index >> 32);
-        key[0] = (byte)(w >> 8);
-        key[1] = (byte)w;
-        w = (int)index;
-        key[2] = (byte)(w >> 24);
-        key[3] = (byte)(w >> 16);
-        key[4] = (byte)(w >> 8);
-        key[5] = (byte)w;
+        Utils.encodeInt48BE(key, 0, index);
         return key;
     }
 
