@@ -163,40 +163,6 @@ public class CompressedPageArray extends PageArray {
     }
 
     @Override
-    public void writePageDurably(long index, byte[] buf) throws IOException {
-        // TODO: Use stream API and buffer pool.
-        byte[] comp = new byte[mMaxCompressedLength];
-        int len = mCompressor.compress(buf, 0, pageSize(), comp, 0);
-        byte[] value = new byte[len];
-        System.arraycopy(comp, 0, value, 0, len);
-        Transaction txn = mDataDb.newTransaction(DurabilityMode.SYNC);
-        try {
-            mPages.store(txn, keyFor(index), value);
-            txn.commit();
-        } catch (Throwable e) {
-            txn.reset();
-            Utils.rethrow(e);
-        }
-    }
-
-    @Override
-    public void writePageDurably(long index, byte[] buf, int offset) throws IOException {
-        // TODO: Use stream API and buffer pool.
-        byte[] comp = new byte[mMaxCompressedLength];
-        int len = mCompressor.compress(buf, offset, pageSize(), comp, 0);
-        byte[] value = new byte[len];
-        System.arraycopy(comp, 0, value, 0, len);
-        Transaction txn = mDataDb.newTransaction(DurabilityMode.SYNC);
-        try {
-            mPages.store(txn, keyFor(index), value);
-            txn.commit();
-        } catch (Throwable e) {
-            txn.reset();
-            Utils.rethrow(e);
-        }
-    }
-
-    @Override
     public void sync(boolean metadata) throws IOException {
         if (metadata) {
             mDataDb.checkpoint();
@@ -217,13 +183,6 @@ public class CompressedPageArray extends PageArray {
     }
 
     private static long indexFor(byte[] key) {
-        // TODO: Re-use Utils.readUnsignedInt48BE.
-        return
-            (((long)(((key[0] & 0xff) << 8 ) |
-                     ((key[1] & 0xff)      ))              ) << 32) |
-            (((long)(((key[2]       ) << 24) |
-                     ((key[3] & 0xff) << 16) |
-                     ((key[4] & 0xff) << 8 ) |
-                     ((key[5] & 0xff)      )) & 0xffffffffL)      );
+        return Utils.decodeUnsignedInt48BE(key, 0);
     }
 }
