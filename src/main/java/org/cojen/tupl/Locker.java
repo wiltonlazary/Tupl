@@ -495,15 +495,17 @@ class Locker {
      * @return new parent scope
      */
     final ParentScope scopeEnter() {
-        ParentScope scope = new ParentScope();
-        scope.mParentScope = mParentScope;
+        ParentScope parent = new ParentScope();
+        parent.mParentScope = mParentScope;
         Object tailObj = mTailBlock;
-        scope.mTailBlock = tailObj;
+        parent.mTailBlock = tailObj;
         if (tailObj != null) {
-            scope.mTailBlockSize = (tailObj instanceof Block) ? (((Block) tailObj).mSize) : 1;
+            if (tailObj instanceof Block) {
+                parent.mTailBlockSize = ((Block) tailObj).mSize;
+            }
         }
-        mParentScope = scope;
-        return scope;
+        mParentScope = parent;
+        return parent;
     }
 
     /**
@@ -515,9 +517,7 @@ class Locker {
             ParentScope parent = mParentScope;
             if (tailObj instanceof Lock) {
                 if (parent.mTailBlock == null) {
-                    Lock tailLock = (Lock) tailObj;
-                    parent.mTailBlock = tailLock;
-                    mTailBlock = null;
+                    parent.mTailBlock = tailObj;
                 }
             } else {
                 Block tail = (Block) tailObj;
@@ -543,14 +543,11 @@ class Locker {
             } else {
                 Block tail = (Block) tailObj;
                 if (tail != null) {
-                    while (true) {
+                    do {
                         tail.unlockToSavepoint(this, 0);
-                        if (tail.isFirstBlock()) {
-                            break;
-                        }
                         tail = tail.pop();
-                    }
-                    mTailBlock = tail;
+                    } while (tail != null);
+                    mTailBlock = null;
                 }
             }
         } else if (parentTailObj instanceof Lock) {
@@ -558,12 +555,14 @@ class Locker {
             if (tailObj instanceof Block) {
                 Block tail = (Block) tailObj;
                 while (true) {
-                    if (tail.isFirstBlock()) {
+                    Block prev = tail.peek();
+                    if (prev == null) {
                         tail.unlockToSavepoint(this, 1);
                         break;
                     }
                     tail.unlockToSavepoint(this, 0);
-                    tail = tail.pop();
+                    tail.discard();
+                    tail = prev;
                 }
                 mTailBlock = tail;
             }
@@ -646,6 +645,7 @@ class Locker {
 
         private Lock[] mLocks;
         private long mUpgrades;
+        // Size must always be least 1.
         int mSize;
 
         private Block mPrev;
@@ -687,7 +687,7 @@ class Locker {
             // Don't push lock upgrade if it applies to the last acquisition
             // within this scope. This is required for unlockLast.
             ParentScope parent;
-            if (upgrade != 0 && size != 0
+            if (upgrade != 0
                 && ((parent = locker.mParentScope) == null || parent.mTailBlockSize != size)
                 && locks[size - 1] == lock)
             {
@@ -705,10 +705,6 @@ class Locker {
 
         Lock last() {
             return mLocks[mSize - 1];
-        }
-
-        boolean isFirstBlock() {
-            return mPrev == null;
         }
 
         void unlockLast(Locker locker) {
@@ -762,6 +758,10 @@ class Locker {
             }
         }
 
+        /**
+         * Note: If target size is zero, caller MUST pop and discard the block. Otherwise, the
+         * block size will be zero, which is illegal.
+         */
         void unlockToSavepoint(Locker locker, int targetSize) {
             int size = mSize;
             if (size > targetSize) {
@@ -794,11 +794,20 @@ class Locker {
             mPrev = null;
             return prev;
         }
+
+        Block peek() {
+            return mPrev;
+        }
+
+        void discard() {
+            mPrev = null;
+        }
     }
 
     static final class ParentScope {
         ParentScope mParentScope;
         Object mTailBlock;
+        // Must be zero if tail is not a block.
         int mTailBlockSize;
 
         // These fields are used by Transaction.
