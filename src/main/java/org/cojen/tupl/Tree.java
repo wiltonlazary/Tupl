@@ -352,6 +352,13 @@ final class Tree implements Index {
     */
 
     @Override
+    public Stream newStream() {
+        TreeCursor cursor = new TreeCursor(this);
+        cursor.autoload(false);
+        return new TreeValueStream(cursor);
+    }
+
+    @Override
     public View viewGe(byte[] key) {
         return BoundedView.viewGe(this, key);
     }
@@ -391,6 +398,14 @@ final class Tree implements Index {
         return isClosed();
     }
 
+    /**
+     * Returns a view which can be passed to an observer. Internal trees are returned as
+     * unmodifiable.
+     */
+    Index observableView() {
+        return isInternal(mId) ? new UnmodifiableView(this) : this;
+    }
+
     @Override
     public boolean verify(VerificationObserver observer) throws IOException {
         if (observer == null) {
@@ -402,14 +417,6 @@ final class Tree implements Index {
         boolean passed = !observer.failed;
         observer.indexComplete(view, passed, null);
         return passed;
-    }
-
-    /**
-     * Returns a view which can be passed to an observer. Internal trees are returned as
-     * unmodifiable.
-     */
-    Index observableView() {
-        return isInternal(mId) ? new UnmodifiableView(this) : this;
     }
 
     /**
