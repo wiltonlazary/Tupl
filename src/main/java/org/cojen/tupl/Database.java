@@ -292,6 +292,9 @@ public final class Database implements CauseCloseable {
         } else if (pageSize > MAXIMUM_PAGE_SIZE) {
             throw new IllegalArgumentException
                 ("Page size is too large: " + pageSize + " > " + MAXIMUM_PAGE_SIZE);
+        } else if ((pageSize & 1) != 0) {
+            throw new IllegalArgumentException
+                ("Page size must be even: " + pageSize);
         }
 
         int minCache, maxCache;
@@ -1315,6 +1318,33 @@ public final class Database implements CauseCloseable {
          */
         public long transactionsCreated() {
             return mTxnsCreated;
+        }
+
+        @Override
+        public int hashCode() {
+            long hash = mFreePages;
+            hash = hash * 31 + mTotalPages;
+            hash = hash * 31 + mTxnsCreated;
+            return (int) scramble(hash);
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (obj instanceof Stats) {
+                Stats other = (Stats) obj;
+                return mPageSize == other.mPageSize
+                    && mFreePages == other.mFreePages
+                    && mTotalPages == other.mTotalPages
+                    && mOpenIndexes == other.mOpenIndexes
+                    && mLockCount == other.mLockCount
+                    && mCursorCount == other.mCursorCount
+                    && mTxnCount == other.mTxnCount
+                    && mTxnsCreated == other.mTxnsCreated;
+            }
+            return false;
         }
 
         @Override
@@ -2689,23 +2719,26 @@ public final class Database implements CauseCloseable {
             // Remainder fits inline, minimizing internal fragmentation. All
             // extra pages will be full. All pointers fit too; encode direct.
 
-            byte header;
+            // Conveniently, 2 is the header bit and the inline length field size.
+            int inline = remainder == 0 ? 0 : 2;
+
+            byte header = (byte) inline;
             int offset;
             if (vlength < (1L << (2 * 8))) {
-                header = 0x02; // ff = 0, i=1
+                // (2 byte length field)
                 offset = 1 + 2;
             } else if (vlength < (1L << (4 * 8))) {
-                header = 0x06; // ff = 1, i=1
+                header |= 0x04; // ff = 1 (4 byte length field)
                 offset = 1 + 4;
             } else if (vlength < (1L << (6 * 8))) {
-                header = 0x0a; // ff = 2, i=1
+                header |= 0x08; // ff = 2 (6 byte length field)
                 offset = 1 + 6;
             } else {
-                header = 0x0e; // ff = 3, i=1
+                header |= 0x0c; // ff = 3 (8 byte length field)
                 offset = 1 + 8;
             }
 
-            int poffset = offset + 2 + remainder;
+            int poffset = offset + inline + remainder;
             newValue = new byte[poffset + (int) pointerSpace];
             if (pageCount > 0) {
                 if (value == null) {
@@ -2733,8 +2766,11 @@ public final class Database implements CauseCloseable {
             }
 
             newValue[0] = header;
-            encodeShortLE(newValue, offset, remainder); // inline length
-            arrayCopyOrFill(value, 0, newValue, offset + 2, remainder);
+
+            if (remainder != 0) {
+                encodeShortLE(newValue, offset, remainder); // inline length
+                arrayCopyOrFill(value, 0, newValue, offset + 2, remainder);
+            }
         } else {
             // Remainder doesn't fit inline, so don't encode any inline
             // content. Last extra page will not be full.
