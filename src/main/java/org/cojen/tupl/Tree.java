@@ -408,6 +408,52 @@ final class Tree implements Index {
         return isInternal(mId) ? new UnmodifiableView(this) : this;
     }
 
+    /**
+     * @param view view to pass to observer
+     * @return false if compaction should stop
+     */
+    boolean compactTree(Index view, long highestNodeId, CompactionObserver observer)
+        throws IOException
+    {
+        try {
+            if (!observer.indexBegin(view)) {
+                observer.manualAbort();
+                return false;
+            }
+        } catch (Throwable e) {
+            uncaught(e);
+            return false;
+        }
+
+        TreeCursor cursor = new TreeCursor(this, Transaction.BOGUS);
+        try {
+            cursor.autoload(false);
+
+            // Find the first entry instead of calling first() to ensure that cursor is
+            // positioned. Otherwise, empty trees would be skipped even when the root node
+            // needed to be moved out of the compaction zone.
+            cursor.find(EMPTY_BYTES);
+
+            if (!cursor.compact(highestNodeId, observer)) {
+                return false;
+            }
+
+            try {
+                if (!observer.indexComplete(view)) {
+                    observer.manualAbort();
+                    return false;
+                }
+            } catch (Throwable e) {
+                uncaught(e);
+                return false;
+            }
+
+            return true;
+        } finally {
+            cursor.reset();
+        }
+    }
+
     @Override
     public boolean verify(VerificationObserver observer) throws IOException {
         if (observer == null) {

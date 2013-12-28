@@ -284,8 +284,10 @@ public final class Database implements CauseCloseable {
         final File[] dataFiles = config.dataFiles();
 
         int pageSize = config.mPageSize;
+        boolean explicitPageSize = true;
         if (pageSize <= 0) {
             config.pageSize(pageSize = DEFAULT_PAGE_SIZE);
+            explicitPageSize = false;
         } else if (pageSize < MINIMUM_PAGE_SIZE) {
             throw new IllegalArgumentException
                 ("Page size is too small: " + pageSize + " < " + MINIMUM_PAGE_SIZE);
@@ -357,7 +359,7 @@ public final class Database implements CauseCloseable {
         }
 
         try {
-            // Create lock file and write info file of properties.
+            // Create lock file, preventing database from being opened multiple times.
             if (mBaseFile == null || openMode == OPEN_TEMP) {
                 mLockFile = null;
             } else {
@@ -369,23 +371,6 @@ public final class Database implements CauseCloseable {
                 }
 
                 mLockFile = new LockedFile(lockFile, config.mReadOnly);
-
-                if (!config.mReadOnly) {
-                    File infoFile = new File(mBaseFile.getPath() + INFO_FILE_SUFFIX);
-
-                    if (factory != null) {
-                        factory.createFile(infoFile);
-                    }
-
-                    Writer w = new BufferedWriter
-                        (new OutputStreamWriter(new FileOutputStream(infoFile), "UTF-8"));
-
-                    try {
-                        config.writeInfo(w);
-                    } finally {
-                        w.close();
-                    }
-                }
             }
 
             if (openMode == OPEN_DESTROY) {
@@ -397,18 +382,39 @@ public final class Database implements CauseCloseable {
                 if (dataPageArray == null) {
                     mPageDb = new NonPageDb(pageSize);
                 } else {
-                    mPageDb = new DurablePageDb
+                    mPageDb = DurablePageDb.open
                         (dataPageArray, config.mCrypto, openMode == OPEN_DESTROY);
                 }
             } else {
                 EnumSet<OpenOption> options = config.createOpenOptions();
-                mPageDb = new DurablePageDb
-                    (pageSize, dataFiles, config.mFileFactory, options, config.mCrypto,
-                     openMode == OPEN_DESTROY);
+                mPageDb = DurablePageDb.open
+                    (explicitPageSize, pageSize,
+                     dataFiles, config.mFileFactory, options,
+                     config.mCrypto, openMode == OPEN_DESTROY);
             }
 
             // Actual page size might differ from configured size.
-            mPageSize = mPageDb.pageSize();
+            config.pageSize(mPageSize = mPageDb.pageSize());
+
+            // Write info file of properties, after database has been opened and after page
+            // size is truly known.
+            if (mBaseFile != null && openMode != OPEN_TEMP && !config.mReadOnly) {
+                File infoFile = new File(mBaseFile.getPath() + INFO_FILE_SUFFIX);
+
+                FileFactory factory = config.mFileFactory;
+                if (factory != null) {
+                    factory.createFile(infoFile);
+                }
+
+                Writer w = new BufferedWriter
+                    (new OutputStreamWriter(new FileOutputStream(infoFile), "UTF-8"));
+
+                try {
+                    config.writeInfo(w);
+                } finally {
+                    w.close();
+                }
+            }
 
             mSharedCommitLock = mPageDb.sharedCommitLock();
 
@@ -1185,8 +1191,13 @@ public final class Database implements CauseCloseable {
             // Delete old redo log files.
             deleteNumberedFiles(config.mBaseFile, REDO_FILE_SUFFIX);
 
+            int pageSize = config.mPageSize;
+            if (pageSize <= 0) {
+                pageSize = DEFAULT_PAGE_SIZE;
+            }
+
             restored = DurablePageDb.restoreFromSnapshot
-                (config.mPageSize, dataFiles, factory, options, config.mCrypto, in);
+                (pageSize, dataFiles, factory, options, config.mCrypto, in);
         }
 
         restored.close();
@@ -1427,6 +1438,143 @@ public final class Database implements CauseCloseable {
         if (c != null) {
             c.resume();
         }
+    }
+
+    /**
+     * Compacts the database by shrinking the database file. The compaction target is the
+     * desired file utilization, and it controls how much compaction should be performed. A
+     * target of 0.0 performs no compaction, and a value of 1.0 attempts to compact as much as
+     * possible.
+     *
+     * <p>Large compaction targets might require multiple passes to complete, and so a smaller
+     * target is preferred to minimize cost. A minimum target of 0.5 is recommended for the
+     * compaction to be worth the effort.
+     *
+     * <p>Compaction requires some additional storage while running, and so attempting to
+     * compact an already compact database might actually cause the file to grow slightly.
+     *
+     * @param observer optional observer; pass null for default
+     * @param target database file compaction target [0.0, 1.0]
+     * @throws IllegalArgumentException if compaction target is out of bounds
+     * @throws IllegalStateException if compaction is already in progress
+     */
+    void compact(CompactionObserver observer, final double target) throws IOException {
+        if (observer == null) {
+            observer = new CompactionObserver();
+        }
+
+        // Clears state as a side-effect.
+        observer.didManualAbort();
+
+        if (doCompact(observer, target) || observer.didManualAbort()) {
+            return;
+        }
+
+        // Compaction target not met, so cut in half repeatedly until it succeeds.
+        double t = target;
+        while (true) {
+            t /= 2;
+            if (doCompact(observer, t)) {
+                if (observer.didManualAbort()) {
+                    return;
+                }
+                break;
+            }
+        }
+
+        // Now attempt to reach target by doubling each time.
+        while ((t *= 2) <= target && doCompact(observer, t) && !observer.didManualAbort());
+    }
+
+    /**
+     * Compacts the database by shrinking the database file. The compaction target is the
+     * desired file utilization, and it controls how much compaction should be performed. A
+     * target of 0.0 performs no compaction, and a value of 1.0 attempts to compact as much as
+     * possible.
+     *
+     * <p>If the compaction target cannot be met, the entire operation aborts. If the database
+     * is being concurrently modified, large compaction targets will likely never succeed.
+     * Although compacting by smaller amounts is more likely to succeed, the entire database
+     * must still be scanned. A minimum target of 0.5 is recommended.
+     *
+     * <p>Compaction requires some amount of free space for page movement, and so very high
+     * compaction targets are unlikely to be met. A compaction target of 1.0 almost always
+     * aborts, but a compaction target of 0.95 is more likely to succeed. Higher compaction is
+     * possible with multiple iterations, each time increasing the target.
+     *
+     * @param observer optional observer; pass null for default
+     * @param target database file compaction target [0.0, 1.0]
+     * @return false if file compaction aborted
+     * @throws IllegalArgumentException if compaction target is out of bounds
+     * @throws IllegalStateException if compaction is already in progress
+     */
+    private boolean doCompact(CompactionObserver observer, double target) throws IOException {
+        if (target < 0 || target > 1) {
+            throw new IllegalArgumentException("Illegal compaction target: " + target);
+        }
+
+        if (target == 0) {
+            // No compaction to do at all, but not aborted.
+            return true;
+        }
+
+        long targetPageCount;
+        synchronized (mCheckpointLock) {
+            PageDb.Stats stats = mPageDb.stats();
+            long usedPages = stats.totalPages - stats.freePages;
+            targetPageCount = Math.max(usedPages, (long) (usedPages / target));
+            if (targetPageCount >= stats.totalPages) {
+                return true;
+            }
+            if (!mPageDb.compactionStart(targetPageCount)) {
+                return false;
+            }
+        }
+
+        if (!mPageDb.compactionScanFreeList()) {
+            synchronized (mCheckpointLock) {
+                mPageDb.compactionEnd();
+            }
+            return false;
+        }
+
+        // Issue a checkpoint to ensure all dirty nodes are flushed out. This ensures that
+        // nodes can be moved out of the compaction zone by simply marking them dirty. If
+        // already dirty, they'll not be in the compaction zone unless compaction aborted.
+        checkpoint();
+
+        if (observer == null) {
+            observer = new CompactionObserver();
+        }
+
+        final long highestNodeId = targetPageCount - 1;
+        final CompactionObserver fobserver = observer;
+
+        boolean completed = scanAllIndexes(new ScanVisitor() {
+            public boolean apply(Tree tree) throws IOException {
+                return tree.compactTree(tree.observableView(), highestNodeId, fobserver);
+            }
+        });
+
+        if (completed && mPageDb.compactionScanFreeList()) {
+            checkpoint(true, 0, 0);
+            if (!mPageDb.compactionVerify() && mPageDb.compactionScanFreeList()) {
+                checkpoint(true, 0, 0);
+            }
+        }
+
+        synchronized (mCheckpointLock) {
+            if (mPageDb.compactionEnd()) {
+                checkpoint(true, 0, 0);
+                // And now, actually shrink the file.
+                return mPageDb.truncatePages();
+            }
+        }
+
+        // Allow the reclaimed reserved pages to be immediately usable.
+        checkpoint(true, 0, 0);
+
+        return false;
     }
 
     /**

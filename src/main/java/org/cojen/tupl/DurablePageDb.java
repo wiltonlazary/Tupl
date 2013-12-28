@@ -61,9 +61,9 @@ class DurablePageDb extends PageDb {
     | int:  page size                          |
     | int:  commit number                      |
     | int:  checksum                           |
-    | page manager header (96 bytes)           |
+    | page manager header (140 bytes)          |
     +------------------------------------------+
-    | reserved (140 bytes)                     |
+    | reserved (96 bytes)                      |
     +------------------------------------------+
     | extra data (256 bytes)                   |
     +------------------------------------------+
@@ -92,11 +92,33 @@ class DurablePageDb extends PageDb {
     /**
      * @param factory optional
      */
-    DurablePageDb(int pageSize, File[] files, FileFactory factory, EnumSet<OpenOption> options,
-                  Crypto crypto, boolean destroy)
+    static DurablePageDb open(boolean explicitPageSize, int pageSize,
+                              File[] files, FileFactory factory, EnumSet<OpenOption> options,
+                              Crypto crypto, boolean destroy)
         throws IOException
     {
-        this(openPageArray(pageSize, files, factory, options), crypto, destroy);
+        while (true) {
+            try {
+                return new DurablePageDb
+                    (openPageArray(pageSize, files, factory, options), crypto, destroy);
+            } catch (WrongPageSize e) {
+                if (explicitPageSize) {
+                    throw e.rethrow();
+                }
+                pageSize = e.mActual;
+                explicitPageSize = true;
+            }
+        }
+    }
+
+    static DurablePageDb open(PageArray rawArray, Crypto crypto, boolean destroy)
+        throws IOException
+    {
+        try {
+            return new DurablePageDb(rawArray, crypto, destroy);
+        } catch (WrongPageSize e) {
+            throw e.rethrow();
+        }
     }
 
     private static PageArray openPageArray(int pageSize, File[] files, FileFactory factory,
@@ -136,8 +158,29 @@ class DurablePageDb extends PageDb {
         }
     }
 
-    DurablePageDb(final PageArray rawArray, Crypto crypto, boolean destroy)
-        throws IOException
+    static class WrongPageSize extends Exception {
+        private final int mExpected;
+        private final int mActual;
+
+        WrongPageSize(int expected, int actual) {
+            mExpected = expected;
+            mActual = actual;
+        }
+
+        @Override
+        public Throwable fillInStackTrace() {
+            return this;
+        }
+
+        DatabaseException rethrow() throws DatabaseException {
+            throw new DatabaseException
+                ("Actual page size does not match configured page size: "
+                 + mActual + " != " + mExpected);
+        }
+    }
+
+    private DurablePageDb(final PageArray rawArray, Crypto crypto, boolean destroy)
+        throws IOException, WrongPageSize
     {
         PageArray array = crypto == null ? rawArray : new CryptoPageArray(rawArray, crypto);
 
@@ -185,9 +228,7 @@ class DurablePageDb extends PageDb {
                     }
 
                     if (pageSize0 != pageSize) {
-                        throw new DatabaseException
-                            ("Actual page size does not match configured page size: "
-                             + pageSize0 + " != " + pageSize);
+                        throw new WrongPageSize(pageSize, pageSize0);
                     }
 
                     try {
@@ -234,6 +275,9 @@ class DurablePageDb extends PageDb {
 
                 mPageManager = new PageManager(mPageArray, header, I_MANAGER_HEADER);
             }
+        } catch (WrongPageSize e) {
+            closeQuietly(null, this);
+            throw e;
         } catch (Throwable e) {
             throw closeOnFailure(e);
         }
@@ -352,6 +396,48 @@ class DurablePageDb extends PageDb {
         } finally {
             mCommitLock.readLock().unlock();
         }
+    }
+
+    @Override
+    public boolean compactionStart(long targetPageCount) throws IOException {
+        mCommitLock.writeLock().lock();
+        try {
+            return mPageManager.compactionStart(targetPageCount);
+        } catch (Throwable e) {
+            throw closeOnFailure(e);
+        } finally {
+            mCommitLock.writeLock().unlock();
+        }
+    }
+
+    @Override
+    public boolean compactionScanFreeList() throws IOException {
+        try {
+            return mPageManager.compactionScanFreeList(mCommitLock);
+        } catch (Throwable e) {
+            throw closeOnFailure(e);
+        }
+    }
+
+    @Override
+    public boolean compactionVerify() throws IOException {
+        // Only performs reads and so no commit lock is required. Holding it would block
+        // checkpoints during reserve list scan, which is not desirable.
+        return mPageManager.compactionVerify();
+    }
+
+    @Override
+    public boolean compactionEnd() throws IOException {
+        try {
+            return mPageManager.compactionEnd(mCommitLock);
+        } catch (Throwable e) {
+            throw closeOnFailure(e);
+        }
+    }
+
+    @Override
+    public boolean truncatePages() throws IOException {
+        return mPageManager.truncatePages();
     }
 
     @Override
@@ -509,7 +595,11 @@ class DurablePageDb extends PageDb {
             closeQuietly(null, in);
         }
 
-        return new DurablePageDb(pa, crypto, false);
+        try {
+            return new DurablePageDb(pa, crypto, false);
+        } catch (WrongPageSize e) {
+            throw e.rethrow();
+        }
     }
 
     private IOException closeOnFailure(Throwable e) throws IOException {
