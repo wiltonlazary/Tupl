@@ -164,11 +164,8 @@ public class CompressedPageArray extends PageArray {
 
     @Override
     public void sync(boolean metadata) throws IOException {
-        if (metadata) {
-            mDataDb.checkpoint();
-        } else {
-            mDataDb.sync();
-        }
+        // Pages are written non-transactionally, and so checkpoint must be performed.
+        mDataDb.checkpoint();
     }
 
     @Override
