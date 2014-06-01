@@ -20,7 +20,7 @@ import java.io.File;
 import java.io.IOException;
 
 import net.jpountz.lz4.LZ4Compressor;
-import net.jpountz.lz4.LZ4Decompressor;
+import net.jpountz.lz4.LZ4FastDecompressor;
 import net.jpountz.lz4.LZ4Factory;
 
 import org.cojen.tupl.Cursor;
@@ -62,7 +62,7 @@ public class CompressedPageArray extends PageArray {
     private final Index mPages;
     private final LZ4Compressor mCompressor;
     private final int mMaxCompressedLength;
-    private final LZ4Decompressor mDecompressor;
+    private final LZ4FastDecompressor mDecompressor;
 
     public CompressedPageArray(int pageSize, File baseFile) throws IOException {
         this(pageSize, Database.open(new DatabaseConfig()
@@ -84,7 +84,7 @@ public class CompressedPageArray extends PageArray {
 
         mCompressor = factory.fastCompressor();
         mMaxCompressedLength = mCompressor.maxCompressedLength(pageSize());
-        mDecompressor = factory.decompressor();
+        mDecompressor = factory.fastDecompressor();
     }
 
     private static int selectDataPageSize(int topPageSize) {
