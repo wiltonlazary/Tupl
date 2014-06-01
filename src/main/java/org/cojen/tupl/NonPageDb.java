@@ -49,6 +49,11 @@ class NonPageDb extends PageDb {
     }
 
     @Override
+    public long pageCount() {
+        return 0;
+    }
+
+    @Override
     public Stats stats() {
         return new Stats();
     }
@@ -160,10 +165,11 @@ class NonPageDb extends PageDb {
     }
 
     private static void fail(boolean forWrite) throws DatabaseException {
-        String message = "Non-durable database";
         if (forWrite) {
-            message += " is full";
+            throw new DatabaseFullException();
+        } else {
+            // This is more of an assertion failure.
+            throw new DatabaseException("Cannot read from a non-durable database");
         }
-        throw new DatabaseException(message);
     }
 }

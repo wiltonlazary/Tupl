@@ -1,10 +1,43 @@
 Changelog
 =========
 
+v1.1.2
+------
+* Fix rare node eviction bug which left it (partially) in the usage list.
+* Cache growth is no longer aggressive, only doing so to avoid node eviction.
+* Added cache size to stats.
+* Defined new DatabaseFullException for non-durable databases.
+
+v1.1.1
+------
+
+* Target Java 7 only.
+* Added support for cache priming.
+* Various fixes.
+
+v1.1.0
+------
+
+* Improved performance of findNearby by encoding extra b-tree node metadata. Indexes can be
+  rapidly filled with in-order records using a single cursor which advances to the next key
+  using findNearby. This technique works with reverse ordered records and it allows concurrent
+  access as usual. Indexes created in older versions will not have this metadata, and so they
+  must be rebuilt to obtain it.
+* Decode only 6-byte child pointers, preparing for future support of child entry counts.
+
+v1.0.5
+------
+
+* Reveal file compaction feature.
+* Tolerate, but don't update, b-tree node metadata introduced in version 1.1.0.
+
 v1.0.4
 ------
+
+* Fix defects when inserting largest possible keys.
 * Added rebalancing for internal nodes (was only leaf nodes before).
 * Added key suffix compression, which allows more keys to fit inside internal nodes.
+* Enforce key size limits. 
 
 v1.0.3
 ------

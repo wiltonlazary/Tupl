@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2014 Brian S O'Neill
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -16,34 +16,19 @@
 
 package org.cojen.tupl;
 
-import java.io.IOException;
-
 /**
- * Returned by {@link DequeIndex}.
+ * Thrown when a non-durable database is full and no more data can be stored into it.
  *
  * @author Brian S O'Neill
  */
-final class DequeCursor extends WrappedCursor<TreeCursor> {
-    private final DequeIndex mIndex;
+public class DatabaseFullException extends DatabaseException {
+    private static final long serialVersionUID = 1L;
 
-    DequeCursor(DequeIndex index, TreeCursor source) {
-        super(source);
-        mIndex = index;
+    public DatabaseFullException() {
     }
 
     @Override
-    public void store(byte[] value) throws IOException {
-        mIndex.storeInto(mSource, value);
-    }
-
-    @Override
-    public Stream newStream() {
-        // FIXME
-        throw null;
-    }
-
-    @Override
-    public Cursor copy() {
-        return new DequeCursor(mIndex, mSource.copy());
+    boolean isRecoverable() {
+        return true;
     }
 }

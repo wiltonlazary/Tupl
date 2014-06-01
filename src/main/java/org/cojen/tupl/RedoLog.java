@@ -131,7 +131,7 @@ final class RedoLog extends RedoWriter {
         }
 
         try {
-            Set<File> files = new LinkedHashSet<File>(2);
+            Set<File> files = new LinkedHashSet<>(2);
 
             while (true) {
                 File file = fileFor(mBaseFile, mLogId);
@@ -318,6 +318,11 @@ final class RedoLog extends RedoWriter {
     long checkpointTransactionId() {
         // Log file always begins with a reset.
         return 0;
+    }
+
+    @Override
+    void checkpointAborted() {
+        // Nothing to do.
     }
 
     @Override

@@ -32,6 +32,9 @@ final class ReplRedoWriter extends RedoWriter {
     private long mCheckpointPos;
     private long mCheckpointTxnId;
 
+    private long mLeaderCommitPos;
+    private long mLeaderCommitTxnId;
+
     private volatile boolean mIsLeader;
 
     ReplRedoWriter(ReplRedoEngine engine) {
@@ -45,7 +48,7 @@ final class ReplRedoWriter extends RedoWriter {
     }
 
     public void recover(long initialTxnId, EventListener listener) throws IOException {
-        mEngine.startReceiving(initialTxnId);
+        mEngine.startReceiving(mManager.readPosition(), initialTxnId);
         mManager.recover(listener);
     }
 
@@ -133,8 +136,8 @@ final class ReplRedoWriter extends RedoWriter {
     synchronized void checkpointSwitch() {
         mCheckpointNum++;
         if (mIsLeader) {
-            mCheckpointPos = mManager.writePosition();
-            mCheckpointTxnId = lastTransactionId();
+            mCheckpointPos = mLeaderCommitPos;
+            mCheckpointTxnId = mLeaderCommitTxnId;
         } else {
             mCheckpointPos = mEngine.mDecodePosition;
             mCheckpointTxnId = mEngine.mDecodeTransactionId;
@@ -154,6 +157,11 @@ final class ReplRedoWriter extends RedoWriter {
     @Override
     long checkpointTransactionId() {
         return mCheckpointTxnId;
+    }
+
+    @Override
+    void checkpointAborted() {
+        mEngine.resume();
     }
 
     @Override
@@ -190,7 +198,14 @@ final class ReplRedoWriter extends RedoWriter {
         // Length check is included because super class can invoke this method to flush the
         // buffer even when empty. Operation should never fail.
         if (len > 0) {
-            return mManager.writeCommit(buffer, 0, len);
+            long pos = mManager.writeCommit(buffer, 0, len);
+            if (pos >= 0) {
+                mLeaderCommitPos = pos;
+                mLeaderCommitTxnId = lastTransactionId();
+                return pos;
+            } else {
+                throw unmodifiable();
+            }
         }
         return 0;
     }
@@ -231,6 +246,8 @@ final class ReplRedoWriter extends RedoWriter {
     synchronized void leaderNotify() throws UnmodifiableReplicaException, IOException {
         if (!mIsLeader) {
             mManager.flip();
+            mLeaderCommitPos = mManager.writePosition();
+            mLeaderCommitTxnId = 0;
             mIsLeader = true;
 
             // Clear the log state and write a reset op to signal leader transition.
@@ -246,17 +263,19 @@ final class ReplRedoWriter extends RedoWriter {
         }
     }
 
-    private synchronized UnmodifiableReplicaException unmodifiable() {
+    private synchronized UnmodifiableReplicaException unmodifiable() throws IOException {
         if (mIsLeader) {
             mManager.flip();
             mIsLeader = false;
+
+            final long initialPosition = mManager.readPosition();
 
             // Invoke from a separate thread, avoiding deadlock during the transition.
             new Thread() {
                 public void run() {
                     // Start receiving if not, but does nothing if already receiving. A reset
                     // op is expected, and so the initial transaction id can be zero.
-                    mEngine.startReceiving(0);
+                    mEngine.startReceiving(initialPosition, 0);
                 }
             }.start();
         }

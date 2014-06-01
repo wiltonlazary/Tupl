@@ -16,18 +16,26 @@
 
 package org.cojen.tupl;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.BufferedWriter;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Serializable;
 import java.io.Writer;
 
 import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
 
 import java.math.BigInteger;
 
@@ -43,6 +51,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static java.lang.System.arraycopy;
 
@@ -109,8 +118,11 @@ public final class Database implements CauseCloseable {
     // 32-bit pointers.
     private static final int NODE_OVERHEAD = 100;
 
+    private static final long PRIMER_MAGIC_NUMBER = 4943712973215968399L;
+
     private static final String INFO_FILE_SUFFIX = ".info";
     private static final String LOCK_FILE_SUFFIX = ".lock";
+    static final String PRIMER_FILE_SUFFIX = ".primer";
     static final String REDO_FILE_SUFFIX = ".redo.";
 
     private static int nodeCountFromBytes(long bytes, int pageSize) {
@@ -217,7 +229,9 @@ public final class Database implements CauseCloseable {
     private UndoLog mTopUndoLog;
     private int mUndoLogCount;
 
-    private final Object mCheckpointLock = new Object();
+    // Checkpoint lock is fair, to ensure that user checkpoint requests are not stalled for too
+    // long by checkpoint thread.
+    private final Lock mCheckpointLock = new ReentrantLock(true);
 
     private long mLastCheckpointNanos;
 
@@ -337,20 +351,30 @@ public final class Database implements CauseCloseable {
         if (mBaseFile != null && !config.mReadOnly && config.mMkdirs) {
             FileFactory factory = config.mFileFactory;
 
+            final boolean baseDirectoriesCreated;
             File baseDir = mBaseFile.getParentFile();
             if (factory == null) {
-                baseDir.mkdirs();
+                baseDirectoriesCreated = baseDir.mkdirs();
             } else {
-                factory.createDirectories(baseDir);
+                baseDirectoriesCreated = factory.createDirectories(baseDir);
+            }
+
+            if (!baseDirectoriesCreated && !baseDir.exists()) {
+                throw new FileNotFoundException("Could not create directory: " + baseDir);
             }
 
             if (dataFiles != null) {
                 for (File f : dataFiles) {
+                    final boolean dataDirectoriesCreated;
                     File dataDir = f.getParentFile();
                     if (factory == null) {
-                        dataDir.mkdirs();
+                        dataDirectoriesCreated = dataDir.mkdirs();
                     } else {
-                        factory.createDirectories(dataDir);
+                        dataDirectoriesCreated = factory.createDirectories(dataDir);
+                    }
+
+                    if (!dataDirectoriesCreated && !dataDir.exists()) {
+                        throw new FileNotFoundException("Could not create directory: " + dataDir);
                     }
                 }
             }
@@ -430,7 +454,8 @@ public final class Database implements CauseCloseable {
 
             try {
                 for (int i=minCache; --i>=0; ) {
-                    allocLatchedNode(true).releaseExclusive();
+                    mUsageLatch.acquireExclusive();
+                    doAllocLatchedNode(true).releaseExclusive();
                 }
             } catch (OutOfMemoryError e) {
                 mMostRecentlyUsed = null;
@@ -438,11 +463,11 @@ public final class Database implements CauseCloseable {
 
                 throw new OutOfMemoryError
                     ("Unable to allocate the minimum required number of cached nodes: " +
-                     minCache + " (" + (minCache * (pageSize + NODE_OVERHEAD)) + " bytes)");
+                     minCache + " (" + (minCache * (long) (pageSize + NODE_OVERHEAD)) + " bytes)");
             }
 
             if (mEventListener != null) {
-                double duration = (System.nanoTime() - cacheInitStart) / 1000000000.0;
+                double duration = (System.nanoTime() - cacheInitStart) / 1_000_000_000.0;
                 mEventListener.notify(EventType.CACHE_INIT_COMPLETE,
                                       "Cache initialization completed in %1$1.3f seconds",
                                       duration, TimeUnit.SECONDS);
@@ -464,17 +489,17 @@ public final class Database implements CauseCloseable {
             // Also verifies the database and replication encodings.
             Node rootNode = loadRegistryRoot(header, config.mReplManager);
 
-            mRegistry = new Tree(this, Tree.REGISTRY_ID, null, null, rootNode);
+            mRegistry = newTreeInstance(Tree.REGISTRY_ID, null, null, rootNode);
 
             mOpenTreesLatch = new Latch();
             if (openMode == OPEN_TEMP) {
                 mOpenTrees = Collections.emptyMap();
-                mOpenTreesById = new LHashTable.Obj<TreeRef>(0);
+                mOpenTreesById = new LHashTable.Obj<>(0);
                 mOpenTreesRefQueue = null;
             } else {
-                mOpenTrees = new TreeMap<byte[], TreeRef>(KeyComparator.THE);
-                mOpenTreesById = new LHashTable.Obj<TreeRef>(16);
-                mOpenTreesRefQueue = new ReferenceQueue<Tree>();
+                mOpenTrees = new TreeMap<>(KeyComparator.THE);
+                mOpenTreesById = new LHashTable.Obj<>(16);
+                mOpenTreesRefQueue = new ReferenceQueue<>();
             }
 
             synchronized (mTxnIdLock) {
@@ -526,7 +551,32 @@ public final class Database implements CauseCloseable {
                     recoveryStart = System.nanoTime();
                 }
 
-                LHashTable.Obj<Transaction> txns = new LHashTable.Obj<Transaction>(16);
+                if (mPageDb instanceof DurablePageDb) {
+                    File primer = primerFile();
+                    try {
+                        if (config.mCachePriming && primer.exists()) {
+                            if (mEventListener != null) {
+                                mEventListener.notify(EventType.RECOVERY_CACHE_PRIMING,
+                                                      "Cache priming");
+                            }
+                            FileInputStream fin;
+                            try {
+                                fin = new FileInputStream(primer);
+                                try (InputStream bin = new BufferedInputStream(fin)) {
+                                    applyCachePrimer(bin);
+                                } catch (IOException e) {
+                                    fin.close();
+                                    primer.delete();
+                                }
+                            } catch (IOException e) {
+                            }
+                        }
+                    } finally {
+                        primer.delete();
+                    }
+                }
+
+                LHashTable.Obj<Transaction> txns = new LHashTable.Obj<>(16);
                 {
                     long masterNodeId = decodeLongLE(header, I_MASTER_UNDO_LOG_PAGE_ID);
                     if (masterNodeId != 0) {
@@ -597,7 +647,7 @@ public final class Database implements CauseCloseable {
                             public boolean visit(LHashTable.ObjEntry<Transaction> entry)
                                 throws IOException
                             {
-                                entry.value.recoveryCleanup();
+                                entry.value.recoveryCleanup(true);
                                 return false;
                             }
                         });
@@ -634,7 +684,7 @@ public final class Database implements CauseCloseable {
             }
         } catch (Throwable e) {
             closeQuietly(null, this, e);
-            throw rethrow(e);
+            throw e;
         }
     }
 
@@ -654,6 +704,10 @@ public final class Database implements CauseCloseable {
         c.register(mRedoWriter);
         c.register(mTempFileManager);
 
+        if (config.mCachePriming && mPageDb instanceof DurablePageDb) {
+            c.register(new ShutdownPrimer(this));
+        }
+
         if (mRedoWriter instanceof ReplRedoWriter) {
             // Start replication and recovery.
             ReplRedoWriter writer = (ReplRedoWriter) mRedoWriter;
@@ -662,7 +716,7 @@ public final class Database implements CauseCloseable {
                 writer.recover(config.mReplInitialTxnId, config.mEventListener);
             } catch (Throwable e) {
                 closeQuietly(null, this, e);
-                throw rethrow(e);
+                throw e;
             }
             checkpoint();
             recoveryComplete(config.mReplRecoveryStartNanos);
@@ -671,9 +725,45 @@ public final class Database implements CauseCloseable {
         c.start();
     }
 
+    static class ShutdownPrimer implements Checkpointer.Shutdown {
+        private final WeakReference<Database> mDatabaseRef;
+
+        ShutdownPrimer(Database db) {
+            mDatabaseRef = new WeakReference<>(db);
+        }
+
+        @Override
+        public void shutdown() {
+            Database db = mDatabaseRef.get();
+            if (db == null) {
+                return;
+            }
+
+            File primer = db.primerFile();
+
+            FileOutputStream fout;
+            try {
+                fout = new FileOutputStream(primer);
+                try {
+                    try (OutputStream bout = new BufferedOutputStream(fout)) {
+                        db.createCachePrimer(bout);
+                    }
+                } catch (IOException e) {
+                    fout.close();
+                    primer.delete();
+                }
+            } catch (IOException e) {
+            }
+        }
+    }
+
+    File primerFile() {
+        return new File(mBaseFile.getPath() + PRIMER_FILE_SUFFIX);
+    }
+
     private void recoveryComplete(long recoveryStart) {
         if (mRedoWriter != null && mEventListener != null) {
-            double duration = (System.nanoTime() - recoveryStart) / 1000000000.0;
+            double duration = (System.nanoTime() - recoveryStart) / 1_000_000_000.0;
             mEventListener.notify(EventType.RECOVERY_COMPLETE,
                                   "Recovery completed in %1$1.3f seconds",
                                   duration, TimeUnit.SECONDS);
@@ -786,9 +876,7 @@ public final class Database implements CauseCloseable {
 
             index = openIndex(name, false);
         } catch (Throwable e) {
-            if (e instanceof DatabaseException && ((DatabaseException) e).isRecoverable()) {
-                throw (DatabaseException) e;
-            }
+            DatabaseException.rethrowIfRecoverable(e);
             throw closeOnFailure(this, e);
         } finally {
             commitLock.unlock();
@@ -928,7 +1016,7 @@ public final class Database implements CauseCloseable {
                 }
             } catch (Throwable e) {
                 txn.reset();
-                throw rethrow(e);
+                throw e;
             }
         } finally {
             // Can release now that registry entries are locked. Those locks will prevent
@@ -973,6 +1061,7 @@ public final class Database implements CauseCloseable {
         } catch (IllegalStateException e) {
             throw e;
         } catch (Throwable e) {
+            DatabaseException.rethrowIfRecoverable(e);
             throw closeOnFailure(this, e);
         } finally {
             txn.reset();
@@ -1021,6 +1110,10 @@ public final class Database implements CauseCloseable {
     private Transaction doNewTransaction(DurabilityMode durabilityMode) {
         return new Transaction
             (this, durabilityMode, LockMode.UPGRADABLE_READ, mDefaultLockTimeoutNanos);
+    }
+
+    Transaction newAlwaysRedoTransaction() {
+        return doNewTransaction(mDurabilityMode.alwaysRedo());
     }
 
     /**
@@ -1107,8 +1200,9 @@ public final class Database implements CauseCloseable {
                     try {
                         checkpoint(true, 0, 0);
                     } catch (Throwable e) {
+                        DatabaseException.rethrowIfRecoverable(e);
                         closeQuietly(null, this, e);
-                        throw rethrow(e);
+                        throw e;
                     }
                 }
                 return pageCount * pageSize;
@@ -1148,8 +1242,9 @@ public final class Database implements CauseCloseable {
     }
 
     /**
-     * Restore from a {@link #beginSnapshot snapshot}, into the data files
-     * defined by the given configuration.
+     * Restore from a {@link #beginSnapshot snapshot}, into the data files defined by the given
+     * configuration. All existing data and redo log files at the snapshot destination are
+     * deleted before the restore begins.
      *
      * @param in snapshot source; does not require extra buffering; auto-closed
      */
@@ -1203,6 +1298,91 @@ public final class Database implements CauseCloseable {
     }
 
     /**
+     * Writes a cache priming set into the given stream, which can then be used later to {@link
+     * #applyCachePrimer prime} the cache.
+     *
+     * @param out cache priming destination; buffering is recommended; not auto-closed
+     * @see DatabaseConfig#cachePriming
+     */
+    public void createCachePrimer(OutputStream out) throws IOException {
+        if (!(mPageDb instanceof DurablePageDb)) {
+            throw new UnsupportedOperationException
+                ("Cache priming only allowed for durable databases");
+        }
+
+        out = ((DurablePageDb) mPageDb).encrypt(out);
+
+        // Create a clone of the open trees, because concurrent iteration is not supported.
+        TreeRef[] openTrees;
+        mOpenTreesLatch.acquireShared();
+        try {
+            openTrees = new TreeRef[mOpenTrees.size()];
+            int i = 0;
+            for (TreeRef treeRef : mOpenTrees.values()) {
+                openTrees[i++] = treeRef;
+            }
+        } finally {
+            mOpenTreesLatch.releaseShared();
+        }
+
+        DataOutputStream dout = new DataOutputStream(out);
+
+        dout.writeLong(PRIMER_MAGIC_NUMBER);
+
+        for (TreeRef treeRef : openTrees) {
+            Tree tree = treeRef.get();
+            if (tree != null && !Tree.isInternal(tree.mId)) {
+                // Encode name instead of identifier, to support priming set portability
+                // between databases. The identifiers won't match, but the names might.
+                byte[] name = tree.mName;
+                dout.writeInt(name.length);
+                dout.write(name);
+                tree.writeCachePrimer(dout);
+            }
+        }
+
+        // Terminator.
+        dout.writeInt(-1);
+    }
+
+    /**
+     * Prime the cache, from a set encoded {@link #createCachePrimer earlier}.
+     *
+     * @param in caching priming source; buffering is recommended; not auto-closed
+     * @see DatabaseConfig#cachePriming
+     */
+    public void applyCachePrimer(InputStream in) throws IOException {
+        if (!(mPageDb instanceof DurablePageDb)) {
+            throw new UnsupportedOperationException
+                ("Cache priming only allowed for durable databases");
+        }
+
+        in = ((DurablePageDb) mPageDb).decrypt(in);
+
+        DataInputStream din = new DataInputStream(in);
+
+        long magic = din.readLong();
+        if (magic != PRIMER_MAGIC_NUMBER) {
+            throw new DatabaseException("Wrong cache primer magic number: " + magic);
+        }
+
+        while (true) {
+            int len = din.readInt();
+            if (len < 0) {
+                break;
+            }
+            byte[] name = new byte[len];
+            din.readFully(name);
+            Index ix = openIndex(name, false);
+            if (ix instanceof Tree) {
+                ((Tree) ix).applyCachePrimer(din);
+            } else {
+                Tree.skipCachePrimer(din);
+            }
+        }
+    }
+
+    /**
      * Returns an immutable copy of database statistics.
      */
     public Stats stats() {
@@ -1242,6 +1422,14 @@ public final class Database implements CauseCloseable {
             mSharedCommitLock.unlock();
         }
 
+        mUsageLatch.acquireShared();
+        stats.mCachedPages = mNodeCount;
+        mUsageLatch.releaseShared();
+
+        if (!mPageDb.isDurable() && stats.mTotalPages == 0) {
+            stats.mTotalPages = stats.mCachedPages;
+        }
+
         return stats;
     }
 
@@ -1254,6 +1442,7 @@ public final class Database implements CauseCloseable {
         int mPageSize;
         long mFreePages;
         long mTotalPages;
+        long mCachedPages;
         int mOpenIndexes;
         long mLockCount;
         long mCursorCount;
@@ -1282,6 +1471,13 @@ public final class Database implements CauseCloseable {
          */
         public long totalPages() {
             return mTotalPages;
+        }
+
+        /**
+         * Returns the current size of the cache, in pages.
+         */
+        public long cachedPages() {
+            return mCachedPages;
         }
 
         /**
@@ -1360,6 +1556,7 @@ public final class Database implements CauseCloseable {
             return "Database.Stats {pageSize=" + mPageSize
                 + ", freePages=" + mFreePages
                 + ", totalPages=" + mTotalPages
+                + ", cachedPages=" + mCachedPages
                 + ", openIndexes=" + mOpenIndexes
                 + ", lockCount=" + mLockCount
                 + ", cursorCount=" + mCursorCount
@@ -1404,8 +1601,9 @@ public final class Database implements CauseCloseable {
             try {
                 checkpoint(false, 0, 0);
             } catch (Throwable e) {
+                DatabaseException.rethrowIfRecoverable(e);
                 closeQuietly(null, this, e);
-                throw rethrow(e);
+                throw e;
             }
         }
     }
@@ -1460,7 +1658,7 @@ public final class Database implements CauseCloseable {
      * @throws IllegalArgumentException if compaction target is out of bounds
      * @throws IllegalStateException if compaction is already in progress
      */
-    boolean compact(CompactionObserver observer, double target) throws IOException {
+    public boolean compactFile(CompactionObserver observer, double target) throws IOException {
         if (target < 0 || target > 1) {
             throw new IllegalArgumentException("Illegal compaction target: " + target);
         }
@@ -1471,7 +1669,8 @@ public final class Database implements CauseCloseable {
         }
 
         long targetPageCount;
-        synchronized (mCheckpointLock) {
+        mCheckpointLock.lock();
+        try {
             PageDb.Stats stats = mPageDb.stats();
             long usedPages = stats.totalPages - stats.freePages;
             targetPageCount = Math.max(usedPages, (long) (usedPages / target));
@@ -1498,18 +1697,23 @@ public final class Database implements CauseCloseable {
 
             targetPageCount += reserve;
 
-            if (targetPageCount >= stats.totalPages) {
+            if (targetPageCount >= stats.totalPages && targetPageCount >= mPageDb.pageCount()) {
                 return true;
             }
 
             if (!mPageDb.compactionStart(targetPageCount)) {
                 return false;
             }
+        } finally {
+            mCheckpointLock.unlock();
         }
 
         if (!mPageDb.compactionScanFreeList()) {
-            synchronized (mCheckpointLock) {
+            mCheckpointLock.lock();
+            try {
                 mPageDb.compactionEnd();
+            } finally {
+                mCheckpointLock.unlock();
             }
             return false;
         }
@@ -1540,7 +1744,8 @@ public final class Database implements CauseCloseable {
             }
         }
 
-        synchronized (mCheckpointLock) {
+        mCheckpointLock.lock();
+        try {
             completed &= mPageDb.compactionEnd();
 
             // If completed, then this allows file to shrink. Otherwise, it allows reclaimed
@@ -1551,6 +1756,8 @@ public final class Database implements CauseCloseable {
                 // And now, attempt to actually shrink the file.
                 return mPageDb.truncatePages();
             }
+        } finally {
+            mCheckpointLock.unlock();
         }
 
         return false;
@@ -1690,25 +1897,27 @@ public final class Database implements CauseCloseable {
         Checkpointer c = mCheckpointer;
 
         if (shutdown) {
-            synchronized (mCheckpointLock) {
+            mCheckpointLock.lock();
+            try {
                 checkpoint(true, 0, 0);
                 mClosed = true;
                 if (c != null) {
                     c.close();
                 }
+            } finally {
+                mCheckpointLock.unlock();
             }
         } else {
             mClosed = true;
             if (c != null) {
                 c.close();
             }
-            // Synchronize to wait for any in-progress checkpoint to complete.
-            synchronized (mCheckpointLock) {
-                // Nothing really needs to be done in the synchronized block, but
-                // do something just in case a "smart" compiler thinks an empty
-                // synchronized block can be eliminated.
-                mClosed = true;
-            }
+            // Wait for any in-progress checkpoint to complete.
+            mCheckpointLock.lock();
+            // Nothing really needs to be done with lock held, but do something just in
+            // case a "smart" compiler thinks the lock can be eliminated.
+            mClosed = true;
+            mCheckpointLock.unlock();
         }
 
         mCheckpointer = null;
@@ -1795,7 +2004,7 @@ public final class Database implements CauseCloseable {
             TreeRef ref = mOpenTreesById.getValue(tree.mId);
             if (ref != null && ref.get() == tree) {
                 ref.clear();
-                tree = new Tree(this, tree.mId, tree.mIdBytes, tree.mName, newRoot);
+                tree = newTreeInstance(tree.mId, tree.mIdBytes, tree.mName, newRoot);
                 ref = new TreeRef(tree, mOpenTreesRefQueue);
                 mOpenTrees.put(tree.mName, ref);
                 mOpenTreesById.insert(tree.mId).value = ref;
@@ -1842,7 +2051,7 @@ public final class Database implements CauseCloseable {
                     mOpenTreesById.remove(tree.mId);
                 } catch (Throwable e) {
                     txn.reset();
-                    throw rethrow(e);
+                    throw e;
                 }
             } finally {
                 mOpenTreesLatch.releaseExclusive();
@@ -1852,8 +2061,6 @@ public final class Database implements CauseCloseable {
             // or dropped concurrently.
 
             try {
-                deletePage(rootId, cachedState);
-
                 mRegistryKeyMap.remove(txn, idKey, tree.mName);
                 mRegistryKeyMap.remove(txn, nameKey, tree.mIdBytes);
                 mRegistry.delete(txn, tree.mIdBytes);
@@ -1862,7 +2069,10 @@ public final class Database implements CauseCloseable {
                     : redo.dropIndex(tree.mId, mDurabilityMode.alwaysRedo());
 
                 txn.commit();
+
+                deletePage(rootId, cachedState);
             } catch (Throwable e) {
+                DatabaseException.rethrowIfRecoverable(e);
                 throw closeOnFailure(this, e);
             } finally {
                 txn.reset();
@@ -1960,7 +2170,7 @@ public final class Database implements CauseCloseable {
                 }
                 rootId = 0;
             }
-            return new Tree(this, treeId, treeIdBytes, null, loadTreeRoot(rootId));
+            return newTreeInstance(treeId, treeIdBytes, null, loadTreeRoot(rootId));
         } finally {
             commitLock.unlock();
         }
@@ -2030,10 +2240,8 @@ public final class Database implements CauseCloseable {
                                 throw new DatabaseException("Unable to insert index id");
                             }
                         } catch (Throwable e) {
-                            if (!critical && e instanceof DatabaseException &&
-                                ((DatabaseException) e).isRecoverable())
-                            {
-                                throw (DatabaseException) e;
+                            if (!critical) {
+                                DatabaseException.rethrowIfRecoverable(e);
                             }
                             throw closeOnFailure(this, e);
                         }
@@ -2058,7 +2266,7 @@ public final class Database implements CauseCloseable {
 
                 long rootId = (rootIdBytes == null || rootIdBytes.length == 0) ? 0
                     : decodeLongLE(rootIdBytes, 0);
-                tree = new Tree(this, treeId, treeIdBytes, name, loadTreeRoot(rootId));
+                tree = newTreeInstance(treeId, treeIdBytes, name, loadTreeRoot(rootId));
 
                 TreeRef treeRef = new TreeRef(tree, mOpenTreesRefQueue);
 
@@ -2082,7 +2290,7 @@ public final class Database implements CauseCloseable {
                         // Ignore.
                     }
                 }
-                throw rethrow(e);
+                throw e;
             } finally {
                 txn.reset();
             }
@@ -2091,11 +2299,21 @@ public final class Database implements CauseCloseable {
         }
     }
 
+    private Tree newTreeInstance(long id, byte[] idBytes, byte[] name, Node root) {
+        if (mRedoWriter instanceof ReplRedoWriter) {
+            // Always need an explcit transaction when using auto-commit, to ensure that
+            // rollback is possible.
+            return new TxnTree(this, id, idBytes, name, root);
+        } else {
+            return new Tree(this, id, idBytes, name, root);
+        }
+    }
+
     private long nextTreeId() throws IOException {
         // By generating identifiers from a 64-bit sequence, it's effectively
         // impossible for them to get re-used after trees are deleted.
 
-        Transaction txn = newTransaction(mDurabilityMode.alwaysRedo());
+        Transaction txn = newAlwaysRedoTransaction();
         try {
             // Tree id mask, to make the identifiers less predictable and
             // non-compatible with other database instances.
@@ -2186,7 +2404,7 @@ public final class Database implements CauseCloseable {
             }
         } catch (Exception e) {
             if (!mClosed) {
-                throw rethrow(e);
+                throw e;
             }
         }
     }
@@ -2304,25 +2522,11 @@ public final class Database implements CauseCloseable {
                     break alloc;
                 }
 
-                if (mNodeCount < max) {
-                    try {
-                        checkClosed();
-                        Node node = new Node(mPageSize);
-                        node.acquireExclusive();
-                        mNodeCount++;
-                        if (evictable) {
-                            if ((node.mLessUsed = mMostRecentlyUsed) == null) {
-                                mLeastRecentlyUsed = node;
-                            } else {
-                                mMostRecentlyUsed.mMoreUsed = node;
-                            }
-                            mMostRecentlyUsed = node;
-                        }
-                        // Return with node latch still held.
-                        return node;
-                    } finally {
-                        usageLatch.releaseExclusive();
-                    }
+                if (mNodeCount < max &&
+                    (trial > 1
+                     || mLeastRecentlyUsed == null || mLeastRecentlyUsed.mMoreUsed == null))
+                {
+                    return doAllocLatchedNode(evictable);
                 }
 
                 if (!evictable && mLeastRecentlyUsed.mMoreUsed == mMostRecentlyUsed) {
@@ -2342,6 +2546,12 @@ public final class Database implements CauseCloseable {
                     }
 
                     if (trial == 1) {
+                        if (node.mCachedState != CACHED_CLEAN && mNodeCount < mMaxNodeCount) {
+                            // Grow the cache instead of evicting.
+                            node.releaseExclusive();
+                            return doAllocLatchedNode(evictable);
+                        }
+
                         // For first attempt, release the usage latch early to prevent blocking
                         // other allocations while node is evicted. Subsequent attempts retain
                         // the latch, preventing potential allocation starvation.
@@ -2365,9 +2575,7 @@ public final class Database implements CauseCloseable {
                         try {
                             if ((node = Node.evict(node, mPageDb)) != null) {
                                 if (!evictable) {
-                                    // Detach from linked list.
-                                    (mMostRecentlyUsed = node.mLessUsed).mMoreUsed = null;
-                                    node.mLessUsed = null;
+                                    doMakeUnevictable(node);
                                 }
                                 usageLatch.releaseExclusive();
                                 // Return with node latch still held.
@@ -2375,7 +2583,7 @@ public final class Database implements CauseCloseable {
                             }
                         } catch (Throwable e) {
                             usageLatch.releaseExclusive();
-                            throw rethrow(e);
+                            throw e;
                         }
                     }
                 } while (--max > 0);
@@ -2396,6 +2604,30 @@ public final class Database implements CauseCloseable {
         }
 
         throw new CacheExhaustedException();
+    }
+
+    /**
+     * Caller must acquire mUsageLatch, which is released by this method.
+     */
+    private Node doAllocLatchedNode(boolean evictable) throws DatabaseException {
+        try {
+            checkClosed();
+            Node node = new Node(mPageSize);
+            node.acquireExclusive();
+            mNodeCount++;
+            if (evictable) {
+                if ((node.mLessUsed = mMostRecentlyUsed) == null) {
+                    mLeastRecentlyUsed = node;
+                } else {
+                    mMostRecentlyUsed.mMoreUsed = node;
+                }
+                mMostRecentlyUsed = node;
+            }
+            // Return with node latch still held.
+            return node;
+        } finally {
+            mUsageLatch.releaseExclusive();
+        }
     }
 
     /**
@@ -2523,21 +2755,28 @@ public final class Database implements CauseCloseable {
                 // Closed.
                 return;
             }
-            final Node lessUsed = node.mLessUsed;
-            final Node moreUsed = node.mMoreUsed;
-            if (lessUsed == null) {
-                (mLeastRecentlyUsed = moreUsed).mLessUsed = null;
-            } else if (moreUsed == null) {
-                (mMostRecentlyUsed = lessUsed).mMoreUsed = null;
-            } else {
-                lessUsed.mMoreUsed = moreUsed;
-                moreUsed.mLessUsed = lessUsed;
-            }
-            node.mMoreUsed = null;
-            node.mLessUsed = null;
+            doMakeUnevictable(node);
         } finally {
             usageLatch.releaseExclusive();
         }
+    }
+
+    /**
+     * Caller must hold mUsageLatch.
+     */
+    private void doMakeUnevictable(final Node node) {
+        final Node lessUsed = node.mLessUsed;
+        final Node moreUsed = node.mMoreUsed;
+        if (lessUsed == null) {
+            (mLeastRecentlyUsed = moreUsed).mLessUsed = null;
+        } else if (moreUsed == null) {
+            (mMostRecentlyUsed = lessUsed).mMoreUsed = null;
+        } else {
+            lessUsed.mMoreUsed = moreUsed;
+            moreUsed.mLessUsed = lessUsed;
+        }
+        node.mMoreUsed = null;
+        node.mLessUsed = null;
     }
 
     /**
@@ -2665,7 +2904,7 @@ public final class Database implements CauseCloseable {
                 node.write(mPageDb);
             } catch (Throwable e) {
                 node.releaseExclusive();
-                throw rethrow(e);
+                throw e;
             }
         }
     }
@@ -3052,7 +3291,7 @@ public final class Database implements CauseCloseable {
             } catch (Throwable e) {
                 // Panic.
                 close(e);
-                throw rethrow(e);
+                throw e;
             }
 
             mFragmentCache.put(caller, inode);
@@ -3404,15 +3643,8 @@ public final class Database implements CauseCloseable {
      */
     void emptyAllFragmentedTrash(boolean checkpoint) throws IOException {
         FragmentedTrash trash = mFragmentedTrash;
-        if (trash != null) {
-            if (mEventListener != null) {
-                mEventListener.notify(EventType.RECOVERY_DELETE_FRAGMENTS,
-                                      "Deleting unused large fragments");
-            }
-                
-            if (trash.emptyAllTrash() && checkpoint) {
-                checkpoint(false, 0, 0);
-            }
+        if (trash != null && trash.emptyAllTrash(mEventListener) && checkpoint) {
+            checkpoint(false, 0, 0);
         }
     }
 
@@ -3475,7 +3707,8 @@ public final class Database implements CauseCloseable {
         throws IOException
     {
         // Checkpoint lock ensures consistent state between page store and logs.
-        synchronized (mCheckpointLock) {
+        mCheckpointLock.lock();
+        try {
             if (mClosed) {
                 return;
             }
@@ -3601,6 +3834,9 @@ public final class Database implements CauseCloseable {
                     mCheckpointFlushState = CHECKPOINT_NOT_FLUSHING;
                     root.releaseShared();
                     mPageDb.exclusiveCommitLock().unlock();
+                    if (redo != null) {
+                        redo.checkpointAborted();
+                    }
                 }
                 throw e;
             }
@@ -3619,11 +3855,13 @@ public final class Database implements CauseCloseable {
             }
 
             if (mEventListener != null) {
-                double duration = (System.nanoTime() - mLastCheckpointNanos) / 1000000000.0;
+                double duration = (System.nanoTime() - mLastCheckpointNanos) / 1_000_000_000.0;
                 mEventListener.notify(EventType.CHECKPOINT_BEGIN,
                                       "Checkpoint completed in %1$1.3f seconds",
                                       duration, TimeUnit.SECONDS);
             }
+        } finally {
+            mCheckpointLock.unlock();
         }
     }
 

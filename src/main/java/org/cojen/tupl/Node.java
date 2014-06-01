@@ -40,8 +40,9 @@ final class Node extends Latch {
 
       bits 7..4: major type   0010 (fragment), 0100 (undo log),
                               0110 (internal), 0111 (bottom internal), 1000 (leaf)
-      bits 3..1: sub type     for leaf: 000 (normal)
-                              for internal: 001 (6 byte child pointers), 010 (8 byte pointers)
+      bits 3..1: sub type     for leaf: x0x (normal)
+                              for internal: x1x (6 byte child pointer + 2 byte count), x0x (unused)
+                              for both: bit 1 is set if low extremity, bit 3 for high extremity
       bit  0:    endianness   0 (little), 1 (big)
 
       TN == Tree Node
@@ -58,6 +59,8 @@ final class Node extends Latch {
         TYPE_TN_IN    = (byte) 0x64, // 0b0110_010_0
         TYPE_TN_BIN   = (byte) 0x74, // 0b0111_010_0
         TYPE_TN_LEAF  = (byte) 0x80; // 0b1000_000_0
+
+    static final byte LOW_EXTREMITY = 0x02, HIGH_EXTREMITY = 0x08;
 
     // Tree node header size.
     static final int TN_HEADER_SIZE = 12;
@@ -226,7 +229,7 @@ final class Node extends Latch {
     void asEmptyRoot() {
         mId = 0;
         mCachedState = CACHED_CLEAN;
-        mType = TYPE_TN_LEAF;
+        mType = TYPE_TN_LEAF | LOW_EXTREMITY | HIGH_EXTREMITY;
         clearEntries();
     }
 
@@ -255,7 +258,7 @@ final class Node extends Latch {
         // Prevent node from being marked dirty.
         mId = STUB_ID;
         mCachedState = CACHED_CLEAN;
-        mType = TYPE_TN_LEAF;
+        mType = TYPE_TN_LEAF | LOW_EXTREMITY | HIGH_EXTREMITY;
         mPage = EMPTY_BYTES;
         mGarbage = 0;
 
@@ -511,7 +514,7 @@ final class Node extends Latch {
             mChildNodes[childPos >> 1] = childNode;
         } catch (Throwable e) {
             releaseExclusive();
-            throw rethrow(e);
+            throw e;
         }
 
         // Release parent latch before child has been loaded. Any threads
@@ -541,7 +544,7 @@ final class Node extends Latch {
                 releaseExclusive();
             }
 
-            throw rethrow(e);
+            throw e;
         }
 
         return childNode;
@@ -634,7 +637,8 @@ final class Node extends Latch {
         mChildNodes = new Node[] {left, right};
 
         mPage = newPage;
-        mType = mType == TYPE_TN_LEAF ? TYPE_TN_BIN : TYPE_TN_IN;
+        mType = isLeaf() ? (byte) (TYPE_TN_BIN | LOW_EXTREMITY | HIGH_EXTREMITY)
+            : (byte) (TYPE_TN_IN | LOW_EXTREMITY | HIGH_EXTREMITY);
         mGarbage = 0;
         mLeftSegTail = leftSegTail;
         mRightSegTail = newPage.length - 1;
@@ -696,11 +700,12 @@ final class Node extends Latch {
             mRightSegTail = decodeUnsignedShortLE(page, 6);
             mSearchVecStart = decodeUnsignedShortLE(page, 8);
             mSearchVecEnd = decodeUnsignedShortLE(page, 10);
+            type &= ~(LOW_EXTREMITY | HIGH_EXTREMITY);
             if (type == TYPE_TN_IN || type == TYPE_TN_BIN) {
                 // TODO: recycle child node arrays
                 mChildNodes = new Node[numKeys() + 1];
-            } else if (type != TYPE_TN_LEAF) {
-                throw new CorruptDatabaseException("Unknown node type: " + type + ", id: " + id);
+            } else if (type >= 0) {
+                throw new CorruptDatabaseException("Unknown node type: " + mType + ", id: " + id);
             }
         }
 
@@ -870,7 +875,7 @@ final class Node extends Latch {
                 mCachedState = CACHED_CLEAN;
             } catch (Throwable e) {
                 releaseExclusive();
-                throw rethrow(e);
+                throw e;
             }
         }
 
@@ -908,7 +913,7 @@ final class Node extends Latch {
             empty.mSearchVecEnd = 0;
         }
 
-        int pos = empty.mType == TYPE_TN_LEAF ? -1 : 0;
+        int pos = isLeaf() ? -1 : 0;
 
         for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
             frame.mNode = empty;
@@ -1120,7 +1125,7 @@ final class Node extends Latch {
         }
         midPos += lowPos;
         if (midPos > highPos) {
-            return ~2 - highPos + lowPos;
+            midPos = highPos;
         }
 
         final byte[] page = mPage;
@@ -1504,14 +1509,14 @@ final class Node extends Latch {
      * @param pos position as provided by binarySearch; must be positive
      */
     long retrieveChildRefId(int pos) {
-        return decodeLongLE(mPage, mSearchVecEnd + 2 + (pos << 2));
+        return decodeUnsignedInt48LE(mPage, mSearchVecEnd + 2 + (pos << 2));
     }
 
     /**
      * @param index index in child node array
      */
     long retrieveChildRefIdFromIndex(int index) {
-        return decodeLongLE(mPage, mSearchVecEnd + 2 + (index << 3));
+        return decodeUnsignedInt48LE(mPage, mSearchVecEnd + 2 + (index << 3));
     }
 
     /**
@@ -1546,11 +1551,11 @@ final class Node extends Latch {
 
     /**
      * @param pos complement of position as provided by binarySearch; must be positive
+     * @param encodedKeyLen from calculateKeyLengthChecked
      */
-    void insertLeafEntry(Tree tree, int pos, byte[] key, byte[] value)
+    void insertLeafEntry(Tree tree, int pos, byte[] key, int encodedKeyLen, byte[] value)
         throws IOException
     {
-        int encodedKeyLen = calculateKeyLength(key);
         int encodedLen = encodedKeyLen + calculateLeafValueLength(value);
 
         int fragmented;
@@ -1561,6 +1566,7 @@ final class Node extends Latch {
             value = db.fragment(this, value, value.length,
                                 db.mMaxFragmentedEntrySize - encodedKeyLen);
             if (value == null) {
+                // Should not happen if key length was checked already.
                 throw new LargeKeyException(key.length);
             }
             encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
@@ -1578,9 +1584,11 @@ final class Node extends Latch {
 
     /**
      * @param pos complement of position as provided by binarySearch; must be positive
+     * @param encodedKeyLen from calculateKeyLengthChecked
      */
-    void insertBlankLeafEntry(Tree tree, int pos, byte[] key, long vlength) throws IOException {
-        int encodedKeyLen = calculateKeyLength(key);
+    void insertBlankLeafEntry(Tree tree, int pos, byte[] key, int encodedKeyLen, long vlength)
+        throws IOException
+    {
         long encodedLen = encodedKeyLen + calculateLeafValueLength(vlength);
 
         int fragmented;
@@ -1592,6 +1600,7 @@ final class Node extends Latch {
             Database db = tree.mDatabase;
             value = db.fragment(this, null, vlength, db.mMaxFragmentedEntrySize - encodedKeyLen);
             if (value == null) {
+                // Should not happen if key length was checked already.
                 throw new LargeKeyException(key.length);
             }
             encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
@@ -1609,11 +1618,11 @@ final class Node extends Latch {
 
     /**
      * @param pos complement of position as provided by binarySearch; must be positive
+     * @param encodedKeyLen from calculateKeyLengthChecked
      */
-    void insertFragmentedLeafEntry(Tree tree, int pos, byte[] key, byte[] value)
+    void insertFragmentedLeafEntry(Tree tree, int pos, byte[] key, int encodedKeyLen, byte[] value)
         throws IOException
     {
-        int encodedKeyLen = calculateKeyLength(key);
         int encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
 
         int entryLoc = createLeafEntry(tree, pos, encodedLen);
@@ -1623,6 +1632,21 @@ final class Node extends Latch {
         } else {
             copyToLeafEntry(key, VALUE_FRAGMENTED, value, entryLoc);
         }
+    }
+
+    /**
+     * Verifies that key can safely fit in the node.
+     */
+    static int calculateKeyLengthChecked(Tree tree, byte[] key) throws LargeKeyException {
+        int len = key.length;
+        if (len <= 64 & len > 0) {
+            // Always safe because minimum node size is 512 bytes.
+            return len + 1;
+        }
+        if (len > tree.mMaxKeySize) {
+            throw new LargeKeyException(len);
+        }
+        return len + 2;
     }
 
     /**
@@ -2149,17 +2173,25 @@ final class Node extends Latch {
 
             // FIXME: IOException; how to rollback the damage?
             InResult result = createInternalEntry
-                (tree, keyPos, split.splitKeyEncodedLength(), newChildPos, splitChild);
+                (tree, keyPos, split.splitKeyEncodedLength(), newChildPos, true);
 
             // Write new child id.
             encodeLongLE(result.mPage, result.mNewChildLoc, newChild.mId);
-            // Write key entry itself.
-            split.copySplitKeyToParent(result.mPage, result.mEntryLoc);
+
+            int entryLoc = result.mEntryLoc;
+            if (entryLoc < 0) {
+                // If loc is negative, then node was split and new key was chosen to be promoted.
+                // It must be written into the new split.
+                mSplit.setKey(split);
+            } else {
+                // Write key entry itself.
+                split.copySplitKeyToParent(result.mPage, entryLoc);
+            }
         } catch (Throwable e) {
             splitChild.releaseExclusive();
             newChild.releaseExclusive();
             releaseExclusive();
-            throw rethrow(e);
+            throw e;
         }
         
         splitChild.releaseExclusive();
@@ -2170,7 +2202,7 @@ final class Node extends Latch {
             tree.mDatabase.makeEvictable(newChild);
         } catch (Throwable e) {
             releaseExclusive();
-            throw rethrow(e);
+            throw e;
         }
     }
 
@@ -2181,15 +2213,14 @@ final class Node extends Latch {
      *
      * @param keyPos 2-based position
      * @param newChildPos 8-based position
-     * @param splitChild pass null if split not allowed
-     * @return null if entry must be split, but split is not allowed
+     * @param allowSplit true if this internal node can be split as a side-effect
+     * @return result; if node was split, key and entry loc is -1 if new key was promoted to parent
+     * @throws AssertionError if entry must be split to make room but split is not allowed
      */
     private InResult createInternalEntry(Tree tree, int keyPos, int encodedLen,
-                                         int newChildPos, Node splitChild)
+                                         int newChildPos, boolean allowSplit)
         throws IOException
     {
-        InResult result = null;
-
         int searchVecStart = mSearchVecStart;
         int searchVecEnd = mSearchVecEnd;
 
@@ -2294,19 +2325,12 @@ final class Node extends Latch {
 
                 // Node is full, so split it.
 
-                if (splitChild == null) {
-                    // Caller doesn't allow split.
-                    return null;
+                if (!allowSplit) {
+                    throw new AssertionError("Split not allowed");
                 }
 
                 // No side-effects if an IOException is thrown here.
-                result = splitInternal(tree, keyPos, newChildPos, encodedLen);
-
-                page = result.mPage;
-                keyPos = result.mKeyLoc;
-                newChildPos = result.mNewChildLoc;
-                entryLoc = result.mEntryLoc;
-                break alloc;
+                return splitInternal(tree, encodedLen, keyPos, newChildPos);
             }
 
             int vecLen = searchVecEnd - searchVecStart + 2;
@@ -2359,13 +2383,10 @@ final class Node extends Latch {
         // Write pointer to key entry.
         encodeShortLE(page, keyPos, entryLoc);
 
-        if (result == null) {
-            result = new InResult();
-            result.mPage = page;
-            result.mKeyLoc = keyPos;
-            result.mNewChildLoc = newChildPos;
-            result.mEntryLoc = entryLoc;
-        }
+        InResult result = new InResult();
+        result.mPage = page;
+        result.mNewChildLoc = newChildPos;
+        result.mEntryLoc = entryLoc;
 
         return result;
     }
@@ -2505,7 +2526,7 @@ final class Node extends Latch {
             // Leftmost key to move comes from the parent.
             int pos = left.highestInternalPos();
             InResult result = left.createInternalEntry
-                (tree, pos, parentKeyLen, (pos + 2) << 2, null);
+                (tree, pos, parentKeyLen, (pos + 2) << 2, false);
             // Note: Must access left page each time, since compaction can replace it.
             arraycopy(parentPage, parentKeyLoc, left.mPage, result.mEntryLoc, parentKeyLen);
 
@@ -2514,7 +2535,7 @@ final class Node extends Latch {
                 int keyLoc = decodeUnsignedShortLE(rightPage, searchVecLoc);
                 int encodedLen = keyLengthAtLoc(rightPage, keyLoc);
                 pos = left.highestInternalPos();
-                result = left.createInternalEntry(tree, pos, encodedLen, (pos + 2) << 2, null);
+                result = left.createInternalEntry(tree, pos, encodedLen, (pos + 2) << 2, false);
                 // Note: Must access left page each time, since compaction can replace it.
                 arraycopy(rightPage, keyLoc, left.mPage, result.mEntryLoc, encodedLen);
                 garbageAccum += encodedLen;
@@ -2711,7 +2732,7 @@ final class Node extends Latch {
 
         try {
             // Rightmost key to move comes from the parent.
-            InResult result = right.createInternalEntry(tree, 0, parentKeyLen, 0, null);
+            InResult result = right.createInternalEntry(tree, 0, parentKeyLen, 0, false);
             // Note: Must access right page each time, since compaction can replace it.
             arraycopy(parentPage, parentKeyLoc, right.mPage, result.mEntryLoc, parentKeyLen);
 
@@ -2719,7 +2740,7 @@ final class Node extends Latch {
             for (; searchVecLoc > firstSearchVecLoc; searchVecLoc -= 2) {
                 int keyLoc = decodeUnsignedShortLE(leftPage, searchVecLoc);
                 int encodedLen = keyLengthAtLoc(leftPage, keyLoc);
-                result = right.createInternalEntry(tree, 0, encodedLen, 0, null);
+                result = right.createInternalEntry(tree, 0, encodedLen, 0, false);
                 // Note: Must access right page each time, since compaction can replace it.
                 arraycopy(leftPage, keyLoc, right.mPage, result.mEntryLoc, encodedLen);
                 garbageAccum += encodedLen;
@@ -2804,7 +2825,7 @@ final class Node extends Latch {
             return sibling;
         } catch (Throwable e) {
             sibling.releaseExclusive();
-            throw rethrow(e);
+            throw e;
         }
     }
 
@@ -2898,8 +2919,7 @@ final class Node extends Latch {
                 value = db.fragment(this, value, value.length,
                                     db.mMaxFragmentedEntrySize - keyLen);
                 if (value == null) {
-                    // TODO: Supply proper key length, not the encoded
-                    // length. Subtracting 2 is just a guess.
+                    // Should not happen if key length was checked already.
                     throw new LargeKeyException(keyLen - 2);
                 }
                 encodedLen = keyLen + calculateFragmentedValueLength(value);
@@ -2938,6 +2958,7 @@ final class Node extends Latch {
                                        garbage + leftSpace + rightSpace);
                     value = db.fragment(this, value, value.length, max);
                     if (value == null) {
+                        // Should not happen if key length was checked already.
                         throw new LargeKeyException(key.length);
                     }
                     encodedLen = keyLen + calculateFragmentedValueLength(value);
@@ -3188,6 +3209,9 @@ final class Node extends Latch {
             frame = prev;
         }
 
+        // If right node was high extremity, left node now is.
+        leftNode.mType |= rightNode.mType & HIGH_EXTREMITY;
+
         tree.mDatabase.deleteNode(rightNode);
     }
 
@@ -3211,7 +3235,7 @@ final class Node extends Latch {
         // Create space to absorb parent key.
         int leftEndPos = leftNode.highestInternalPos();
         InResult result = leftNode.createInternalEntry
-            (tree, leftEndPos, parentLen, (leftEndPos += 2) << 2, null);
+            (tree, leftEndPos, parentLen, (leftEndPos += 2) << 2, false);
 
         // Copy child id associated with parent key.
         final byte[] rightPage = rightNode.mPage;
@@ -3231,7 +3255,7 @@ final class Node extends Latch {
 
             // Allocate entry for left node.
             int pos = leftNode.highestInternalPos();
-            result = leftNode.createInternalEntry(tree, pos, encodedLen, (pos + 2) << 2, null);
+            result = leftNode.createInternalEntry(tree, pos, encodedLen, (pos + 2) << 2, false);
 
             // Copy child id.
             arraycopy(rightPage, rightChildIdsLoc, result.mPage, result.mNewChildLoc, 8);
@@ -3260,6 +3284,9 @@ final class Node extends Latch {
             frame.bind(leftNode, leftEndPos + framePos);
             frame = prev;
         }
+
+        // If right node was high extremity, left node now is.
+        leftNode.mType |= rightNode.mType & HIGH_EXTREMITY;
 
         tree.mDatabase.deleteNode(rightNode);
     }
@@ -3591,7 +3618,6 @@ final class Node extends Latch {
         }
 
         Node newNode = tree.mDatabase.allocUnevictableNode();
-        newNode.mType = TYPE_TN_LEAF;
         newNode.mGarbage = 0;
 
         byte[] newPage = newNode.mPage;
@@ -3601,7 +3627,7 @@ final class Node extends Latch {
             // descending. Split into new left node, but only the new entry
             // goes into the new node.
 
-            mSplit = new Split(false, newNode);
+            mSplit = newSplitLeft(newNode);
             // Choose an appropriate middle key for suffix compression.
             mSplit.setKey(midKey(key, 0));
 
@@ -3631,7 +3657,7 @@ final class Node extends Latch {
             // ascending. Split into new right node, but only the new entry
             // goes into the new node.
 
-            mSplit = new Split(true, newNode);
+            mSplit = newSplitRight(newNode);
             // Choose an appropriate middle key for suffix compression.
             mSplit.setKey(midKey(pos - searchVecStart - 2, key));
 
@@ -3708,7 +3734,7 @@ final class Node extends Latch {
             }
 
             // Allocate Split object first, in case it throws an OutOfMemoryError.
-            mSplit = new Split(false, newNode);
+            mSplit = newSplitLeft(newNode);
 
             // Prune off the left end of this node.
             mSearchVecStart = searchVecLoc;
@@ -3789,7 +3815,7 @@ final class Node extends Latch {
             }
 
             // Allocate Split object first, in case it throws an OutOfMemoryError.
-            mSplit = new Split(true, newNode);
+            mSplit = newSplitRight(newNode);
 
             // Prune off the right end of this node.
             mSearchVecEnd = searchVecLoc;
@@ -3844,6 +3870,7 @@ final class Node extends Latch {
                 int encodedKeyLen = calculateKeyLength(key);
                 value = db.fragment(this, value, value.length, max - encodedKeyLen);
                 if (value == null) {
+                    // Should not happen if key length was checked already.
                     throw new LargeKeyException(key.length);
                 }
                 fragmented = VALUE_FRAGMENTED;
@@ -3861,9 +3888,10 @@ final class Node extends Latch {
 
     /**
      * @throws IOException if new node could not be allocated; no side-effects
+     * @return split result; key and entry loc is -1 if new key was promoted to parent
      */
     private InResult splitInternal
-        (final Tree tree, final int keyPos, final int newChildPos, final int encodedLen)
+        (final Tree tree, final int encodedLen, final int keyPos, final int newChildPos)
         throws IOException
     {
         if (mSplit != null) {
@@ -3876,17 +3904,76 @@ final class Node extends Latch {
 
         final byte[] page = mPage;
 
+        // Alloc early in case an exception is thrown.
         final Node newNode = tree.mDatabase.allocUnevictableNode();
-        newNode.mType = mType;
         newNode.mGarbage = 0;
 
         final byte[] newPage = newNode.mPage;
 
         final InResult result = new InResult();
-        result.mPage = newPage;
 
         final int searchVecStart = mSearchVecStart;
         final int searchVecEnd = mSearchVecEnd;
+
+        if ((searchVecEnd - searchVecStart) == 2 && keyPos == 2) {
+            // Node has two keys and the key to insert should go in the middle. The new key
+            // should not be inserted, but instead be promoted to the parent. Treat this as a
+            // special case -- the code below only promotes an existing key to the parent.
+            // This case is expected to only occur when using very large keys.
+
+            // Signals that key should not be inserted.
+            result.mEntryLoc = -1;
+
+            int leftKeyLoc = decodeUnsignedShortLE(page, searchVecStart);
+            int leftKeyLen = keyLengthAtLoc(page, leftKeyLoc);
+
+            // Assume a large key will be inserted later, so arrange it with room: entry at far
+            // left and search vector at far right.
+            arraycopy(page, leftKeyLoc, newPage, TN_HEADER_SIZE, leftKeyLen);
+            int leftSearchVecStart = newPage.length - (2 + 8 + 8);
+            encodeShortLE(newPage, leftSearchVecStart, TN_HEADER_SIZE);
+
+            if (newChildPos == 8) {
+                // Caller must store child id into left node.
+                result.mPage = newPage;
+                result.mNewChildLoc = leftSearchVecStart + (2 + 8);
+            } else {
+                if (newChildPos != 16) {
+                    throw new AssertionError();
+                }
+                // Caller must store child id into right node.
+                result.mPage = page;
+                result.mNewChildLoc = searchVecEnd + (2 + 8);
+            }
+
+            // Copy one or two left existing child ids to left node (newChildPos is 8 or 16).
+            arraycopy(page, searchVecEnd + 2, newPage, leftSearchVecStart + 2, newChildPos);
+
+            // Split references to child node instances. New child node has already
+            // been placed into mChildNodes by caller.
+            // TODO: recycle child node arrays
+            newNode.mChildNodes = new Node[] {mChildNodes[0], mChildNodes[1]};
+            mChildNodes = new Node[] {mChildNodes[2], mChildNodes[3]};
+
+            newNode.mLeftSegTail = TN_HEADER_SIZE + leftKeyLen;
+            newNode.mRightSegTail = leftSearchVecStart + (2 + 8 + 8 - 1);
+            newNode.mSearchVecStart = leftSearchVecStart;
+            newNode.mSearchVecEnd = leftSearchVecStart;
+            newNode.releaseExclusive();
+
+            // Prune off the left end of this node by shifting vector towards child ids.
+            arraycopy(page, searchVecEnd, page, searchVecEnd + 8, 2);
+            mSearchVecStart = mSearchVecEnd = searchVecEnd + 8;
+
+            mGarbage += leftKeyLen;
+
+            // Caller must set the split key.
+            mSplit = newSplitLeft(newNode);
+
+            return result;
+        }
+
+        result.mPage = newPage;
         final int keyLoc = keyPos + searchVecStart;
 
         int garbageAccum;
@@ -3977,7 +4064,7 @@ final class Node extends Latch {
 
                         if (newKeyLoc != 0) {
                             // ...and split key has been found.
-                            split = new Split(false, newNode);
+                            split = newSplitLeft(newNode);
                             split.setKey(retrieveKeyAtLoc(page, entryLoc));
                             break;
                         }
@@ -4097,7 +4184,7 @@ final class Node extends Latch {
 
                         if (newKeyLoc != 0) {
                             // ...and split key has been found.
-                            split = new Split(true, newNode);
+                            split = newSplitRight(newNode);
                             split.setKey(retrieveKeyAtLoc(page, entryLoc));
                             break moveEntries;
                         }
@@ -4182,7 +4269,9 @@ final class Node extends Latch {
         mGarbage += garbageAccum;
         mSplit = split;
 
-        result.mKeyLoc = newKeyLoc;
+        // Write pointer to key entry.
+        encodeShortLE(newPage, newKeyLoc, result.mEntryLoc);
+
         return result;
     }
 
@@ -4273,7 +4362,6 @@ final class Node extends Latch {
 
         InResult result = new InResult();
         result.mPage = dest;
-        result.mKeyLoc = newLoc;
         result.mNewChildLoc = newSearchVecLoc + childPos;
         result.mEntryLoc = destLoc;
 
@@ -4286,9 +4374,24 @@ final class Node extends Latch {
      */
     static final class InResult {
         byte[] mPage;
-        int mKeyLoc;
-        int mNewChildLoc;
-        int mEntryLoc;
+        int mNewChildLoc; // location of child pointer
+        int mEntryLoc;    // location of key entry, referenced by search vector
+    }
+
+    private Split newSplitLeft(Node newNode) {
+        Split split = new Split(false, newNode);
+        // New left node cannot be a high extremity, and this node cannot be a low extremity.
+        newNode.mType = (byte) (mType & ~HIGH_EXTREMITY);
+        mType &= ~LOW_EXTREMITY;
+        return split;
+    }
+
+    private Split newSplitRight(Node newNode) {
+        Split split = new Split(true, newNode);
+        // New right node cannot be a low extremity, and this node cannot be a high extremity.
+        newNode.mType = (byte) (mType & ~LOW_EXTREMITY);
+        mType &= ~HIGH_EXTREMITY;
+        return split;
     }
 
     /**
@@ -4319,11 +4422,6 @@ final class Node extends Latch {
         String prefix;
 
         switch (mType) {
-        default:
-            return "Node: {id=" + mId +
-                ", cachedState=" + mCachedState +
-                ", lockState=" + super.toString() +
-                '}';
         case TYPE_UNDO_LOG:
             return "UndoNode: {id=" + mId +
                 ", cachedState=" + mCachedState +
@@ -4337,13 +4435,26 @@ final class Node extends Latch {
                 ", lockState=" + super.toString() +
                 '}';
         case TYPE_TN_IN:
+        case (TYPE_TN_IN | LOW_EXTREMITY):
+        case (TYPE_TN_IN | HIGH_EXTREMITY):
+        case (TYPE_TN_IN | LOW_EXTREMITY | HIGH_EXTREMITY):
             prefix = "Internal";
             break;
 
         case TYPE_TN_BIN:
+        case (TYPE_TN_BIN | LOW_EXTREMITY):
+        case (TYPE_TN_BIN | HIGH_EXTREMITY):
+        case (TYPE_TN_BIN | LOW_EXTREMITY | HIGH_EXTREMITY):
             prefix = "BottomInternal";
             break;
-
+        default:
+            if (!isLeaf()) {
+                return "Node: {id=" + mId +
+                    ", cachedState=" + mCachedState +
+                    ", lockState=" + super.toString() +
+                    '}';
+            }
+            // Fallthrough...
         case TYPE_TN_LEAF:
             prefix = "Leaf";
             break;
@@ -4353,6 +4464,7 @@ final class Node extends Latch {
             ", cachedState=" + mCachedState +
             ", isSplit=" + (mSplit != null) +
             ", availableBytes=" + availableBytes() +
+            ", extremity=" + (mType & (LOW_EXTREMITY | HIGH_EXTREMITY)) +
             ", lockState=" + super.toString() +
             '}';
     }
@@ -4365,8 +4477,9 @@ final class Node extends Latch {
      * @return false if should stop
      */
     boolean verifyTreeNode(int level, VerificationObserver observer) {
-        if (mType != TYPE_TN_IN && mType != TYPE_TN_BIN && mType != TYPE_TN_LEAF) {
-            return verifyFailed(level, observer, "Not a tree node");
+        int type = mType & ~(LOW_EXTREMITY | HIGH_EXTREMITY);
+        if (type != TYPE_TN_IN && type != TYPE_TN_BIN && !isLeaf()) {
+            return verifyFailed(level, observer, "Not a tree node: " + type);
         }
 
         final byte[] page = mPage;
@@ -4402,7 +4515,7 @@ final class Node extends Latch {
             LHashTable.Int childIds = new LHashTable.Int(512);
 
             for (int i = childIdsStart; i < childIdsEnd; i += 8) {
-                long childId = decodeLongLE(page, i);
+                long childId = decodeUnsignedInt48LE(page, i);
                 if (childId < 0 || childId == 0 || childId == 1) {
                     return verifyFailed(level, observer, "Illegal child id: " + childId);
                 }

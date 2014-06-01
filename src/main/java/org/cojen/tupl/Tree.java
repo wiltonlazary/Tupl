@@ -16,6 +16,8 @@
 
 package org.cojen.tupl;
 
+import java.io.DataInput;
+import java.io.DataOutput;
 import java.io.IOException;
 
 import java.util.concurrent.locks.Lock;
@@ -27,7 +29,7 @@ import static org.cojen.tupl.Utils.*;
  *
  * @author Brian S O'Neill
  */
-final class Tree implements Index {
+class Tree implements Index {
     // Reserved internal tree ids.
     static final int
         REGISTRY_ID = 0,
@@ -57,6 +59,7 @@ final class Tree implements Index {
     // object when the tree root changes.
     final Node mRoot;
 
+    final int mMaxKeySize;
     final int mMaxEntrySize;
 
     // Maintain a stack of stubs, which are created when root nodes are
@@ -72,16 +75,23 @@ final class Tree implements Index {
         mIdBytes = idBytes;
         mName = name;
         mRoot = root;
+
+        int pageSize = db.pageSize();
+
+        // Key size is limited to ensure that internal nodes can hold at least two keys.
+        // Absolute maximum is dictated by key encoding, as described in Node class.
+        mMaxKeySize = Math.min(16383, (pageSize >> 1) - 22);
+
         // Limit maximum non-fragmented entry size to 0.75 of usable node size.
-        mMaxEntrySize = ((db.pageSize() - Node.TN_HEADER_SIZE) * 3) >> 2;
+        mMaxEntrySize = ((pageSize - Node.TN_HEADER_SIZE) * 3) >> 2;
     }
 
     @Override
-    public String toString() {
+    public final String toString() {
         return toString(this);
     }
 
-    static String toString(Index ix) {
+    static final String toString(Index ix) {
         StringBuilder b = new StringBuilder(ix.getClass().getName());
         b.append('@').append(Integer.toHexString(ix.hashCode()));
         b.append(" {");
@@ -92,23 +102,23 @@ final class Tree implements Index {
     }
 
     @Override
-    public Ordering getOrdering() {
+    public final Ordering getOrdering() {
         return Ordering.ASCENDING;
     }
 
     @Override
-    public long getId() {
+    public final long getId() {
         return mId;
     }
 
     @Override
-    public byte[] getName() {
+    public final byte[] getName() {
         byte[] name = mName;
         return name == null ? null : name.clone();
     }
 
     @Override
-    public String getNameString() {
+    public final String getNameString() {
         byte[] name = mName;
         try {
             return name == null ? "null" : new String(name, "UTF-8");
@@ -122,44 +132,8 @@ final class Tree implements Index {
         return new TreeCursor(this, txn);
     }
 
-    /*
     @Override
-    public long count(Transaction txn) throws IOException {
-        // TODO
-        throw null;
-    }
-    */
-
-    /*
-    @Override
-    public long count(Transaction txn,
-                      byte[] start, boolean startInclusive,
-                      byte[] end, boolean endInclusive)
-        throws IOException
-    {
-        // TODO
-        throw null;
-    }
-    */
-
-    /*
-    @Override
-    public boolean exists(Transaction txn, byte[] key) throws IOException {
-        // TODO
-        throw null;
-    }
-    */
-
-    /*
-    @Override
-    public boolean exists(Transaction txn, byte[] key, byte[] value) throws IOException {
-        // TODO
-        throw null;
-    }
-    */
-
-    @Override
-    public byte[] load(Transaction txn, byte[] key) throws IOException {
+    public final byte[] load(Transaction txn, byte[] key) throws IOException {
         check(txn);
         Locker locker = lockForLoad(txn, key);
         try {
@@ -220,138 +194,14 @@ final class Tree implements Index {
     }
 
     @Override
-    public boolean delete(Transaction txn, byte[] key) throws IOException {
+    public final boolean delete(Transaction txn, byte[] key) throws IOException {
         return replace(txn, key, null);
     }
 
     @Override
-    public boolean remove(Transaction txn, byte[] key, byte[] value) throws IOException {
+    public final boolean remove(Transaction txn, byte[] key, byte[] value) throws IOException {
         return update(txn, key, value, null);
     }
-
-    /*
-    @Override
-    public void clear(Transaction txn) throws IOException {
-        if (txn == null) {
-            TreeCursor cursor = new TreeCursor(this, null);
-            try {
-                cursor.autoload(false);
-                cursor.first();
-                cursor.clearTo(null, false);
-            } finally {
-                cursor.reset();
-            }
-            return;
-        }
-
-        if (txn.lockMode() == LockMode.UNSAFE) {
-            // TODO: Optimize for LockMode.UNSAFE.
-            throw null;
-        }
-
-        txn.enter();
-        try {
-            txn.lockMode(LockMode.UPGRADABLE_READ);
-            TreeCursor cursor = new TreeCursor(this, txn);
-            try {
-                cursor.autoload(false);
-                cursor.first();
-                while (cursor.key() != null) {
-                    cursor.store(null);
-                    cursor.next();
-                }
-            } finally {
-                // TODO: this can deadlock, because exception can be thrown at anytime
-                cursor.reset();
-            }
-            txn.commit();
-        } finally {
-            txn.exit();
-        }
-    }
-
-    @Override
-    public void clear(Transaction txn,
-                      byte[] start, boolean startInclusive,
-                      byte[] end, boolean endInclusive)
-        throws IOException
-    {
-        if (txn == null) {
-            TreeCursor cursor = new TreeCursor(this, null);
-            try {
-                cursor.autoload(false);
-                if (start == null) {
-                    cursor.first();
-                } else if (startInclusive) {
-                    cursor.findGe(start);
-                } else {
-                    cursor.findGt(start);
-                }
-                cursor.clearTo(end, endInclusive);
-            } finally {
-                cursor.reset();
-            }
-            return;
-        }
-
-        if (txn.lockMode() == LockMode.UNSAFE) {
-            // TODO: Optimize for LockMode.UNSAFE.
-            throw null;
-        }
-
-        txn.enter();
-        try {
-            txn.lockMode(LockMode.UPGRADABLE_READ);
-            TreeCursor cursor = new TreeCursor(this, txn);
-            try {
-                cursor.autoload(false);
-
-                if (start == null) {
-                    cursor.first();
-                } else if (startInclusive) {
-                    cursor.findGe(start);
-                } else {
-                    cursor.findGt(start);
-                }
-
-                if (end == null) {
-                    while (cursor.key() != null) {
-                        cursor.store(null);
-                        cursor.next();
-                    }
-                } else if (endInclusive) {
-                    byte[] key;
-                    while ((key = cursor.key()) != null) {
-                        int compare = compareKeys(key, 0, key.length, end, 0, end.length);
-                        if (compare > 0) {
-                            break;
-                        }
-                        cursor.store(null);
-                        if (compare >= 0) {
-                            break;
-                        }
-                        cursor.next();
-                    }
-                } else {
-                    byte[] key;
-                    while ((key = cursor.key()) != null) {
-                        if (compareKeys(key, 0, key.length, end, 0, end.length) >= 0) {
-                            break;
-                        }
-                        cursor.store(null);
-                        cursor.next();
-                    }
-                }
-            } finally {
-                // TODO: this can deadlock, because exception can be thrown at anytime
-                cursor.reset();
-            }
-            txn.commit();
-        } finally {
-            txn.exit();
-        }
-    }
-    */
 
     @Override
     public Stream newStream() {
@@ -361,42 +211,42 @@ final class Tree implements Index {
     }
 
     @Override
-    public View viewGe(byte[] key) {
+    public final View viewGe(byte[] key) {
         return BoundedView.viewGe(this, key);
     }
 
     @Override
-    public View viewGt(byte[] key) {
+    public final View viewGt(byte[] key) {
         return BoundedView.viewGt(this, key);
     }
 
     @Override
-    public View viewLe(byte[] key) {
+    public final View viewLe(byte[] key) {
         return BoundedView.viewLe(this, key);
     }
 
     @Override
-    public View viewLt(byte[] key) {
+    public final View viewLt(byte[] key) {
         return BoundedView.viewLt(this, key);
     }
 
     @Override
-    public View viewPrefix(byte[] prefix, int trim) {
+    public final View viewPrefix(byte[] prefix, int trim) {
         return BoundedView.viewPrefix(this, prefix, trim);
     }
 
     @Override
-    public View viewReverse() {
+    public final View viewReverse() {
         return new ReverseView(this);
     }
 
     @Override
-    public View viewUnmodifiable() {
+    public final View viewUnmodifiable() {
         return UnmodifiableView.apply(this);
     }
 
     @Override
-    public boolean isUnmodifiable() {
+    public final boolean isUnmodifiable() {
         return isClosed();
     }
 
@@ -404,7 +254,7 @@ final class Tree implements Index {
      * Returns a view which can be passed to an observer. Internal trees are returned as
      * unmodifiable.
      */
-    Index observableView() {
+    final Index observableView() {
         return isInternal(mId) ? new UnmodifiableView(this) : this;
     }
 
@@ -412,7 +262,7 @@ final class Tree implements Index {
      * @param view view to pass to observer
      * @return false if compaction should stop
      */
-    boolean compactTree(Index view, long highestNodeId, CompactionObserver observer)
+    final boolean compactTree(Index view, long highestNodeId, CompactionObserver observer)
         throws IOException
     {
         try {
@@ -453,7 +303,7 @@ final class Tree implements Index {
     }
 
     @Override
-    public boolean verify(VerificationObserver observer) throws IOException {
+    public final boolean verify(VerificationObserver observer) throws IOException {
         if (observer == null) {
             observer = new VerificationObserver();
         }
@@ -469,28 +319,29 @@ final class Tree implements Index {
      * @param view view to pass to observer
      * @return false if should stop
      */
-    boolean verifyTree(Index view, VerificationObserver observer) throws IOException {
+    final boolean verifyTree(Index view, VerificationObserver observer) throws IOException {
         TreeCursor cursor = new TreeCursor(this, Transaction.BOGUS);
         try {
             cursor.first();
             int height = cursor.height();
             if (!observer.indexBegin(view, height)) {
+                cursor.reset();
                 return false;
             }
             if (!cursor.verify(height, observer)) {
+                cursor.reset();
                 return false;
             }
+            cursor.reset();
         } catch (Throwable e) {
             observer.failed = true;
-            throw rethrow(e);
-        } finally {
-            cursor.reset();
+            throw e;
         }
         return true;
     }
 
     @Override
-    public void close() throws IOException {
+    public final void close() throws IOException {
         Node root = mRoot;
         root.acquireExclusive();
         try {
@@ -545,7 +396,7 @@ final class Tree implements Index {
     }
 
     @Override 
-    public boolean isClosed() {
+    public final boolean isClosed() {
         Node root = mRoot;
         root.acquireShared();
         boolean closed = root.mPage == EMPTY_BYTES;
@@ -554,7 +405,7 @@ final class Tree implements Index {
     }
 
     @Override
-    public void drop() throws IOException {
+    public final void drop() throws IOException {
         long rootId;
         int cachedState;
 
@@ -595,7 +446,219 @@ final class Tree implements Index {
         mDatabase.dropClosedTree(this, rootId, cachedState);
     }
 
-    void check(Transaction txn) throws IllegalArgumentException {
+    static interface NodeVisitor {
+        void visit(Node node) throws IOException;
+    }
+
+    /**
+     * Performs a depth-first traversal of the tree, only visting loaded nodes. Nodes passed to
+     * the visitor are latched exclusively, and they must be released by the visitor.
+     */
+    final void traverseLoaded(NodeVisitor visitor) throws IOException {
+        Node node = mRoot;
+        node.acquireExclusive();
+
+        if (node.mSplit != null) {
+            // Create a temporary frame for the root split.
+            TreeCursorFrame frame = new TreeCursorFrame();
+            frame.bind(node, 0);
+            try {
+                node = finishSplit(frame, node);
+            } catch (Throwable e) {
+                TreeCursorFrame.popAll(frame);
+                throw e;
+            }
+        }
+
+        // Frames are only used for backtracking up the tree. Frame creation and binding is
+        // performed late, and none are created for leaf nodes.
+        TreeCursorFrame frame = null;
+        int pos = 0;
+
+        while (true) {
+            toLower: while (true) {
+                Node[] childNodes = node.mChildNodes;
+
+                if (childNodes == null) {
+                    break toLower;
+                }
+
+                while (true) {
+                    int i = pos >> 1;
+                    if (i >= childNodes.length) {
+                        break toLower;
+                    }
+                    Node child = childNodes[i];
+                    if (child != null) {
+                        long childId = node.retrieveChildRefId(pos);
+                        child.acquireExclusive();
+                        // Need to check again in case evict snuck in.
+                        if (childId != child.mId) {
+                            childNodes[i] = null;
+                            child.releaseExclusive();
+                        } else {
+                            frame = new TreeCursorFrame(frame);
+                            frame.bind(node, pos);
+                            node.releaseExclusive();
+                            node = child;
+                            pos = 0;
+                            continue toLower;
+                        }
+                    }
+                    pos += 2;
+                }
+            }
+
+            try {
+                visitor.visit(node);
+            } catch (Throwable e) {
+                TreeCursorFrame.popAll(frame);
+                throw e;
+            }
+
+            if (frame == null) {
+                return;
+            }
+
+            node = frame.acquireExclusive();
+
+            if (node.mSplit != null) {
+                try {
+                    node = finishSplit(frame, node);
+                } catch (Throwable e) {
+                    TreeCursorFrame.popAll(frame);
+                    throw e;
+                }
+            }
+
+            pos = frame.mNodePos;
+            frame = frame.pop();
+            pos += 2;
+        }
+    }
+
+    final void writeCachePrimer(final DataOutput dout) throws IOException {
+        traverseLoaded(new NodeVisitor() {
+            public void visit(Node node) throws IOException {
+                byte[] midKey;
+                try {
+                    if (!node.isLeaf()) {
+                        return;
+                    }
+                    int numKeys = node.numKeys();
+                    if (numKeys > 1) {
+                        int highPos = numKeys & ~1;
+                        midKey = node.midKey(highPos - 2, node, highPos);
+                    } else if (numKeys == 1) {
+                        midKey = node.retrieveKey(0);
+                    } else {
+                        return;
+                    }
+                } finally {
+                    node.releaseExclusive();
+                }
+
+                dout.writeShort(midKey.length);
+                dout.write(midKey);
+            }
+        });
+
+        // Terminator. Key is limited to 16383 bytes; see LargeKeyException.
+        dout.writeShort(0xffff);
+    }
+
+    final void applyCachePrimer(DataInput din) throws IOException {
+        Cursor c = newCursor(Transaction.BOGUS);
+        try {
+            c.autoload(false);
+            while (true) {
+                int len = din.readUnsignedShort();
+                if (len == 0xffff) {
+                    break;
+                }
+                byte[] key = new byte[len];
+                din.readFully(key);
+                c.findNearby(key);
+            }
+        } finally {
+            c.reset();
+        }
+    }
+
+    static final void skipCachePrimer(DataInput din) throws IOException {
+        while (true) {
+            int len = din.readUnsignedShort();
+            if (len == 0xffff) {
+                break;
+            }
+            din.skipBytes(len);
+        }
+    }
+
+    /**
+     * Caller must hold exclusive latch and it must verify that node has
+     * split. Node latch is released if an exception is thrown.
+     *
+     * @param frame bound cursor frame
+     * @param node node which is bound to the frame, latched exclusively
+     * @return replacement node, still latched
+     */
+    final Node finishSplit(final TreeCursorFrame frame, Node node) throws IOException {
+        while (node == mRoot) {
+            Node stub;
+            if (hasStub()) {
+                // Don't wait for stub latch, to avoid deadlock. The stub stack
+                // is latched up upwards here, but downwards by cursors.
+                stub = tryPopStub();
+                if (stub == null) {
+                    // Latch not immediately available, so release root latch
+                    // and try again. This implementation spins, but root
+                    // splits are expected to be infrequent.
+                    Thread waiter = node.getFirstQueuedThread();
+                    node.releaseExclusive();
+                    do {
+                        Thread.yield();
+                    } while (waiter != null && node.getFirstQueuedThread() == waiter);
+                    node = frame.acquireExclusive();
+                    if (node.mSplit == null) {
+                        return node;
+                    }
+                    continue;
+                }
+                stub = Tree.validateStub(stub);
+            } else {
+                stub = null;
+            }
+            try {
+                node.finishSplitRoot(this, stub);
+                // Must return the node as referenced by the frame, which is no
+                // longer the root node.
+                node.releaseExclusive();
+                return frame.acquireExclusive();
+            } catch (Throwable e) {
+                node.releaseExclusive();
+                throw e;
+            }
+        }
+
+        final TreeCursorFrame parentFrame = frame.mParentFrame;
+        node.releaseExclusive();
+
+        Node parentNode = parentFrame.acquireExclusive();
+        while (true) {
+            if (parentNode.mSplit != null) {
+                parentNode = finishSplit(parentFrame, parentNode);
+            }
+            node = frame.acquireExclusive();
+            if (node.mSplit == null) {
+                parentNode.releaseExclusive();
+                return node;
+            }
+            parentNode.insertSplitChildRef(this, parentFrame.mNodePos, node);
+        }
+    }
+
+    final void check(Transaction txn) throws IllegalArgumentException {
         if (txn != null) {
             Database txnDb = txn.mDatabase;
             if (txnDb != null & txnDb != mDatabase) {
@@ -610,7 +673,7 @@ final class Tree implements Index {
      *
      * @param locker optional locker
      */
-    boolean isLockAvailable(Locker locker, byte[] key, int hash) {
+    final boolean isLockAvailable(Locker locker, byte[] key, int hash) {
         return mLockManager.isAvailable(locker, mId, key, hash);
     }
 
@@ -646,7 +709,7 @@ final class Tree implements Index {
      * @param key non-null key instance
      * @return non-null Locker instance if caller should unlock when write is done
      */
-    Locker lockExclusive(Transaction txn, byte[] key, int hash) throws LockFailureException {
+    final Locker lockExclusive(Transaction txn, byte[] key, int hash) throws LockFailureException {
         if (txn == null) {
             return lockExclusiveLocal(key, hash);
         }
@@ -658,18 +721,18 @@ final class Tree implements Index {
         return null;
     }
 
-    Locker lockSharedLocal(byte[] key, int hash) throws LockFailureException {
+    final Locker lockSharedLocal(byte[] key, int hash) throws LockFailureException {
         return mLockManager.lockSharedLocal(mId, key, hash);
     }
 
-    Locker lockExclusiveLocal(byte[] key, int hash) throws LockFailureException {
+    final Locker lockExclusiveLocal(byte[] key, int hash) throws LockFailureException {
         return mLockManager.lockExclusiveLocal(mId, key, hash);
     }
 
     /**
      * @return non-zero position if caller should call txnCommitSync
      */
-    long redoStore(byte[] key, byte[] value) throws IOException {
+    final long redoStore(byte[] key, byte[] value) throws IOException {
         RedoWriter redo = mDatabase.mRedoWriter;
         return redo == null ? 0 : redo.store(mId, key, value, mDatabase.mDurabilityMode);
     }
@@ -677,33 +740,33 @@ final class Tree implements Index {
     /**
      * @return non-zero position if caller should call txnCommitSync
      */
-    long redoStoreNoLock(byte[] key, byte[] value) throws IOException {
+    final long redoStoreNoLock(byte[] key, byte[] value) throws IOException {
         RedoWriter redo = mDatabase.mRedoWriter;
         return redo == null ? 0 : redo.storeNoLock(mId, key, value, mDatabase.mDurabilityMode);
     }
 
-    void txnCommitSync(long commitPos) throws IOException {
+    final void txnCommitSync(long commitPos) throws IOException {
         mDatabase.mRedoWriter.txnCommitSync(commitPos);
     }
 
     /**
      * @see Database#markDirty
      */
-    boolean markDirty(Node node) throws IOException {
+    final boolean markDirty(Node node) throws IOException {
         return mDatabase.markDirty(this, node);
     }
 
     /**
      * Caller must exclusively hold root latch.
      */
-    void addStub(Node node) {
+    final void addStub(Node node) {
         mStubTail = new Stub(mStubTail, node);
     }
 
     /**
      * Caller must exclusively hold root latch.
      */
-    boolean hasStub() {
+    final boolean hasStub() {
         Stub stub = mStubTail;
         while (stub != null) {
             if (stub.mNode.mId == Node.STUB_ID) {
@@ -720,7 +783,7 @@ final class Tree implements Index {
      * if latch cannot be immediatly obtained. Caller must exclusively hold
      * root latch and have checked that a stub exists.
      */
-    Node tryPopStub() {
+    final Node tryPopStub() {
         Stub stub = mStubTail;
         if (stub.mNode.tryAcquireExclusive()) {
             mStubTail = stub.mParent;
@@ -734,7 +797,7 @@ final class Tree implements Index {
      * hold root latch and have checked that a stub exists.
      */
     /*
-    Node popStub() {
+    final Node popStub() {
         Stub stub = mStubTail;
         stub.mNode.acquireExclusive();
         mStubTail = stub.mParent;
@@ -749,7 +812,7 @@ final class Tree implements Index {
      *
      * @return node if valid, null otherwise
      */
-    static Node validateStub(Node node) {
+    static final Node validateStub(Node node) {
         if (node.mId == Node.STUB_ID && node.mLastCursorFrame != null) {
             return node;
         }

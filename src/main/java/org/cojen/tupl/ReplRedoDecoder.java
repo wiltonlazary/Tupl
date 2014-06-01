@@ -25,46 +25,16 @@ import java.io.IOException;
  * @see ReplRedoEngine
  */
 final class ReplRedoDecoder extends RedoDecoder {
-    private final ReplRedoEngine mEngine;
     private final In mIn;
 
-    ReplRedoDecoder(ReplRedoEngine engine, long initialTxnId) {
+    ReplRedoDecoder(ReplicationManager manager, long initialPosition, long initialTxnId) {
         super(false, initialTxnId);
-
-        mEngine = engine;
-        mIn = new In(engine.mManager);
-
-        Latch opLatch = engine.mOpLatch;
-        opLatch.acquireExclusive();
-        mEngine.mDecodeTransactionId = initialTxnId;
-        mEngine.mDecodePosition = mIn.mPos;
-        opLatch.releaseExclusive();
-    }
-
-    @Override
-    long readTxnId(DataIn in) throws IOException {
-        // Capture the last transaction id, before a delta is applied.
-        // See "in()" comments below regarding updates to this field.
-        long txnId = mTxnId;
-        mEngine.mDecodeTransactionId = txnId;
-
-        txnId += in.readSignedVarLong();
-        mTxnId = txnId;
-        return txnId;
+        mIn = new In(initialPosition, manager);
     }
 
     @Override
     DataIn in() {
-        In in = mIn;
-
-        // Capture the position for the next operation. No conflict exists when assigning the
-        // value because the decode latch should be held exclusively. ReplRedoEngine must
-        // acquire shared op latch when applying operations, and suspending the engine acquires
-        // an exclusive op latch. This creates a happens-before relationship allowing the
-        // suspending thread to safely read the highest read postion.
-        mEngine.mDecodePosition = in.mPos;
-
-        return in;
+        return mIn;
     }
 
     @Override
@@ -76,12 +46,12 @@ final class ReplRedoDecoder extends RedoDecoder {
     static final class In extends DataIn {
         private final ReplicationManager mManager;
 
-        In(ReplicationManager manager) {
-            this(manager, 4096);
+        In(long position, ReplicationManager manager) {
+            this(position, manager, 4096);
         }
 
-        In(ReplicationManager manager, int bufferSize) {
-            super(manager.readPosition(), bufferSize);
+        In(long position, ReplicationManager manager, int bufferSize) {
+            super(position, bufferSize);
             mManager = manager;
         }
 

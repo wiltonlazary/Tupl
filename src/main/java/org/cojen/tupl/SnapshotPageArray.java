@@ -63,7 +63,13 @@ final class SnapshotPageArray extends PageArray {
 
     @Override
     public void setPageCount(long count) throws IOException {
-        mSource.setPageCount(count);
+        synchronized (this) {
+            if (mSnapshots == null) {
+                mSource.setPageCount(count);
+                return;
+            }
+        }
+        throw new IllegalStateException();
     }
 
     @Override
@@ -264,13 +270,6 @@ final class SnapshotPageArray extends PageArray {
                 final byte[] buffer = new byte[pageSize()];
                 final byte[] key = new byte[8];
                 final long count = mSnapshotPageCount;
-
-                {
-                    // Insert a terminator for findNearby efficiency.
-                    byte[] k2 = new byte[8];
-                    encodeLongBE(k2, 0, ~0L);
-                    mPageCopyIndex.store(Transaction.BOGUS, k2, EMPTY_BYTES);
-                }
 
                 for (long index = 0; index < count; index++, increment(key, 0, 8)) {
                     synchronized (mSnapshotLock) {
