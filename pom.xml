@@ -31,6 +31,12 @@
       <version>4.9</version>
       <scope>test</scope>
     </dependency>
+
+    <dependency>
+      <groupId>net.jpountz.lz4</groupId>
+      <artifactId>lz4</artifactId>
+      <version>[1.2,)</version>
+    </dependency>
   </dependencies>
 
   <build>
