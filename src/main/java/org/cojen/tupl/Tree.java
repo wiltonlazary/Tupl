@@ -366,7 +366,7 @@ class Tree implements Index {
                         return;
                     }
                     if (root.mLastCursorFrame != null) {
-                        root.invalidateCursors(null);
+                        root.invalidateCursors(mDatabase.mTreeNodeMap);
                     }
                 } finally {
                     commitLock.unlock();
@@ -374,7 +374,7 @@ class Tree implements Index {
             }
 
             if (mDatabase.mPageDb.isDurable()) {
-                root.forceEvictTree(mDatabase.mPageDb);
+                root.forceEvictTree(mDatabase);
 
                 // Root node reference cannot be cleared, so instead make it
                 // non-functional. Move the page reference into a new evictable Node object,
@@ -406,17 +406,28 @@ class Tree implements Index {
 
     @Override
     public final void drop() throws IOException {
+        drop(DROP_IF_EMPTY);
+    }
+
+    static final int DROP_TO_TRASH = 0, DROP_IF_EMPTY = 1, DROP_EMPTY_FROM_TRASH = 2;
+
+    /**
+     * @param mode DROP_TO_TRASH, DROP_IF_EMPTY, or DROP_EMPTY_FROM_TRASH
+     * @return trashed root node; null if not DROP_TO_TRASH
+     */
+    final Node drop(int mode) throws IOException {
+        Node trashedRoot;
         long rootId;
         int cachedState;
 
-        Node root = mRoot;
+        final Node root = mRoot;
         root.acquireExclusive();
         try {
             if (root.mPage == EMPTY_BYTES) {
                 throw new ClosedIndexException();
             }
 
-            if (!root.isLeaf() || root.hasKeys()) {
+            if (mode != DROP_TO_TRASH && (!root.isLeaf() || root.hasKeys())) {
                 // Note that this check also covers the transactional case, because deletes
                 // store ghosts. The message could be more accurate, but it would require
                 // scanning the whole index looking for ghosts. Using LockMode.UNSAFE deletes
@@ -437,13 +448,32 @@ class Tree implements Index {
             rootId = root.mId;
             cachedState = root.mCachedState;
 
-            mDatabase.makeEvictable(root.closeRoot(false));
+            if (mode == DROP_TO_TRASH) {
+                trashedRoot = root.closeRoot(true);
+            } else {
+                mDatabase.makeEvictable(root.closeRoot(false));
+                trashedRoot = null;
+            }
         } finally {
             root.releaseExclusive();
         }
 
         // Drop with root latch released, avoiding deadlock when commit lock is acquired.
-        mDatabase.dropClosedTree(this, rootId, cachedState);
+        mDatabase.dropClosedTree(this, rootId, cachedState, mode);
+
+        return trashedRoot;
+    }
+
+    /**
+     * Non-transactionally deletes all entries in the tree. No other cursors or threads can be
+     * active in the tree.
+     */
+    final void deleteAll() throws IOException {
+        TreeCursor c = new TreeCursor(this, Transaction.BOGUS);
+        c.autoload(false);
+        for (c.first(); c.key() != null; ) {
+            c.trim();
+        }
     }
 
     static interface NodeVisitor {
@@ -476,25 +506,18 @@ class Tree implements Index {
         int pos = 0;
 
         while (true) {
-            toLower: while (true) {
-                Node[] childNodes = node.mChildNodes;
-
-                if (childNodes == null) {
-                    break toLower;
-                }
-
+            toLower: while (node.isInternal()) {
+                final int highestPos = node.highestInternalPos();
                 while (true) {
-                    int i = pos >> 1;
-                    if (i >= childNodes.length) {
+                    if (pos > highestPos) {
                         break toLower;
                     }
-                    Node child = childNodes[i];
+                    long childId = node.retrieveChildRefId(pos);
+                    Node child = mDatabase.mTreeNodeMap.get(childId);
                     if (child != null) {
-                        long childId = node.retrieveChildRefId(pos);
                         child.acquireExclusive();
                         // Need to check again in case evict snuck in.
                         if (childId != child.mId) {
-                            childNodes[i] = null;
                             child.releaseExclusive();
                         } else {
                             frame = new TreeCursorFrame(frame);
@@ -593,6 +616,80 @@ class Tree implements Index {
             }
             din.skipBytes(len);
         }
+    }
+
+    /**
+     * Non-transactionally insert an entry as the highest overall. Intended for filling up a
+     * new tree with ordered entries.
+     *
+     * @param key new highest key; no existing key can be greater than or equal to it
+     * @param frame frame bound to the tree leaf node
+     */
+    final void append(byte[] key, byte[] value, TreeCursorFrame frame) throws IOException {
+        try {
+            final Lock sharedCommitLock = mDatabase.sharedCommitLock();
+            sharedCommitLock.lock();
+            Node node = latchDirty(frame);
+            try {
+                int encodedKeyLen = Node.calculateKeyLengthChecked(this, key);
+                // TODO: inline and specialize
+                node.insertLeafEntry(this, frame.mNodePos, key, encodedKeyLen, value);
+                frame.mNodePos += 2;
+
+                while (node.mSplit != null) {
+                    if (node == mRoot) {
+                        node.finishSplitRoot(this, null);
+                        break;
+                    }
+                    Node childNode = node;
+                    frame = frame.mParentFrame;
+                    node = frame.mNode;
+                    // Latch coupling upwards is fine because nothing should be searching a
+                    // tree which is filling up.
+                    node.acquireExclusive();
+                    childNode.releaseExclusive();
+                    // TODO: inline and specialize
+                    node.insertSplitChildRef(this, frame.mNodePos, childNode);
+                }
+            } finally {
+                node.releaseExclusive();
+                sharedCommitLock.unlock();
+            }
+        } catch (Throwable e) {
+            throw closeOnFailure(mDatabase, e);
+        }
+    }
+
+    /**
+     * Returns the frame node latched exclusively and marked dirty.
+     */
+    private Node latchDirty(TreeCursorFrame frame) throws IOException {
+        final Database db = mDatabase;
+        Node node = frame.mNode;
+        node.acquireExclusive();
+
+        if (db.shouldMarkDirty(node)) {
+            TreeCursorFrame parentFrame = frame.mParentFrame;
+            if (parentFrame == null) {
+                db.doMarkDirty(this, node);
+            } else {
+                // Latch coupling upwards is fine because nothing should be searching a tree
+                // which is filling up.
+                Node parentNode = latchDirty(parentFrame);
+                try {
+                    if (db.markDirty(this, node)) {
+                        parentNode.updateChildRefId(parentFrame.mNodePos, node.mId);
+                    }
+                } catch (Throwable e) {
+                    node.releaseExclusive();
+                    throw e;
+                } finally {
+                    parentNode.releaseExclusive();
+                }
+            }
+        }
+
+        return node;
     }
 
     /**

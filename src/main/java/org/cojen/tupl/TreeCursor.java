@@ -980,12 +980,7 @@ class TreeCursor implements CauseCloseable, Cursor {
             if (txn == null) {
                 mode = LockMode.READ_COMMITTED;
             } else if ((mode = txn.lockMode()).noReadLock) {
-                if (mKeyOnly) {
-                    mKey = node.retrieveKey(pos);
-                    mValue = node.hasLeafValue(pos);
-                } else {
-                    node.retrieveLeafEntry(pos, this);
-                }
+                node.retrieveLeafEntry(pos, this);
                 return LockResult.UNOWNED;
             }
 
@@ -2270,6 +2265,109 @@ class TreeCursor implements CauseCloseable, Cursor {
         return postInsert(leaf, node, key);
     }
 
+    /**
+     * Non-transactionally deletes the lowest entry and moves to the next entry. This cursor
+     * must be positioned at the lowest entry, and no other cursors or threads can be active in
+     * the tree.
+     */
+    final void trim() throws IOException {
+        TreeCursorFrame leaf = leafExclusive();
+
+        final Lock sharedCommitLock = mTree.mDatabase.sharedCommitLock();
+        sharedCommitLock.lock();
+        try {
+            // Releases latch if an exception is thrown.
+            Node node = notSplitDirty(leaf);
+
+            try {
+                node.deleteLeafEntry(mTree, 0);
+            } catch (Throwable e) {
+                node.releaseExclusive();
+                throw e;
+            }
+
+            if (node.hasKeys()) {
+                leaf.mNodePos = ~0;
+            } else {
+                node = trimNode(leaf, node);
+
+                if (node == null) {
+                    mLeaf = null;
+                    reset();
+                    return;
+                }
+
+                try {
+                    mKeyHash = 0;
+                    node.retrieveLeafEntry(0, this);
+                    // Extra check for filtering ghosts.
+                    if (mValue != null) {
+                        return;
+                    }
+                } finally {
+                    node.releaseExclusive();
+                }
+            }
+        } finally {
+            sharedCommitLock.unlock();
+        }
+
+        next(Transaction.BOGUS, leaf);
+    }
+
+    /**
+     * @param frame node frame
+     * @param node latched node, with no keys, and dirty; released by this method
+     * @return replacement node, latched exclusively; null if tree is empty
+     */
+    private Node trimNode(final TreeCursorFrame frame, final Node node) throws IOException {
+        node.mLastCursorFrame = null;
+
+        if (node == mTree.mRoot) {
+            try {
+                node.asTrimmedRoot();
+            } finally {
+                node.releaseExclusive();
+            }
+            return null;
+        }
+
+        Database db = mTree.mDatabase;
+        db.prepareToDelete(node);
+
+        TreeCursorFrame parentFrame = frame.mParentFrame;
+        Node parentNode = parentFrame.acquireExclusive();
+
+        if (parentNode.hasKeys()) {
+            parentNode.deleteLeftChildRef(0);
+        } else {
+            parentNode = trimNode(parentFrame, parentNode);
+            if (parentNode == null) {
+                db.deleteNode(node);
+                return null;
+            }
+        }
+
+        Node next = latchChild(parentNode, 0, false);
+
+        try {
+            if (db.markDirty(mTree, next)) {
+                parentNode.updateChildRefId(0, next.mId);
+            }
+        } finally {
+            parentNode.releaseExclusive();
+        }
+
+        frame.mNode = next;
+        frame.mNodePos = 0;
+        next.mLastCursorFrame = frame;
+        next.mType |= Node.LOW_EXTREMITY;
+
+        db.deleteNode(node);
+
+        return next;
+    }
+
     protected final IOException handleException(Throwable e, boolean reset) throws IOException {
         if (mLeaf == null && e instanceof IllegalStateException) {
             // Exception is caused by cursor state; store is safe.
@@ -3089,7 +3187,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                 throw e;
             }
             rightNode = null;
-            parentNode.deleteChildRef(leftPos + 2);
+            parentNode.deleteRightChildRef(leftPos + 2);
         }
 
         mergeInternal(parentFrame, parentNode, leftNode, rightNode);
@@ -3097,6 +3195,10 @@ class TreeCursor implements CauseCloseable, Cursor {
 
     /**
      * Caller must hold exclusive latch, which is released by this method.
+     *
+     * @param leftChildNode never null, latched exclusively
+     * @param rightChildNode null if contents merged into left node, otherwise latched
+     * exclusively and should simply be unlatched
      */
     private void mergeInternal(TreeCursorFrame frame, Node node,
                                Node leftChildNode, Node rightChildNode)
@@ -3111,16 +3213,15 @@ class TreeCursor implements CauseCloseable, Cursor {
 
                 // Delete the empty root node, eliminating a tree level.
 
-                // Note: By retaining child latches (although right might have
-                // been deleted), another thread is prevented from splitting
-                // the lone child. The lone child will become the new root.
-                // TODO: Investigate if this creates deadlocks.
+                if (rightChildNode != null) {
+                    throw new AssertionError();
+                }
+
+                // By retaining child latch, another thread is prevented from splitting it. The
+                // lone child will become the new root.
                 try {
-                    node.rootDelete(mTree);
+                    node.rootDelete(mTree, leftChildNode);
                 } catch (Throwable e) {
-                    if (rightChildNode != null) {
-                        rightChildNode.releaseExclusive();
-                    }
                     leftChildNode.releaseExclusive();
                     node.releaseExclusive();
                     throw e;
@@ -3280,7 +3381,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                 throw e;
             }
             rightNode = null;
-            parentNode.deleteChildRef(leftPos + 2);
+            parentNode.deleteRightChildRef(leftPos + 2);
         }
 
         // Tail call. I could just loop here, but this is simpler.
@@ -3296,10 +3397,10 @@ class TreeCursor implements CauseCloseable, Cursor {
     private Node latchChild(Node parent, int childPos, boolean releaseParent)
         throws IOException
     {
-        Node childNode = parent.mChildNodes[childPos >> 1];
         long childId = parent.retrieveChildRefId(childPos);
+        Node childNode = mTree.mDatabase.mTreeNodeMap.get(childId);
 
-        if (childNode != null && childId == childNode.mId) {
+        if (childNode != null) {
             childNode.acquireExclusive();
             // Need to check again in case evict snuck in.
             if (childId != childNode.mId) {
@@ -3327,10 +3428,10 @@ class TreeCursor implements CauseCloseable, Cursor {
     /*
     private Node latchChildToModify(TreeCursorFrame parentFrame, int childPos) throws IOException {
         Node parentNode = parentFrame.mNode;
-        Node childNode = parentNode.mChildNodes[childPos >> 1];
         long childId = parentNode.retrieveChildRefId(childPos);
+        Node childNode = mTree.mDatabase.mTreeNodeMap.get(childId);
 
-        check: if (childNode != null && childId == childNode.mId) {
+        check: if (childNode != null) {
             if (parentNode.mType == Node.TYPE_TN_BIN) {
                 childNode.acquireExclusive();
                 // Need to check again in case evict snuck in.

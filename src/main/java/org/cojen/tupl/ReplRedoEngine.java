@@ -233,7 +233,7 @@ class ReplRedoEngine implements RedoVisitor {
         nextTask();
 
         try {
-            while (true) {
+            while (ix != null) {
                 try {
                     ix.store(Transaction.BOGUS, key, value);
                     break;
@@ -278,41 +278,39 @@ class ReplRedoEngine implements RedoVisitor {
             }
         }
 
-        if (ix != null) {
-            try {
-                while (true) {
+        try {
+            while (ix != null) {
+                try {
+                    // Sweep through index, waiting for any concurrent deletes to
+                    // finish. Need to use a transaction for upgradable locks. No changes
+                    // are being made, and so this doesn't create a transaction id.
+                    Transaction txn = mDb.newTransaction();
                     try {
-                        // Sweep through index, waiting for any concurrent deletes to
-                        // finish. Need to use a transaction for upgradable locks. No changes
-                        // are being made, and so this doesn't create a transaction id.
-                        Transaction txn = mDb.newTransaction();
+                        Cursor c = ix.newCursor(txn);
                         try {
-                            Cursor c = ix.newCursor(txn);
-                            try {
-                                c.autoload(false);
-                                c.first();
-                            } finally {
-                                c.reset();
-                            }
+                            c.autoload(false);
+                            c.first();
                         } finally {
-                            txn.reset();
+                            c.reset();
                         }
-                            
-                        ix.drop();
-                        break;
-                    } catch (ClosedIndexException e) {
-                        // User closed the shared index reference, so re-open it.
-                        ix = openIndex(indexId, null);
+                    } finally {
+                        txn.reset();
                     }
+
+                    ix.drop();
+                    break;
+                } catch (ClosedIndexException e) {
+                    // User closed the shared index reference, so re-open it.
+                    ix = openIndex(indexId, null);
                 }
-            } catch (IllegalStateException e) {
-                EventListener listener = mDb.mEventListener;
-                if (listener != null) {
-                    listener.notify(EventType.REPLICATION_WARNING,
-                                    "Unable to drop index: %1$s", rootCause(e));
-                    // Disable notification.
-                    ix = null;
-                }
+            }
+        } catch (IllegalStateException e) {
+            EventListener listener = mDb.mEventListener;
+            if (listener != null) {
+                listener.notify(EventType.REPLICATION_WARNING,
+                                "Unable to drop index: %1$s", rootCause(e));
+                // Disable notification.
+                ix = null;
             }
         }
 
@@ -334,20 +332,23 @@ class ReplRedoEngine implements RedoVisitor {
     @Override
     public boolean renameIndex(long indexId, byte[] newName) throws IOException {
         Index ix = getIndex(indexId);
-        byte[] oldName = ix.getName();
+        byte[] oldName = null;
 
         // Acquire latch before performing operations with side-effects.
         mOpLatch.acquireShared();
 
-        try {
-            mDb.renameIndex(ix, newName, false);
-        } catch (RuntimeException e) {
-            EventListener listener = mDb.mEventListener;
-            if (listener != null) {
-                listener.notify(EventType.REPLICATION_WARNING,
-                                "Unable to rename index: %1$s", rootCause(e));
-                // Disable notification.
-                ix = null;
+        if (ix != null) {
+            oldName = ix.getName();
+            try {
+                mDb.renameIndex(ix, newName, false);
+            } catch (RuntimeException e) {
+                EventListener listener = mDb.mEventListener;
+                if (listener != null) {
+                    listener.notify(EventType.REPLICATION_WARNING,
+                                    "Unable to rename index: %1$s", rootCause(e));
+                    // Disable notification.
+                    ix = null;
+                }
             }
         }
 
@@ -359,6 +360,71 @@ class ReplRedoEngine implements RedoVisitor {
                 mManager.notifyRename(ix, oldName, newName.clone());
             } catch (Throwable e) {
                 uncaught(e);
+            }
+        }
+
+        // Return true and allow RedoDecoder to loop back.
+        return true;
+    }
+
+    @Override
+    public boolean deleteIndex(long indexId) throws IOException {
+        // Acquire latch before performing operations with side-effects.
+        mOpLatch.acquireShared();
+
+        Index ix;
+        {
+            LHashTable.ObjEntry<SoftReference<Index>> entry = mIndexes.remove(indexId);
+            if (entry == null || (ix = entry.value.get()) == null) {
+                ix = mDb.anyIndexById(indexId);
+            }
+        }
+
+        Runnable task = null;
+
+        try {
+            while (ix != null) {
+                try {
+                    task = mDb.deleteIndex(ix);
+                    break;
+                } catch (ClosedIndexException e) {
+                    // User closed the shared index reference, so re-open it.
+                    ix = openIndex(indexId, null);
+                }
+            }
+        } catch (RuntimeException e) {
+            EventListener listener = mDb.mEventListener;
+            if (listener != null) {
+                listener.notify(EventType.REPLICATION_WARNING,
+                                "Unable to delete index: %1$s", rootCause(e));
+                // Disable notification.
+                ix = null;
+            }
+        }
+
+        // Only release if no exception.
+        opFinished();
+
+        if (ix != null && task != null) {
+            try {
+                mManager.notifyDrop(ix);
+            } catch (Throwable e) {
+                uncaught(e);
+            }
+
+            try {
+                // Allow index deletion to run concurrently. If multiple deletes are received
+                // concurrently, then the application is likely doing concurrent deletes.
+                Thread deletion = new Thread(task, "IndexDeletion");
+                deletion.setDaemon(true);
+                deletion.start();
+            } catch (Throwable e) {
+                EventListener listener = mDb.mEventListener;
+                if (listener != null) {
+                    listener.notify(EventType.REPLICATION_WARNING,
+                                    "Unable to immediately delete index: %1$s", rootCause(e));
+                }
+                // Index will get fully deleted when database is re-opened.
             }
         }
 
@@ -533,7 +599,7 @@ class ReplRedoEngine implements RedoVisitor {
             // Allow another task thread to run while operation completes.
             nextTask();
 
-            while (true) {
+            while (ix != null) {
                 try {
                     ix.store(txn, key, value);
                     break;
@@ -576,7 +642,7 @@ class ReplRedoEngine implements RedoVisitor {
             // Allow another task thread to run while operation completes.
             nextTask();
 
-            while (true) {
+            while (ix != null) {
                 try {
                     ix.store(txn, key, value);
                     break;
@@ -701,6 +767,8 @@ class ReplRedoEngine implements RedoVisitor {
 
     /**
      * Returns the index from the local cache, opening it if necessary.
+     *
+     * @return null if not found
      */
     private Index getIndex(long indexId) throws IOException {
         LHashTable.ObjEntry<SoftReference<Index>> entry = mIndexes.get(indexId);
@@ -715,14 +783,15 @@ class ReplRedoEngine implements RedoVisitor {
 
     /**
      * Opens the index and puts it into the local cache, replacing the existing entry.
+     *
+     * @return null if not found
      */
     private Index openIndex(long indexId, LHashTable.ObjEntry<SoftReference<Index>> entry)
         throws IOException
     {
         Index ix = mDb.anyIndexById(indexId);
         if (ix == null) {
-            // TODO: Throw a better exception.
-            throw new DatabaseException("Index not found: " + indexId);
+            return null;
         }
 
         SoftReference<Index> ref = new SoftReference<>(ix);
@@ -822,7 +891,7 @@ class ReplRedoEngine implements RedoVisitor {
     }
 
     private void notifyStore(Index ix, byte[] key, byte[] value) {
-        if (!Tree.isInternal(ix.getId())) {
+        if (ix != null && !Tree.isInternal(ix.getId())) {
             try {
                 mManager.notifyStore(ix, key, value);
             } catch (Throwable e) {

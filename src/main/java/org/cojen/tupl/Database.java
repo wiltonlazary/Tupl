@@ -202,6 +202,7 @@ public final class Database implements CauseCloseable {
     static final byte KEY_TYPE_INDEX_ID     = 1; // prefix for id to name mapping
     static final byte KEY_TYPE_TREE_ID_MASK = 2; // full key for random tree id mask
     static final byte KEY_TYPE_NEXT_TREE_ID = 3; // full key for tree id sequence
+    static final byte KEY_TYPE_TRASH_ID     = 4; // prefix for id to name mapping of trash
 
     // Various mappings, defined by KEY_TYPE_ fields.
     private final Tree mRegistryKeyMap;
@@ -213,6 +214,9 @@ public final class Database implements CauseCloseable {
     private final ReferenceQueue<Tree> mOpenTreesRefQueue;
 
     private final PageAllocator mAllocator;
+
+    // Map of all loaded non-root nodes.
+    final NodeMap mTreeNodeMap;
 
     final FragmentCache mFragmentCache;
     final int mMaxFragmentedEntrySize;
@@ -348,6 +352,8 @@ public final class Database implements CauseCloseable {
         mDefaultLockTimeoutNanos = config.mLockTimeoutNanos;
         mLockManager = new LockManager(config.mLockUpgradeRule, mDefaultLockTimeoutNanos);
 
+        mTreeNodeMap = new NodeMap(mMaxNodeCount);
+
         if (mBaseFile != null && !config.mReadOnly && config.mMkdirs) {
             FileFactory factory = config.mFileFactory;
 
@@ -399,20 +405,30 @@ public final class Database implements CauseCloseable {
                 deleteRedoLogFiles();
             }
 
+            final long cacheInitStart = System.nanoTime();
+
+            // Create or retrieve optional page cache.
+            PageCache cache = config.pageCache(mEventListener);
+
+            if (cache != null) {
+                // Update config such that info file is correct.
+                config.mSecondaryCacheSize = cache.capacity();
+            }
+
             if (dataFiles == null) {
                 PageArray dataPageArray = config.mDataPageArray;
                 if (dataPageArray == null) {
-                    mPageDb = new NonPageDb(pageSize);
+                    mPageDb = new NonPageDb(pageSize, cache);
                 } else {
                     mPageDb = DurablePageDb.open
-                        (dataPageArray, config.mCrypto, openMode == OPEN_DESTROY);
+                        (dataPageArray, cache, config.mCrypto, openMode == OPEN_DESTROY);
                 }
             } else {
                 EnumSet<OpenOption> options = config.createOpenOptions();
                 mPageDb = DurablePageDb.open
                     (explicitPageSize, pageSize,
                      dataFiles, config.mFileFactory, options,
-                     config.mCrypto, openMode == OPEN_DESTROY);
+                     cache, config.mCrypto, openMode == OPEN_DESTROY);
             }
 
             // Actual page size might differ from configured size.
@@ -445,11 +461,9 @@ public final class Database implements CauseCloseable {
             // get used. Since the initial state is clean, evicting these
             // nodes does nothing.
 
-            long cacheInitStart = 0;
             if (mEventListener != null) {
                 mEventListener.notify(EventType.CACHE_INIT_BEGIN,
                                       "Initializing %1$d cached nodes", minCache);
-                cacheInitStart = System.nanoTime();
             }
 
             try {
@@ -518,13 +532,7 @@ public final class Database implements CauseCloseable {
 
             mAllocator = new PageAllocator(mPageDb);
 
-            if (mBaseFile == null) {
-                // Non-durable database never evicts anything.
-                mFragmentCache = new FragmentMap();
-            } else {
-                // Regular database evicts automatically.
-                mFragmentCache = new FragmentCache(this, mMaxNodeCount);
-            }
+            mFragmentCache = new FragmentCache(this, mTreeNodeMap);
 
             if (openMode != OPEN_TEMP) {
                 Tree tree = openInternalTree(Tree.FRAGMENTED_TRASH_ID, false);
@@ -723,6 +731,14 @@ public final class Database implements CauseCloseable {
         }
 
         c.start();
+
+        Tree trashed = openAnyTrashedTree();
+
+        if (trashed != null) {
+            Thread deletion = new Thread(new Deletion(trashed, true), "IndexDeletion");
+            deletion.setDaemon(true);
+            deletion.start();
+        }
     }
 
     static class ShutdownPrimer implements Checkpointer.Shutdown {
@@ -964,18 +980,7 @@ public final class Database implements CauseCloseable {
         // Database instance makes this operation a bit more of a hassle to use, which is
         // desirable. Rename is not expected to be a common operation.
 
-        Tree tree;
-        check: {
-            try {
-                if ((tree = ((Tree) index)).mDatabase == this) {
-                    break check;
-                }
-            } catch (ClassCastException e) {
-                // Cast and catch an exception instead of calling instanceof to cause a
-                // NullPointerException to be thrown if index is null.
-            }
-            throw new IllegalArgumentException("Index belongs to a different database");
-        }
+        Tree tree = accessTree(index);
 
         byte[] idKey;
         byte[] oldName, oldNameKey;
@@ -1070,6 +1075,165 @@ public final class Database implements CauseCloseable {
         if (redo != null && commitPos != 0) {
             // Don't hold locks and latches during sync.
             redo.txnCommitSync(commitPos);
+        }
+    }
+
+    private Tree accessTree(Index index) {
+        try {
+            Tree tree;
+            if ((tree = ((Tree) index)).mDatabase == this) {
+                return tree;
+            }
+        } catch (ClassCastException e) {
+            // Cast and catch an exception instead of calling instanceof to cause a
+            // NullPointerException to be thrown if index is null.
+        }
+        throw new IllegalArgumentException("Index belongs to a different database");
+    }
+
+    /**
+     * Fully closes and deletes the given index, but does not immediately reclaim the pages it
+     * occupied. Run the returned task in any thread to reclaim the pages.
+     *
+     * <p>Once deleted, the index reference appears empty and {@link ClosedIndexException
+     * unmodifiable}. A new index by the original name can be created, which will be assigned a
+     * different unique identifier. Any transactions still referring to the old index will not
+     * affect the new index.
+     *
+     * <p>If the deletion task is never started or it doesn't finish normally, it will resume
+     * when the database is re-opened. All resumed deletions are completed in serial order by a
+     * background thread.
+     *
+     * @param index non-null open index
+     * @return non-null task to call for reclaiming the pages used by the deleted index
+     * @throws ClosedIndexException if index reference is closed
+     * @throws IllegalArgumentException if index belongs to another database instance
+     * @see EventListener
+     * @see Index#drop Index.drop
+     */
+    public Runnable deleteIndex(Index index) throws IOException {
+        // Design note: This is a Database method instead of an Index method because it offers
+        // an extra degree of safety. See notes in renameIndex.
+
+        Tree tree = accessTree(index);
+        byte[] name = tree.mName;
+        Node trashedRoot = tree.drop(Tree.DROP_TO_TRASH);
+        Tree trashed = newTreeInstance(tree.mId, tree.mIdBytes, name, trashedRoot);
+
+        return new Deletion(trashed, false);
+    }
+
+    /**
+     * @return null if none available
+     */
+    private Tree openAnyTrashedTree() throws IOException {
+        View view = mRegistryKeyMap.viewPrefix(new byte[] {KEY_TYPE_TRASH_ID}, 1);
+
+        byte[] treeIdBytes, name, rootIdBytes;
+
+        Cursor c = view.newCursor(null);
+        try {
+            c.first();
+            while (true) {
+                treeIdBytes = c.key();
+                if (treeIdBytes == null) {
+                    return null;
+                }
+
+                rootIdBytes = mRegistry.load(Transaction.BOGUS, treeIdBytes);
+                if (rootIdBytes != null) {
+                    break;
+                }
+
+                // Clear out bogus entry in the trash.
+                c.store(null);
+                c.next();
+            }
+
+            name = c.value();
+        } finally {
+            c.reset();
+        }
+
+        long rootId = decodeLongLE(rootIdBytes, 0);
+
+        if (name.length == 0) {
+            name = null;
+        } else {
+            // Trim off the first byte.
+            byte[] actual = new byte[name.length - 1];
+            System.arraycopy(name, 1, actual, 0, actual.length);
+            name = actual;
+        }
+
+        long treeId = decodeLongBE(treeIdBytes, 0);
+
+        return newTreeInstance(treeId, treeIdBytes, name, loadTreeRoot(rootId));
+    }
+
+    private class Deletion implements Runnable {
+        private Tree mTrashed;
+        private final boolean mResumed;
+
+        Deletion(Tree trashed, boolean resumed) {
+            mTrashed = trashed;
+            mResumed = resumed;
+        }
+
+        @Override
+        public synchronized void run() {
+            while (mTrashed != null) {
+                delete();
+            }
+        }
+
+        private void delete() {
+            final EventListener listener = mEventListener;
+
+            if (listener != null) {
+                listener.notify(EventType.DELETION_BEGIN,
+                                "Index deletion " + (mResumed ? "resumed" : "begin") +
+                                ": %1$d, name: %2$s",
+                                mTrashed.getId(), mTrashed.getNameString());
+            }
+
+            try {
+                long start = System.nanoTime();
+
+                mTrashed.deleteAll();
+                mTrashed.drop(Tree.DROP_EMPTY_FROM_TRASH);
+
+                if (listener != null) {
+                    double duration = (System.nanoTime() - start) / 1_000_000_000.0;
+                    listener.notify(EventType.DELETION_COMPLETE,
+                                    "Index deletion complete: %1$d, name: %2$s, " +
+                                    "duration: %3$1.3f seconds",
+                                    mTrashed.getId(), mTrashed.getNameString(), duration);
+                }
+
+                mTrashed = null;
+            } catch (IOException e) {
+                if ((!mClosed || mClosedCause != null) && listener != null) {
+                    listener.notify
+                        (EventType.DELETION_FAILED,
+                         "Index deletion failed: %1$d, name: %2$s, exception: %3$s",
+                         mTrashed.getId(), mTrashed.getNameString(), rootCause(e));
+                }
+                return;
+            }
+
+            if (mResumed) {
+                try {
+                    mTrashed = openAnyTrashedTree();
+                } catch (IOException e) {
+                    if ((!mClosed || mClosedCause != null) && listener != null) {
+                        listener.notify
+                            (EventType.DELETION_FAILED,
+                             "Unable to resume deletion: %1$s", rootCause(e));
+                    }
+                    return;
+                }
+            }
         }
     }
 
@@ -1251,6 +1415,7 @@ public final class Database implements CauseCloseable {
     public static Database restoreFromSnapshot(DatabaseConfig config, InputStream in)
         throws IOException
     {
+        config = config.clone();
         PageDb restored;
 
         File[] dataFiles = config.dataFiles();
@@ -1265,7 +1430,7 @@ public final class Database implements CauseCloseable {
             // Delete old redo log files.
             deleteNumberedFiles(config.mBaseFile, REDO_FILE_SUFFIX);
 
-            restored = DurablePageDb.restoreFromSnapshot(dataPageArray, config.mCrypto, in);
+            restored = DurablePageDb.restoreFromSnapshot(dataPageArray, null, config.mCrypto, in);
         } else {
             if (!config.mReadOnly) {
                 for (File f : dataFiles) {
@@ -1289,7 +1454,7 @@ public final class Database implements CauseCloseable {
             }
 
             restored = DurablePageDb.restoreFromSnapshot
-                (pageSize, dataFiles, factory, options, config.mCrypto, in);
+                (pageSize, dataFiles, factory, options, null, config.mCrypto, in);
         }
 
         restored.close();
@@ -2017,37 +2182,71 @@ public final class Database implements CauseCloseable {
         }
     }
 
-    void dropClosedTree(Tree tree, long rootId, int cachedState) throws IOException {
+    /**
+     * @param mode DROP_TO_TRASH, DROP_EMPTY, or DROP_EMPTY_FROM_TRASH
+     */
+    void dropClosedTree(Tree tree, long rootId, int cachedState, int mode)
+        throws IOException
+    {
         RedoWriter redo = mRedoWriter;
 
-        byte[] idKey, nameKey;
         long commitPos;
 
         final Lock commitLock = sharedCommitLock();
         commitLock.lock();
         try {
+            final byte[] name, idKey, nameKey, trashIdKey;
+
             Transaction txn;
             mOpenTreesLatch.acquireExclusive();
             try {
                 TreeRef ref = mOpenTreesById.getValue(tree.mId);
+
                 if (ref == null || ref.get() != tree) {
-                    return;
+                    if (ref != null || mode != Tree.DROP_EMPTY_FROM_TRASH) {
+                        return;
+                    }
                 }
 
-                idKey = newKey(KEY_TYPE_INDEX_ID, tree.mIdBytes);
-                nameKey = newKey(KEY_TYPE_INDEX_NAME, tree.mName);
+                name = tree.mName;
+
+                if (name == null) {
+                    idKey = null;
+                    nameKey = null;
+                } else {
+                    idKey = newKey(KEY_TYPE_INDEX_ID, tree.mIdBytes);
+                    nameKey = newKey(KEY_TYPE_INDEX_NAME, name);
+                }
+
+                trashIdKey = newKey(KEY_TYPE_TRASH_ID, tree.mIdBytes);
 
                 txn = newNoRedoTransaction();
                 try {
                     // Acquire locks to prevent tree from being re-opened. No deadlocks should
                     // be possible with tree latch held exclusively, but order in a safe
                     // fashion anyhow. A registry lookup can only follow a key map lookup.
-                    txn.lockExclusive(mRegistryKeyMap.mId, idKey);
-                    txn.lockExclusive(mRegistryKeyMap.mId, nameKey);
-                    txn.lockExclusive(mRegistry.mId, tree.mIdBytes);
 
-                    ref.clear();
-                    mOpenTrees.remove(tree.mName);
+                    if (idKey != null) {
+                        txn.lockExclusive(mRegistryKeyMap.mId, idKey);
+                    }
+                    if (nameKey != null) {
+                        txn.lockExclusive(mRegistryKeyMap.mId, nameKey);
+                    }
+
+                    txn.lockExclusive(mRegistryKeyMap.mId, trashIdKey);
+
+                    if (mode != Tree.DROP_TO_TRASH) {
+                        txn.lockExclusive(mRegistry.mId, tree.mIdBytes);
+                    }
+
+                    if (ref != null) {
+                        ref.clear();
+                    }
+
+                    if (name != null) {
+                        mOpenTrees.remove(name);
+                    }
+
                     mOpenTreesById.remove(tree.mId);
                 } catch (Throwable e) {
                     txn.reset();
@@ -2061,16 +2260,38 @@ public final class Database implements CauseCloseable {
             // or dropped concurrently.
 
             try {
-                mRegistryKeyMap.remove(txn, idKey, tree.mName);
-                mRegistryKeyMap.remove(txn, nameKey, tree.mIdBytes);
-                mRegistry.delete(txn, tree.mIdBytes);
+                if (idKey != null) {
+                    mRegistryKeyMap.remove(txn, idKey, name);
+                }
+                if (nameKey != null) {
+                    mRegistryKeyMap.remove(txn, nameKey, tree.mIdBytes);
+                }
 
-                commitPos = redo == null ? 0
-                    : redo.dropIndex(tree.mId, mDurabilityMode.alwaysRedo());
+                if (mode == Tree.DROP_TO_TRASH) {
+                    byte[] trashedName = nameKey == null ? EMPTY_BYTES : nameKey;
+                    mRegistryKeyMap.store(txn, trashIdKey, trashedName);
+                } else {
+                    mRegistryKeyMap.store(txn, trashIdKey, null);
+                    mRegistry.delete(txn, tree.mIdBytes);
+                }
+
+                if (redo == null || mode == Tree.DROP_EMPTY_FROM_TRASH) {
+                    // Only record one redo operation when deleting an index.
+                    commitPos = 0;
+                } else {
+                    DurabilityMode durability = mDurabilityMode.alwaysRedo();
+                    if (mode == Tree.DROP_TO_TRASH) {
+                        commitPos = redo.deleteIndex(tree.mId, durability);
+                    } else {
+                        commitPos = redo.dropIndex(tree.mId, durability);
+                    }
+                }
 
                 txn.commit();
 
-                deletePage(rootId, cachedState);
+                if (mode != Tree.DROP_TO_TRASH) {
+                    deletePage(rootId, cachedState);
+                }
             } catch (Throwable e) {
                 DatabaseException.rethrowIfRecoverable(e);
                 throw closeOnFailure(this, e);
@@ -2437,7 +2658,7 @@ public final class Database implements CauseCloseable {
 
             Node root = ref.mRoot;
             root.acquireExclusive();
-            root.forceEvictTree(mPageDb);
+            root.forceEvictTree(this);
             root.releaseExclusive();
 
             mOpenTreesLatch.acquireExclusive();
@@ -2558,7 +2779,7 @@ public final class Database implements CauseCloseable {
 
                         usageLatch.releaseExclusive();
 
-                        if ((node = Node.evict(node, mPageDb)) != null) {
+                        if ((node = Node.evict(node, this)) != null) {
                             if (!evictable) {
                                 makeUnevictable(node);
                             }
@@ -2573,7 +2794,7 @@ public final class Database implements CauseCloseable {
                         }
                     } else {
                         try {
-                            if ((node = Node.evict(node, mPageDb)) != null) {
+                            if ((node = Node.evict(node, this)) != null) {
                                 if (!evictable) {
                                     doMakeUnevictable(node);
                                 }
@@ -2653,17 +2874,10 @@ public final class Database implements CauseCloseable {
                 // Make node appear to be evicted.
                 node.mId = 0;
 
-                // Attempt to unlink child nodes, making them appear to be evicted.
-                if (node.tryAcquireExclusive()) {
-                    Node[] childNodes = node.mChildNodes;
-                    if (childNodes != null) {
-                        fill(childNodes, null);
-                    }
-                    node.releaseExclusive();
-                }
-
                 node = next;
             }
+
+            mTreeNodeMap.clear();
         } finally {
             usageLatch.releaseExclusive();
         }
@@ -2851,6 +3065,7 @@ public final class Database implements CauseCloseable {
         long newId = mAllocator.allocPage(node);
         if (oldId != 0) {
             mPageDb.deletePage(oldId);
+            mTreeNodeMap.remove(node, NodeMap.hash(oldId));
         }
         if (node.mCachedState != CACHED_CLEAN) {
             node.write(mPageDb);
@@ -2861,6 +3076,7 @@ public final class Database implements CauseCloseable {
             mRegistry.store(Transaction.BOGUS, tree.mIdBytes, newEncodedId);
         }
         dirty(node, newId);
+        mTreeNodeMap.put(node);
     }
 
     /**
@@ -2930,9 +3146,8 @@ public final class Database implements CauseCloseable {
                 mPageDb.deletePage(id);
             }
 
+            mTreeNodeMap.remove(node, NodeMap.hash(id));
             node.mId = 0;
-            // TODO: child node array should be recycled
-            node.mChildNodes = null;
 
             // When node is re-allocated, it will be evicted. Ensure that eviction
             // doesn't write anything.
@@ -3042,13 +3257,12 @@ public final class Database implements CauseCloseable {
      * content length field size: 0 or 2 bytes. The 'p' bit is clear if direct pointers are
      * used, and set for indirect pointers. Pointers are always 6 bytes.
      *
-     * @param caller optional tree node which is latched and calling this method
      * @param value can be null if value is all zeros
      * @param max maximum allowed size for returned byte array; must not be
      * less than 11 (can be 9 if full value length is < 65536)
      * @return null if max is too small
      */
-    byte[] fragment(Node caller, final byte[] value, final long vlength, int max)
+    byte[] fragment(final byte[] value, final long vlength, int max)
         throws IOException
     {
         int pageSize = mPageSize;
@@ -3115,7 +3329,7 @@ public final class Database implements CauseCloseable {
                     while (true) {
                         Node node = allocDirtyNode();
                         try {
-                            mFragmentCache.put(caller, node);
+                            mFragmentCache.put(node);
                             encodeInt48LE(newValue, poffset, node.mId);
                             arraycopy(value, voffset, node.mPage, 0, pageSize);
                             if (pageCount == 1) {
@@ -3171,7 +3385,7 @@ public final class Database implements CauseCloseable {
                         while (true) {
                             Node node = allocDirtyNode();
                             try {
-                                mFragmentCache.put(caller, node);
+                                mFragmentCache.put(node);
                                 encodeInt48LE(newValue, offset, node.mId);
                                 byte[] page = node.mPage;
                                 if (pageCount > 1) {
@@ -3202,7 +3416,7 @@ public final class Database implements CauseCloseable {
                     Node inode = allocDirtyNode();
                     encodeInt48LE(newValue, offset, inode.mId);
                     int levels = calculateInodeLevels(vlength, pageSize);
-                    writeMultilevelFragments(caller, levels, inode, value, 0, vlength);
+                    writeMultilevelFragments(levels, inode, value, 0, vlength);
                 }
             }
 
@@ -3256,8 +3470,7 @@ public final class Database implements CauseCloseable {
      * @param inode exclusive latched parent inode; always released by this method
      * @param value slice of complete value being fragmented
      */
-    private void writeMultilevelFragments(Node caller,
-                                          int level, Node inode,
+    private void writeMultilevelFragments(int level, Node inode,
                                           byte[] value, int voffset, long vlength)
         throws IOException
     {
@@ -3294,7 +3507,7 @@ public final class Database implements CauseCloseable {
                 throw e;
             }
 
-            mFragmentCache.put(caller, inode);
+            mFragmentCache.put(inode);
         } finally {
             inode.releaseExclusive();
         }
@@ -3327,10 +3540,10 @@ public final class Database implements CauseCloseable {
                 arraycopy(value, voffset, childPage, 0, len);
                 // Zero fill the rest, making it easier to extend later.
                 fill(childPage, len, childPage.length, (byte) 0);
-                mFragmentCache.put(caller, childNode);
+                mFragmentCache.put(childNode);
                 childNode.releaseExclusive();
             } else {
-                writeMultilevelFragments(caller, level, childNode, value, voffset, len);
+                writeMultilevelFragments(level, childNode, value, voffset, len);
             }
 
             vlength -= len;
@@ -3340,10 +3553,8 @@ public final class Database implements CauseCloseable {
 
     /**
      * Reconstruct a fragmented value.
-     *
-     * @param caller optional tree node which is latched and calling this method
      */
-    byte[] reconstruct(Node caller, byte[] fragmented, int off, int len) throws IOException {
+    byte[] reconstruct(byte[] fragmented, int off, int len) throws IOException {
         int header = fragmented[off++];
         len--;
 
@@ -3414,7 +3625,7 @@ public final class Database implements CauseCloseable {
                     // Reconstructing a sparse value. Array is already zero-filled.
                     pLen = Math.min(vLen, mPageSize);
                 } else {
-                    Node node = mFragmentCache.get(caller, nodeId);
+                    Node node = mFragmentCache.get(nodeId);
                     try {
                         byte[] page = node.mPage;
                         pLen = Math.min(vLen, page.length);
@@ -3430,9 +3641,9 @@ public final class Database implements CauseCloseable {
             // Indirect pointers.
             long inodeId = decodeUnsignedInt48LE(fragmented, off);
             if (inodeId != 0) {
-                Node inode = mFragmentCache.get(caller, inodeId);
+                Node inode = mFragmentCache.get(inodeId);
                 int levels = calculateInodeLevels(vLen, mPageSize);
-                readMultilevelFragments(caller, levels, inode, value, 0, vLen);
+                readMultilevelFragments(levels, inode, value, 0, vLen);
             }
         }
 
@@ -3444,8 +3655,7 @@ public final class Database implements CauseCloseable {
      * @param inode shared latched parent inode; always released by this method
      * @param value slice of complete value being reconstructed; initially filled with zeros
      */
-    private void readMultilevelFragments(Node caller,
-                                         int level, Node inode,
+    private void readMultilevelFragments(int level, Node inode,
                                          byte[] value, int voffset, int vlength)
         throws IOException
     {
@@ -3465,12 +3675,12 @@ public final class Database implements CauseCloseable {
         for (long childNodeId : childNodeIds) {
             int len = (int) Math.min(levelCap, vlength);
             if (childNodeId != 0) {
-                Node childNode = mFragmentCache.get(caller, childNodeId);
+                Node childNode = mFragmentCache.get(childNodeId);
                 if (level <= 0) {
                     arraycopy(childNode.mPage, 0, value, voffset, len);
                     childNode.releaseShared();
                 } else {
-                    readMultilevelFragments(caller, level, childNode, value, voffset, len);
+                    readMultilevelFragments(level, childNode, value, voffset, len);
                 }
             }
             vlength -= len;
@@ -3480,10 +3690,8 @@ public final class Database implements CauseCloseable {
 
     /**
      * Delete the extra pages of a fragmented value. Caller must hold commit lock.
-     *
-     * @param caller optional tree node which is latched and calling this method
      */
-    void deleteFragments(Node caller, byte[] fragmented, int off, int len)
+    void deleteFragments(byte[] fragmented, int off, int len)
         throws IOException
     {
         int header = fragmented[off++];
@@ -3529,15 +3737,15 @@ public final class Database implements CauseCloseable {
                 long nodeId = decodeUnsignedInt48LE(fragmented, off);
                 off += 6;
                 len -= 6;
-                deleteFragment(caller, nodeId);
+                deleteFragment(nodeId);
             }
         } else {
             // Indirect pointers.
             long inodeId = decodeUnsignedInt48LE(fragmented, off);
             if (inodeId != 0) {
-                Node inode = removeInode(caller, inodeId);
+                Node inode = removeInode(inodeId);
                 int levels = calculateInodeLevels(vLen, mPageSize);
-                deleteMultilevelFragments(caller, levels, inode, vLen);
+                deleteMultilevelFragments(levels, inode, vLen);
             }
         }
     }
@@ -3546,8 +3754,7 @@ public final class Database implements CauseCloseable {
      * @param level inode level; at least 1
      * @param inode exclusive latched parent inode; always released by this method
      */
-    private void deleteMultilevelFragments(Node caller,
-                                           int level, Node inode, long vlength)
+    private void deleteMultilevelFragments(int level, Node inode, long vlength)
         throws IOException
     {
         byte[] page = inode.mPage;
@@ -3563,12 +3770,12 @@ public final class Database implements CauseCloseable {
         deleteNode(inode);
 
         if (level <= 0) for (long childNodeId : childNodeIds) {
-            deleteFragment(caller, childNodeId);
+            deleteFragment(childNodeId);
         } else for (long childNodeId : childNodeIds) {
             long len = Math.min(levelCap, vlength);
             if (childNodeId != 0) {
-                Node childNode = removeInode(caller, childNodeId);
-                deleteMultilevelFragments(caller, level, childNode, len);
+                Node childNode = removeInode(childNodeId);
+                deleteMultilevelFragments(level, childNode, len);
             }
             vlength -= len;
         }
@@ -3578,8 +3785,8 @@ public final class Database implements CauseCloseable {
      * @param nodeId must not be zero
      * @return non-null Node with exclusive latch held
      */
-    private Node removeInode(Node caller, long nodeId) throws IOException {
-        Node node = mFragmentCache.remove(caller, nodeId);
+    private Node removeInode(long nodeId) throws IOException {
+        Node node = mFragmentCache.remove(nodeId);
         if (node == null) {
             node = allocLatchedNode(false);
             node.mId = nodeId;
@@ -3592,9 +3799,9 @@ public final class Database implements CauseCloseable {
     /**
      * @param nodeId can be zero
      */
-    private void deleteFragment(Node caller, long nodeId) throws IOException {
+    private void deleteFragment(long nodeId) throws IOException {
         if (nodeId != 0) {
-            Node node = mFragmentCache.remove(caller, nodeId);
+            Node node = mFragmentCache.remove(nodeId);
             if (node != null) {
                 deleteNode(node);
             } else if (!mHasCheckpointed) {
