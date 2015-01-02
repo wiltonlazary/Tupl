@@ -16,6 +16,10 @@
 
 package org.cojen.tupl.map;
 
+import java.io.IOException;
+
+import org.cojen.tupl.Transaction;
+
 import org.cojen.tupl.io.Utils;
 
 /**
@@ -23,42 +27,101 @@ import org.cojen.tupl.io.Utils;
  *
  * @author Brian S O'Neill
  */
-public class ArrayType extends Type {
+public final class ArrayType extends Type {
     private static final long HASH_BASE = 1858514625934181638L;
 
-    ArrayType(Schemata schemata, long typeId, short flags) {
+    private final Type mElementType;
+    private final long mMinLength;
+    private final long mMaxRange;
+
+    ArrayType(Schemata schemata, long typeId, short flags,
+              Type elementType, long minLength, long maxRange)
+    {
         super(schemata, typeId, flags);
+        mElementType = elementType;
+        mMinLength = minLength;
+        mMaxRange = maxRange;
     }
 
     public Type getElementType() {
-        // FIXME
-        throw null;
+        return mElementType;
     }
 
     public long getMinLength() {
-        // FIXME
-        throw null;
+        return mMinLength;
     }
 
     public long getMaxRange() {
-        // FIXME
-        throw null;
+        return mMaxRange;
     }
 
-    static long computeHash(short flags, Type elementType, long minLength, long maxRange) {
-        long hash = mixHash(HASH_BASE + flags, elementType);
-        hash = hash * 31 + minLength;
-        hash = hash * 31 + maxRange;
+    @Override
+    public boolean isFixedLength() {
+        return mMaxRange == 0 && mElementType != null && mElementType.isFixedLength();
+    }
+
+    @Override
+    void appendTo(StringBuilder b) {
+        b.append("ArrayType");
+        b.append(" {");
+        appendCommon(b);
+        b.append(", ");
+        b.append("elementType=");
+        appendType(b, mElementType);
+        b.append(", ");
+        b.append("minLength=");
+        b.append(mMinLength);
+        b.append(", ");
+        b.append("maxRange=");
+        b.append(mMaxRange);
+        b.append('}');
+    }
+
+    static ArrayType decode(Transaction txn, Schemata schemata, long typeId, byte[] value)
+        throws IOException
+    {
+        if (value[0] != TYPE_PREFIX_ARRAY) {
+            throw new IllegalArgumentException();
+        }
+        return new ArrayType(schemata, typeId,
+                             (short) Utils.decodeUnsignedShortBE(value, 1), // flags
+                             schemata.decodeType(txn, value, 3), // elementType
+                             Utils.decodeLongBE(value, 11),  // minLength
+                             Utils.decodeLongBE(value, 19)); // maxRange
+    }
+
+    @Override
+    long computeHash() {
+        long hash = mixHash(HASH_BASE + mFlags, mElementType);
+        hash = hash * 31 + mMinLength;
+        hash = hash * 31 + mMaxRange;
         return hash;
     }
 
-    static byte[] encodeValue(short flags, Type elementType, long minLength, long maxRange) {
+    @Override
+    byte[] encodeValue() {
         byte[] value = new byte[1 + 2 + 8 + 8 + 8];
-        value[0] = 2; // polymorph prefix
-        Utils.encodeShortBE(value, 1, flags);
-        encodeType(value, 3, elementType);
-        Utils.encodeLongBE(value, 11, minLength);
-        Utils.encodeLongBE(value, 19, maxRange);
+        value[0] = TYPE_PREFIX_ARRAY;
+        Utils.encodeShortBE(value, 1, mFlags);
+        encodeType(value, 3, mElementType);
+        Utils.encodeLongBE(value, 11, mMinLength);
+        Utils.encodeLongBE(value, 19, mMaxRange);
         return value;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    <T extends Type> T equivalent(T type) {
+        if (type instanceof ArrayType) {
+            ArrayType other = (ArrayType) type;
+            if (mFlags == other.mFlags &&
+                equalTypeIds(mElementType, other.mElementType) &&
+                mMinLength == other.mMinLength &&
+                mMaxRange == other.mMaxRange)
+            {
+                return (T) this;
+            }
+        }
+        return null;
     }
 }

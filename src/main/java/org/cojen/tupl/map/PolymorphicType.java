@@ -16,6 +16,10 @@
 
 package org.cojen.tupl.map;
 
+import java.io.IOException;
+
+import org.cojen.tupl.Transaction;
+
 /**
  * 
  *
@@ -24,28 +28,67 @@ package org.cojen.tupl.map;
 public class PolymorphicType extends Type {
     private static final long HASH_BASE = 1902668584782181472L;
 
+    /* FIXME: Should be: Type nameType, byte[] name, Type[] allowedTypes
+    private final long mIdentifier;
+    private final Type mTargetType;
+    */ 
+
     PolymorphicType(Schemata schemata, long typeId, short flags) {
         super(schemata, typeId, flags);
     }
 
+    /* FIXME: remove
     public long getIdentifier() {
-        // FIXME
-        throw null;
+        return mIdentifier;
     }
 
     public Type getTargetType() {
+        return mTargetType;
+    }
+    */
+
+    @Override
+    public boolean isFixedLength() {
         // FIXME
         throw null;
     }
 
-    static long computeHash(short flags, Type nameType, byte[] name) {
-        long hash = mixHash(HASH_BASE + flags, nameType);
-        hash = mixHash(hash, name);
-        return hash;
+    @Override
+    void appendTo(StringBuilder b) {
+        b.append("PolymorphicType");
+        b.append(" {");
+        appendCommon(b);
+        b.append(", ");
+        // FIXME
+        b.append('}');
     }
 
-    static byte[] encodeValue(short flags, Type nameType, byte[] name, Type[] allowedTypes) {
-        // FIXME: polymorph prefix 6, uint_16 flags, MapType<uvarint_64, uvarint_64>
+    static PolymorphicType decode(Transaction txn, Schemata schemata, long typeId, byte[] value)
+        throws IOException
+    {
+        if (value[0] != TYPE_PREFIX_POLYMORPH) {
+            throw new IllegalArgumentException();
+        }
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    long computeHash() {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    byte[] encodeValue() {
+        // FIXME: polymorph prefix, uint_16 flags, MapType<uvarint_64, uvarint_64>
+        throw null;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    <T extends Type> T equivalent(T type) {
+        // FIXME
         throw null;
     }
 }

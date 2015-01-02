@@ -16,6 +16,10 @@
 
 package org.cojen.tupl.map;
 
+import java.io.IOException;
+
+import org.cojen.tupl.Transaction;
+
 import org.cojen.tupl.io.Utils;
 
 /**
@@ -26,32 +30,84 @@ import org.cojen.tupl.io.Utils;
 public class MapType extends Type {
     private static final long HASH_BASE = 7558341980033698328L;
 
-    MapType(Schemata schemata, long typeId, short flags) {
+    private final Type mKeyType;
+    private final Type mValueType;
+
+    MapType(Schemata schemata, long typeId, short flags, Type keyType, Type valueType) {
         super(schemata, typeId, flags);
+        mKeyType = keyType;
+        mValueType = valueType;
     }
 
     public Type getKeyType() {
-        // FIXME
-        throw null;
+        return mKeyType;
     }
 
     public Type getValueType() {
-        // FIXME
-        throw null;
+        return mValueType;
     }
 
-    static long computeHash(short flags, Type keyType, Type valueType) {
-        long hash = mixHash(HASH_BASE + flags, keyType);
-        hash = mixHash(hash, valueType);
+    @Override
+    public boolean isFixedLength() {
+        return mKeyType != null && mKeyType.isFixedLength()
+            && (mValueType == null || mValueType.isFixedLength());
+    }
+
+    @Override
+    void appendTo(StringBuilder b) {
+        b.append("MapType");
+        b.append(" {");
+        appendCommon(b);
+        b.append(", ");
+        b.append("keyType=");
+        appendType(b, mKeyType);
+        b.append(", ");
+        b.append("valueType=");
+        appendType(b, mValueType);
+        b.append('}');
+    }
+
+    static MapType decode(Transaction txn, Schemata schemata, long typeId, byte[] value)
+        throws IOException
+    {
+        if (value[0] != TYPE_PREFIX_MAP) {
+            throw new IllegalArgumentException();
+        }
+        return new MapType(schemata, typeId,
+                           (short) Utils.decodeUnsignedShortBE(value, 1), // flags
+                           schemata.decodeType(txn, value, 3),   // keyType
+                           schemata.decodeType(txn, value, 11)); // valueType
+    }
+
+    @Override
+    long computeHash() {
+        long hash = mixHash(HASH_BASE + mFlags, mKeyType);
+        hash = mixHash(hash, mValueType);
         return hash;
     }
 
-    static byte[] encodeValue(short flags, Type keyType, Type valueType) {
+    @Override
+    byte[] encodeValue() {
         byte[] value = new byte[1 + 2 + 8 + 8];
-        value[0] = 5; // polymorph prefix
-        Utils.encodeShortBE(value, 1, flags);
-        encodeType(value, 3, keyType);
-        encodeType(value, 11, valueType);
+        value[0] = TYPE_PREFIX_MAP;
+        Utils.encodeShortBE(value, 1, mFlags);
+        encodeType(value, 3, mKeyType);
+        encodeType(value, 11, mValueType);
         return value;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    <T extends Type> T equivalent(T type) {
+        if (type instanceof MapType) {
+            MapType other = (MapType) type;
+            if (mFlags == other.mFlags &&
+                equalTypeIds(mKeyType, other.mKeyType) &&
+                equalTypeIds(mValueType, other.mValueType))
+            {
+                return (T) this;
+            }
+        }
+        return null;
     }
 }

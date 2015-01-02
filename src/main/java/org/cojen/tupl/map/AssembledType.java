@@ -16,6 +16,10 @@
 
 package org.cojen.tupl.map;
 
+import java.io.IOException;
+
+import org.cojen.tupl.Transaction;
+
 import org.cojen.tupl.io.Utils;
 
 /**
@@ -26,28 +30,86 @@ import org.cojen.tupl.io.Utils;
 public class AssembledType extends Type {
     private static final long HASH_BASE = 3315411704127731845L;
 
-    AssembledType(Schemata schemata, long typeId, short flags) {
+    private final Type[] mElementTypes;
+
+    AssembledType(Schemata schemata, long typeId, short flags, Type[] elementTypes) {
         super(schemata, typeId, flags);
+        mElementTypes = elementTypes;
     }
 
     public Type[] getElementTypes() {
-        // FIXME
-        throw null;
+        Type[] types = mElementTypes;
+        if (types != null && types.length != 0) {
+            types = types.clone();
+        }
+
+        return types;
     }
 
-    static long computeHash(short flags, Type[] elementTypes) {
-        return mixHash(HASH_BASE + flags, elementTypes);
+    @Override
+    public boolean isFixedLength() {
+        Type[] types = mElementTypes;
+        if (types != null) {
+            for (Type t : types) {
+                if (!t.isFixedLength()) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
-    static byte[] encodeValue(short flags, Type[] elementTypes) {
-        byte[] value = new byte[1 + 2 + elementTypes.length * 8];
-        value[0] = 3; // polymorph prefix
-        Utils.encodeShortBE(value, 1, flags);
+    @Override
+    void appendTo(StringBuilder b) {
+        b.append("AssembledType");
+        b.append(" {");
+        appendCommon(b);
+        b.append(", ");
+        b.append("elementTypes=");
+        appendTypes(b, mElementTypes);
+        b.append('}');
+    }
+
+    static AssembledType decode(Transaction txn, Schemata schemata, long typeId, byte[] value)
+        throws IOException
+    {
+        if (value[0] != TYPE_PREFIX_ASSEMBLED) {
+            throw new IllegalArgumentException();
+        }
+        return new AssembledType(schemata, typeId,
+                                 (short) Utils.decodeUnsignedShortBE(value, 1), // flags
+                                 schemata.decodeTypes(txn, value, 3)); // elementTypes
+    }
+
+    @Override
+    long computeHash() {
+        return mixHash(HASH_BASE + mFlags, mElementTypes);
+    }
+
+    @Override
+    byte[] encodeValue() {
+        byte[] value = new byte[1 + 2 + mElementTypes.length * 8];
+        value[0] = TYPE_PREFIX_ASSEMBLED;
+        Utils.encodeShortBE(value, 1, mFlags);
         int off = 3;
-        for (Type t : elementTypes) {
+        for (Type t : mElementTypes) {
             encodeType(value, off, t);
             off += 8;
         }
         return value;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    <T extends Type> T equivalent(T type) {
+        if (type instanceof AssembledType) {
+            AssembledType other = (AssembledType) type;
+            if (mFlags == other.mFlags &&
+                equalTypeIds(mElementTypes, other.mElementTypes))
+            {
+                return (T) this;
+            }
+        }
+        return null;
     }
 }

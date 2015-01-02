@@ -23,7 +23,7 @@ import org.cojen.tupl.io.Utils;
  *
  * @author Brian S O'Neill
  */
-public class BasicType extends Type {
+public final class BasicType extends Type {
     /** Denotes any type. Bit length and range must be zero. */
     public static final short FORMAT_ANY = 0;
 
@@ -72,21 +72,117 @@ public class BasicType extends Type {
         return mMaxBitRange;
     }
 
-    static long computeHash(short flags, short format, int minBitLength, int maxBitRange) {
-        long hash = HASH_BASE + flags;
-        hash = hash * 31 + format;
-        hash = hash * 31 + minBitLength;
-        hash = hash * 31 + maxBitRange;
+    @Override
+    public boolean isFixedLength() {
+        return mFormat >= 1 & mFormat <= 2;
+    }
+
+    @Override
+    void appendTo(StringBuilder b) {
+        b.append("BasicType");
+        b.append(" {");
+        appendCommon(b);
+        b.append(", ");
+        b.append("format=");
+
+        switch (mFormat) {
+        case FORMAT_ANY:
+            b.append("Any");
+            break;
+
+        case FORMAT_FIXED_INTEGER:
+            appendFixedInfo("FixedInteger", b);
+            break;
+
+        case FORMAT_UNSIGNED_FIXED_INTEGER:
+            appendFixedInfo("UnsignedFixedInteger", b);
+            break;
+
+        case FORMAT_VARIABLE_INTEGER:
+            appendVariableInfo("VariableInteger", b);
+            break;
+
+        case FORMAT_UNSIGNED_VARIABLE_INTEGER:
+            appendVariableInfo("UnsignedVariableInteger", b);
+            break;
+
+        case FORMAT_BIG_INTEGER:
+            b.append("BigInteger");
+            break;
+
+        case FORMAT_BIG_DECIMAL:
+            b.append("BigDecimal");
+            break;
+
+        default:
+            b.append(mFormat & 0xffffffff);
+            break;
+        }
+
+        b.append('}');
+    }
+
+    private void appendFixedInfo(String desc, StringBuilder b) {
+        b.append(desc);
+        b.append(", ");
+        b.append("bitLength=");
+        b.append(mMinBitLength);
+    }
+
+    private void appendVariableInfo(String desc, StringBuilder b) {
+        b.append(desc);
+        b.append(", ");
+        b.append("minBitLength=");
+        b.append(mMinBitLength);
+        b.append(", ");
+        b.append("maxBitRange=");
+        b.append(mMaxBitRange);
+    }
+
+    static BasicType decode(Schemata schemata, long typeId, byte[] value) {
+        if (value[0] != TYPE_PREFIX_BASIC) {
+            throw new IllegalArgumentException();
+        }
+        return new BasicType(schemata, typeId,
+                             (short) Utils.decodeUnsignedShortBE(value, 1), // flags
+                             (short) Utils.decodeUnsignedShortBE(value, 3), // format
+                             Utils.decodeUnsignedShortBE(value, 5),  // minBitLength
+                             Utils.decodeUnsignedShortBE(value, 7)); // maxBitRange
+    }
+
+    @Override
+    long computeHash() {
+        long hash = HASH_BASE + mFlags;
+        hash = hash * 31 + mFormat;
+        hash = hash * 31 + mMinBitLength;
+        hash = hash * 31 + mMaxBitRange;
         return hash;
     }
 
-    static byte[] encodeValue(short flags, short format, int minBitLength, int maxBitRange) {
+    @Override
+    byte[] encodeValue() {
         byte[] value = new byte[1 + 2 + 2 + 2 + 2];
-        value[0] = 1; // polymorph prefix
-        Utils.encodeShortBE(value, 1, flags);
-        Utils.encodeShortBE(value, 3, format);
-        Utils.encodeShortBE(value, 5, minBitLength);
-        Utils.encodeShortBE(value, 7, maxBitRange);
+        value[0] = TYPE_PREFIX_BASIC;
+        Utils.encodeShortBE(value, 1, mFlags);
+        Utils.encodeShortBE(value, 3, mFormat);
+        Utils.encodeShortBE(value, 5, mMinBitLength);
+        Utils.encodeShortBE(value, 7, mMaxBitRange);
         return value;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    <T extends Type> T equivalent(T type) {
+        if (type instanceof BasicType) {
+            BasicType other = (BasicType) type;
+            if (mFlags == other.mFlags &&
+                mFormat == other.mFormat &&
+                mMinBitLength == other.mMinBitLength &&
+                mMaxBitRange == other.mMaxBitRange)
+            {
+                return (T) this;
+            }
+        }
+        return null;
     }
 }

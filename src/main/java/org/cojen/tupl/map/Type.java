@@ -52,6 +52,13 @@ public abstract class Type {
      */
     public static final short FLAG_PACK_NULLS = 32;
 
+    static final byte TYPE_PREFIX_BASIC = 1;
+    static final byte TYPE_PREFIX_ARRAY = 2;
+    static final byte TYPE_PREFIX_ASSEMBLED = 3;
+    static final byte TYPE_PREFIX_NAMED = 4;
+    static final byte TYPE_PREFIX_MAP = 5;
+    static final byte TYPE_PREFIX_POLYMORPH = 6;
+
     final Schemata mSchemata;
     final long mTypeId;
     final short mFlags;
@@ -70,10 +77,104 @@ public abstract class Type {
         return mFlags;
     }
 
+    public abstract boolean isFixedLength();
+
     public Codec createCodec(Transaction txn) throws IOException {
         // FIXME
         throw null;
     }
+
+    @Override
+    public String toString() {
+        StringBuilder b = new StringBuilder();
+        appendTo(b);
+        return b.toString();
+    }
+
+    abstract void appendTo(StringBuilder b);
+
+    void appendCommon(StringBuilder b) {
+        b.append("typeId=");
+        b.append(mTypeId);
+        b.append(", ");
+        b.append("flags=");
+
+        if (mFlags == 0) {
+            b.append('0');
+        } else {
+            boolean any = false;
+            if ((mFlags & FLAG_DESCENDING) != 0) {
+                b.append("Descending");
+                any = true;
+            }
+            if ((mFlags & FLAG_NULLABLE) != 0) {
+                if (any) {
+                    b.append('|');
+                }
+                b.append("Nullable");
+                any = true;
+            }
+            if ((mFlags & FLAG_NULL_LOW) != 0) {
+                if (any) {
+                    b.append('|');
+                }
+                b.append("NullLow");
+                any = true;
+            }
+            if ((mFlags & FLAG_LITTLE_ENDIAN) != 0) {
+                if (any) {
+                    b.append('|');
+                }
+                b.append("LittleEndian");
+                any = true;
+            }
+            if ((mFlags & FLAG_PACK_ELEMENTS) != 0) {
+                if (any) {
+                    b.append('|');
+                }
+                b.append("PackElements");
+                any = true;
+            }
+            if ((mFlags & FLAG_PACK_NULLS) != 0) {
+                if (any) {
+                    b.append('|');
+                }
+                b.append("PackNulls");
+            }
+        }
+    }
+
+    abstract long computeHash();
+
+    abstract byte[] encodeValue();
+
+    static void appendType(StringBuilder b, Type type) {
+        if (type == null) {
+            b.append("null");
+        } else {
+            type.appendTo(b);
+        }
+    }
+
+    static void appendTypes(StringBuilder b, Type[] types) {
+        if (types == null) {
+            b.append("null");
+        } else {
+            b.append('[');
+            for (int i=0; i<types.length; i++) {
+                if (i > 0) {
+                    b.append(", ");
+                }
+                appendType(b, types[i]);
+            }
+            b.append(']');
+        }
+    }
+
+    /**
+     * @return this if equivalent, null otherwise
+     */
+    abstract <T extends Type> T equivalent(T other);
 
     static long mixHash(long hash, Type type) {
         if (type == null) {
@@ -108,5 +209,37 @@ public abstract class Type {
 
     static void encodeType(byte[] value, int off, Type type) {
         Utils.encodeLongBE(value, off, type == null ? 0 : type.getTypeId());
+    }
+
+    static boolean equalTypeIds(Type a, Type b) {
+        if (a == null) {
+            return b == null;
+        }
+
+        if (b == null) {
+            return a == null;
+        }
+
+        return a.mTypeId == b.mTypeId;
+    }
+
+    static boolean equalTypeIds(Type[] a, Type[] b) {
+        if (a == null) {
+            return b == null;
+        }
+
+        if (b == null) {
+            return a == null;
+        }
+
+        if (a.length == b.length) {
+            for (int i=0; i<a.length; i++) {
+                if (!equalTypeIds(a[i], b[i])) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 }
