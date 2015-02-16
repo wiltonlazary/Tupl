@@ -14,6 +14,7 @@
  *  limitations under the License.
  */
 
+// FIXME: rename to schemata
 package org.cojen.tupl.map;
 
 import java.io.IOException;
@@ -28,17 +29,17 @@ import org.cojen.tupl.io.Utils;
  * @author Brian S O'Neill
  */
 public abstract class Type {
+    /** Set to indicate that numeric value should be encoded in little-endian format. */
+    public static final short FLAG_LITTLE_ENDIAN = 1;
+
     /** Set to indicate that natural ordering is descending. */
-    public static final short FLAG_DESCENDING = 1;
+    public static final short FLAG_DESCENDING = 2;
 
     /** Set to indicate that values can be null. */
-    public static final short FLAG_NULLABLE = 2;
+    public static final short FLAG_NULLABLE = 4;
 
     /** Set to indicate that nulls are ordered lower than non-null values. */
-    public static final short FLAG_NULL_LOW = 4;
-
-    /** Set to indicate that value should be encoded in little-endian format. */
-    public static final short FLAG_LITTLE_ENDIAN = 8;
+    public static final short FLAG_NULL_LOW = 8;
 
     /**
      * For array and assembled types, set to indicate that elements smaller than one byte are
@@ -52,12 +53,15 @@ public abstract class Type {
      */
     public static final short FLAG_PACK_NULLS = 32;
 
-    static final byte TYPE_PREFIX_BASIC = 1;
+    static final byte TYPE_PREFIX_NUMERIC = 1;
     static final byte TYPE_PREFIX_ARRAY = 2;
-    static final byte TYPE_PREFIX_ASSEMBLED = 3;
-    static final byte TYPE_PREFIX_NAMED = 4;
-    static final byte TYPE_PREFIX_MAP = 5;
-    static final byte TYPE_PREFIX_POLYMORPH = 6;
+    static final byte TYPE_PREFIX_UNICODE = 3;
+    static final byte TYPE_PREFIX_ASSEMBLED = 4;
+    static final byte TYPE_PREFIX_NAMED = 5;
+    static final byte TYPE_PREFIX_MAP = 6;
+    // FIXME: Define an enum type which maps constants (of any type) to constants (of any type).
+    static final byte TYPE_PREFIX_ENUM = 7;
+    static final byte TYPE_PREFIX_POLYMORPH = 8;
 
     final Schemata mSchemata;
     final long mTypeId;
@@ -78,6 +82,30 @@ public abstract class Type {
     }
 
     public abstract boolean isFixedLength();
+
+    /**
+     * Converts the encoded data to a human-readable string. Implementation is not expected to
+     * be efficient.
+     */
+    public abstract String printData(byte[] data);
+
+    /**
+     * Converts the encoded key to a human-readable string. Implementation is not expected to
+     * be efficient.
+     */
+    public abstract String printKey(byte[] key);
+
+    /**
+     * Converts a printed string to encoded data. Parser is strict except with respect to
+     * whitespace. Implementation is not expected to be efficient.
+     */
+    public abstract byte[] parseData(String str);
+
+    /**
+     * Converts a printed string to an encoded key. Parser is strict except with respect to
+     * whitespace. Implementation is not expected to be efficient.
+     */
+    public abstract byte[] parseKey(String str);
 
     public Codec createCodec(Transaction txn) throws IOException {
         // FIXME
@@ -103,7 +131,14 @@ public abstract class Type {
             b.append('0');
         } else {
             boolean any = false;
+            if ((mFlags & FLAG_LITTLE_ENDIAN) != 0) {
+                b.append("LittleEndian");
+                any = true;
+            }
             if ((mFlags & FLAG_DESCENDING) != 0) {
+                if (any) {
+                    b.append('|');
+                }
                 b.append("Descending");
                 any = true;
             }
@@ -119,13 +154,6 @@ public abstract class Type {
                     b.append('|');
                 }
                 b.append("NullLow");
-                any = true;
-            }
-            if ((mFlags & FLAG_LITTLE_ENDIAN) != 0) {
-                if (any) {
-                    b.append('|');
-                }
-                b.append("LittleEndian");
                 any = true;
             }
             if ((mFlags & FLAG_PACK_ELEMENTS) != 0) {

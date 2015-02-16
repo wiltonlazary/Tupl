@@ -67,6 +67,30 @@ public class NamedType extends Type {
     }
 
     @Override
+    public String printData(byte[] data) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public String printKey(byte[] data) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public byte[] parseData(String str) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public byte[] parseKey(String str) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
     void appendTo(StringBuilder b) {
         b.append("NamedType");
         b.append(" {");
@@ -92,8 +116,8 @@ public class NamedType extends Type {
         /* FIXME
         if (mNameType instanceof ArrayType) {
             Type elementType = ((ArrayType) mNameType).getElementType();
-            if (elementType instanceof BasicType) {
-                short format = ((BasicType) elementType).getFormat();
+            if (elementType instanceof NumericType) {
+                short format = ((NumericType) elementType).getFormat();
                 if (format
             }
         }

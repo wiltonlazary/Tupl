@@ -33,76 +33,67 @@ public abstract class Encoder {
 
     public abstract int getMaxRange();
 
-    public abstract void init();
+    public abstract void encode(Record rec, boolean v);
 
-    // Note: Array might be replaced if not large enough.
-    public abstract void init(byte[] dst, int off);
+    public abstract void encode(Record rec, byte v);
 
-    public abstract int getLength();
+    public abstract void encode(Record rec, char v);
 
-    public abstract byte[] finish();
+    public abstract void encode(Record rec, short v);
 
-    public abstract void encode(boolean v);
+    public abstract void encode(Record rec, int v);
 
-    public abstract void encode(byte v);
+    public abstract void encode(Record rec, float v);
 
-    public abstract void encode(char v);
+    public abstract void encode(Record rec, long v);
 
-    public abstract void encode(short v);
+    public abstract void encode(Record rec, double v);
 
-    public abstract void encode(int v);
+    public abstract void encode(Record rec, BigInteger v);
 
-    public abstract void encode(float v);
+    public abstract void encode(Record rec, BigDecimal v);
 
-    public abstract void encode(long v);
+    public abstract void encode(Record rec, String v);
 
-    public abstract void encode(double v);
+    public abstract void encode(Record rec, Boolean v);
 
-    public abstract void encode(BigInteger v);
+    public abstract void encode(Record rec, Byte v);
 
-    public abstract void encode(BigDecimal v);
+    public abstract void encode(Record rec, Character v);
 
-    public abstract void encode(String v);
+    public abstract void encode(Record rec, Short v);
 
-    public abstract void encode(Boolean v);
+    public abstract void encode(Record rec, Integer v);
 
-    public abstract void encode(Byte v);
+    public abstract void encode(Record rec, Float v);
 
-    public abstract void encode(Character v);
+    public abstract void encode(Record rec, Long v);
 
-    public abstract void encode(Short v);
+    public abstract void encode(Record rec, Double v);
 
-    public abstract void encode(Integer v);
+    public abstract void encode(Record rec, boolean[] v);
 
-    public abstract void encode(Float v);
+    public abstract void encode(Record rec, byte[] v);
 
-    public abstract void encode(Long v);
+    public abstract void encode(Record rec, char[] v);
 
-    public abstract void encode(Double v);
+    public abstract void encode(Record rec, short[] v);
 
-    public abstract void encode(boolean[] v);
+    public abstract void encode(Record rec, int[] v);
 
-    public abstract void encode(byte[] v);
+    public abstract void encode(Record rec, float[] v);
 
-    public abstract void encode(char[] v);
+    public abstract void encode(Record rec, long[] v);
 
-    public abstract void encode(short[] v);
+    public abstract void encode(Record rec, double[] v);
 
-    public abstract void encode(int[] v);
+    public abstract <T> void encode(Record rec, T[] v, Class<T> t);
 
-    public abstract void encode(float[] v);
+    public abstract <T> void encode(Record rec, List<T> v, Class<T> t);
 
-    public abstract void encode(long[] v);
+    public abstract <T> void encode(Record rec, Set<T> v, Class<T> t);
 
-    public abstract void encode(double[] v);
+    public abstract <K, V> void encode(Record rec, Map<K, V> v, Class<K> kt, Class<V> vt);
 
-    public abstract <T> void encode(T[] v, Class<T> t);
-
-    public abstract <T> void encode(List<T> v, Class<T> t);
-
-    public abstract <T> void encode(Set<T> v, Class<T> t);
-
-    public abstract <K, V> void encode(Map<K, V> v, Class<K> kt, Class<V> vt);
-
-    public abstract void encode(Object v);
+    public abstract void encode(Record rec, Object v);
 }

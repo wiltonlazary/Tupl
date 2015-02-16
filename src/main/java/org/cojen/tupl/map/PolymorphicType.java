@@ -31,7 +31,10 @@ public class PolymorphicType extends Type {
     /* FIXME: Should be: Type nameType, byte[] name, Type[] allowedTypes
     private final long mIdentifier;
     private final Type mTargetType;
-    */ 
+    */
+
+    // FIXME: User defines the tag to type mappings. Tag is a simple byte[] constant which must
+    // not match a prefix of any other tag. This eliminates decoding ambiguity.
 
     PolymorphicType(Schemata schemata, long typeId, short flags) {
         super(schemata, typeId, flags);
@@ -49,6 +52,30 @@ public class PolymorphicType extends Type {
 
     @Override
     public boolean isFixedLength() {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public String printData(byte[] data) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public String printKey(byte[] data) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public byte[] parseData(String str) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public byte[] parseKey(String str) {
         // FIXME
         throw null;
     }

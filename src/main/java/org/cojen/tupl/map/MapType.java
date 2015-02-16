@@ -54,6 +54,30 @@ public class MapType extends Type {
     }
 
     @Override
+    public String printData(byte[] data) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public String printKey(byte[] data) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public byte[] parseData(String str) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
+    public byte[] parseKey(String str) {
+        // FIXME
+        throw null;
+    }
+
+    @Override
     void appendTo(StringBuilder b) {
         b.append("MapType");
         b.append(" {");

@@ -28,7 +28,7 @@ import org.cojen.tupl.View;
 
 import org.cojen.tupl.io.Utils;
 
-import static org.cojen.tupl.map.BasicType.*;
+import static org.cojen.tupl.map.NumericType.*;
 
 /**
  * 
@@ -42,7 +42,7 @@ public class Schemata {
         View ix = db.openIndex("org.cojen.tupl.map.Schemata");
         Schemata s = new Schemata(db, ix);
 
-        BasicType t1 = s.defineBasicType(0, BasicType.FORMAT_FIXED_INTEGER, 32, 0);
+        NumericType t1 = s.defineNumericType(0, NumericType.FORMAT_FIXED_INTEGER, 32, 0);
         System.out.println(t1);
 
         ArrayType t2 = s.defineArrayType(Type.FLAG_NULLABLE, t1, 0, 1000);
@@ -60,6 +60,9 @@ public class Schemata {
 
         MapType t6 = s.defineMapType(0, t1, t2);
         System.out.println(t6);
+
+        UnicodeType t7 = s.defineUnicodeType(t2, UnicodeType.ENCODING_UTF_32);
+        System.out.println(t7);
     }
 
     private static final byte PRIMARY_IX_PREFIX = 1, HASH_IX_PREFIX = 2;
@@ -101,32 +104,48 @@ public class Schemata {
 
     // Note: Built-in type zero is reserved and means "void".
 
-    public BasicType defineBasicType(int flags, int format, int minBitLength, int maxBitRange)
+    public NumericType defineNumericType(int flags, int format, int minBitLength, int maxBitRange)
         throws IOException
     {
-        checkCommonFlags(flags);
+        checkNumericFlags(flags);
 
-        if (format < FORMAT_ANY | format > FORMAT_BIG_DECIMAL
+        if (format < FORMAT_FIXED_INTEGER | format > FORMAT_BIG_FLOAT_DECIMAL
             | (minBitLength & ~0xffff) != 0 | (maxBitRange & ~0xffff) != 0)
         {
             throw new IllegalArgumentException();
         }
 
         if (minBitLength != 0
-            && (format < FORMAT_FIXED_INTEGER | format > FORMAT_UNSIGNED_VARIABLE_INTEGER))
+            && (format < FORMAT_FIXED_INTEGER | format > FORMAT_VARIABLE_INTEGER_UNSIGNED))
         {
             throw new IllegalArgumentException();
         }
 
         if (maxBitRange != 0
-            && (format < FORMAT_VARIABLE_INTEGER | format > FORMAT_UNSIGNED_VARIABLE_INTEGER))
+            && (format < FORMAT_VARIABLE_INTEGER | format > FORMAT_VARIABLE_INTEGER_UNSIGNED))
         {
             throw new IllegalArgumentException();
         }
 
+        if (format == FORMAT_FIXED_FLOAT) {
+            switch (minBitLength) {
+            case 16: case 32: case 64: case 128:
+                break;
+            default:
+                throw new IllegalArgumentException();
+            }
+        } else if (format == FORMAT_FIXED_FLOAT_DECIMAL) {
+            switch (minBitLength) {
+            case 32: case 64: case 128:
+                break;
+            default:
+                throw new IllegalArgumentException();
+            }
+        }
+
         synchronized (this) {
             return defineType
-                (new BasicType
+                (new NumericType
                  (this, mNextTypeId, (short) flags, (short) format, minBitLength, maxBitRange));
         }
     }
@@ -154,6 +173,69 @@ public class Schemata {
     }
 
     /**
+     * Note: For full compatibility with unicode encoding, base type must be composed of fixed
+     * sized integers.
+     *
+     * @param baseType NumericType or ArrayType of NumericType
+     * @param encoding UnicodeType.ENCODING_UTF_8, etc.
+     */
+    public UnicodeType defineUnicodeType(Type baseType, int encoding) throws IOException {
+        if (baseType == null) {
+            throw new IllegalArgumentException();
+        }
+
+        checkSchemata(baseType);
+
+        NumericType numericType;
+        numeric: {
+            if (baseType instanceof NumericType) {
+                numericType = (NumericType) baseType;
+                break numeric;
+            }
+
+            if (baseType instanceof ArrayType) {
+                Type elementType = ((ArrayType) baseType).getElementType();
+                if (elementType instanceof NumericType) {
+                    numericType = (NumericType) elementType;
+                    break numeric;
+                }
+            }
+
+            throw new IllegalArgumentException();
+        }
+
+        if (encoding < UnicodeType.ENCODING_UTF_8 || encoding > UnicodeType.ENCODING_UTF_32) {
+            throw new IllegalArgumentException();
+        }
+
+        int minBitLength;
+
+        switch (encoding) {
+        case UnicodeType.ENCODING_UTF_8:
+            minBitLength = 8;
+            break;
+        case UnicodeType.ENCODING_UTF_16:
+            minBitLength = 16;
+            break;
+        case UnicodeType.ENCODING_UTF_32:
+            minBitLength = 32;
+            break;
+        default:
+            throw new IllegalArgumentException();
+        }
+
+        /* Allow data truncation.
+        if (numericType.getMinBitLength() < minBitLength) {
+            throw new IllegalArgumentException();
+        }
+        */
+
+        synchronized (this) {
+            return defineType(new UnicodeType(this, mNextTypeId, baseType, (short) encoding));
+        }
+    }
+
+    /**
      * Note: Elements are always encoded in the order defined here. Optimal encoding can be
      * achieved by ordering fixed sized elements first and by enabling packing.
      */
@@ -167,6 +249,9 @@ public class Schemata {
         }
 
         for (Type t : elementTypes) {
+            if (t == null) {
+                throw new IllegalArgumentException();
+            }
             checkSchemata(t);
         }
 
@@ -228,6 +313,9 @@ public class Schemata {
 
         /*
         for (Type t : allowedTypes) {
+            if (t == null) {
+                throw new IllegalArgumentException();
+            }
             checkSchemata(t);
         }
         */
@@ -256,10 +344,12 @@ public class Schemata {
         }
 
         switch (value[0]) {
-        case TYPE_PREFIX_BASIC:
-            return BasicType.decode(this, typeId, value);
+        case TYPE_PREFIX_NUMERIC:
+            return NumericType.decode(this, typeId, value);
         case TYPE_PREFIX_ARRAY:
             return ArrayType.decode(txn, this, typeId, value);
+        case TYPE_PREFIX_UNICODE:
+            return UnicodeType.decode(txn, this, typeId, value);
         case TYPE_PREFIX_ASSEMBLED:
             return AssembledType.decode(txn, this, typeId, value);
         case TYPE_PREFIX_NAMED:
@@ -342,14 +432,20 @@ public class Schemata {
         return type;
     }
 
-    private static void checkCommonFlags(int flags) {
+    private static void checkNumericFlags(int flags) {
         if ((flags & ~0b00000000_00001111) != 0) {
             throw new IllegalArgumentException();
         }
     }
 
+    private static void checkCommonFlags(int flags) {
+        if ((flags & ~0b00000000_00001110) != 0) {
+            throw new IllegalArgumentException();
+        }
+    }
+
     private static void checkAssembledFlags(int flags) {
-        if ((flags & ~0b00000000_00111111) != 0) {
+        if ((flags & ~0b00000000_00111110) != 0) {
             throw new IllegalArgumentException();
         }
     }
