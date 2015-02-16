@@ -23,7 +23,7 @@ import java.io.IOException;
  *
  * @author Brian S O'Neill
  */
-class TrimmedCursor implements Cursor {
+final class TrimmedCursor implements Cursor {
     private final TrimmedView mView;
     private final Cursor mSource;
     private final int mTrim;
@@ -44,6 +44,11 @@ class TrimmedCursor implements Cursor {
     @Override
     public Transaction link(Transaction txn) {
         return mSource.link(txn);
+    }
+
+    @Override
+    public Transaction link() {
+        return mSource.link();
     }
 
     @Override
@@ -70,6 +75,11 @@ class TrimmedCursor implements Cursor {
     @Override
     public boolean autoload(boolean mode) {
         return mSource.autoload(mode);
+    }
+
+    @Override
+    public boolean autoload() {
+        return mSource.autoload();
     }
 
     @Override

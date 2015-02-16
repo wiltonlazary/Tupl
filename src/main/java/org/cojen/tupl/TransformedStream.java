@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2015 Brian S O'Neill
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,16 +23,20 @@ import java.io.IOException;
  *
  * @author Brian S O'Neill
  */
-final class TrimmedStream extends WrappedStream {
-    private final TrimmedView mView;
+final class TransformedStream extends WrappedStream {
+    private final Transformer mTransformer;
 
-    TrimmedStream(TrimmedView view, Stream source) {
+    TransformedStream(Stream source, Transformer transformer) {
         super(source);
-        mView = view;
+        mTransformer = transformer;
     }
 
     @Override
-    public LockResult open(Transaction txn, byte[] key) throws IOException {
-        return mSource.open(txn, mView.applyPrefix(key));
+    public LockResult open(Transaction txn, byte[] tkey) throws IOException {
+        final byte[] key = mTransformer.inverseTransformKey(tkey);
+        if (key == null) {
+            throw new ViewConstraintException("Unsupported key");
+        }
+        return mSource.open(txn, key);
     }
 }

@@ -24,15 +24,15 @@ import java.io.IOException;
  * @author Brian S O'Neill
  * @see RedoLogRecovery
  */
-class RedoLogApplier implements RedoVisitor {
-    private final Database mDb;
+final class RedoLogApplier implements RedoVisitor {
+    private final Database mDatabase;
     private final LHashTable.Obj<Transaction> mTransactions;
     private final LHashTable.Obj<Index> mIndexes;
 
     long mHighestTxnId;
 
     RedoLogApplier(Database db, LHashTable.Obj<Transaction> txns) {
-        mDb = db;
+        mDatabase = db;
         mTransactions = txns;
         mIndexes = new LHashTable.Obj<>(16);
     }
@@ -78,11 +78,15 @@ class RedoLogApplier implements RedoVisitor {
     }
 
     @Override
-    public boolean dropIndex(long indexId) throws IOException {
+    public boolean dropIndex(long txnId, long indexId) throws IOException {
         Index ix = openIndex(indexId);
         if (ix != null) {
             try {
-                ix.drop();
+                if (ix instanceof Tree) {
+                    ((Tree) ix).drop(txnId);
+                } else {
+                    ix.drop();
+                }
             } catch (IllegalStateException e) {
                 // Assume not empty due to NO_REDO delete.
                 return true;
@@ -93,16 +97,16 @@ class RedoLogApplier implements RedoVisitor {
     }
 
     @Override
-    public boolean renameIndex(long indexId, byte[] newName) throws IOException {
+    public boolean renameIndex(long txnId, long indexId, byte[] newName) throws IOException {
         Index ix = openIndex(indexId);
         if (ix != null) {
-            mDb.renameIndex(ix, newName, false);
+            mDatabase.renameIndex(ix, newName, txnId);
         }
         return true;
     }
 
     @Override
-    public boolean deleteIndex(long indexId) throws IOException {
+    public boolean deleteIndex(long txnId, long indexId) throws IOException {
         // Nothing to do yet. After recovery is complete, trashed indexes are deleted in a
         // separate thread.
         return true;
@@ -112,7 +116,7 @@ class RedoLogApplier implements RedoVisitor {
     public boolean txnEnter(long txnId) throws IOException {
         Transaction txn = txn(txnId);
         if (txn == null) {
-            txn = new Transaction(mDb, txnId, LockMode.UPGRADABLE_READ, 0L);
+            txn = new Transaction(mDatabase, txnId, LockMode.UPGRADABLE_READ, 0L);
             mTransactions.insert(txnId).value = txn;
         } else {
             txn.enter();
@@ -197,7 +201,7 @@ class RedoLogApplier implements RedoVisitor {
         if (entry != null) {
             return entry.value;
         }
-        Index ix = mDb.anyIndexById(indexId);
+        Index ix = mDatabase.anyIndexById(indexId);
         if (ix != null) {
             // Maintain a strong reference to the index.
             mIndexes.insert(indexId).value = ix;

@@ -25,7 +25,7 @@ import static org.cojen.tupl.Node.*;
  *
  * @author Brian S O'Neill
  */
-class FragmentCache {
+final class FragmentCache {
     private final Database mDatabase;
     private final NodeMap mNodeMap;
 
@@ -45,13 +45,13 @@ class FragmentCache {
         if (node != null) {
             node.acquireShared();
             if (nodeId == node.mId) {
-                mDatabase.used(node);
+                node.used();
                 return node;
             }
             node.releaseShared();
         }
 
-        node = mDatabase.allocLatchedNode();
+        node = mDatabase.allocLatchedNode(nodeId);
         node.mId = nodeId;
         node.mType = TYPE_FRAGMENT;
 
@@ -76,13 +76,13 @@ class FragmentCache {
         if (node != null) {
             node.acquireExclusive();
             if (nodeId == node.mId) {
-                mDatabase.used(node);
+                node.used();
                 return node;
             }
             node.releaseExclusive();
         }
 
-        node = mDatabase.allocLatchedNode();
+        node = mDatabase.allocLatchedNode(nodeId);
         node.mId = nodeId;
         node.mType = TYPE_FRAGMENT;
 
@@ -96,28 +96,8 @@ class FragmentCache {
     }
 
     /**
-     * Returns the node with the given id, if already in the cache. Method is intended for
-     * obtaining nodes to write into.
-     *
-     * @return node with exclusive latch held, or null if not found
-     */
-    Node findw(long nodeId) {
-        Node node = mNodeMap.get(nodeId);
-        if (node != null) {
-            node.acquireExclusive();
-            if (nodeId == node.mId) {
-                mDatabase.used(node);
-            } else {
-                node.releaseExclusive();
-                node = null;
-            }
-        }
-        return node;
-    }
-
-    /**
-     * Stores the node, and sets the type to TYPE_FRAGMENT. Node latch is not released, even
-     * if an exception is thrown.
+     * Stores the node, and sets the type to TYPE_FRAGMENT. Node latch is not released, even if
+     * an exception is thrown. Caller must confirm that node is not already present.
      *
      * @param node exclusively latched node
      */

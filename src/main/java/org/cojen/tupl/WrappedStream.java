@@ -33,6 +33,16 @@ abstract class WrappedStream implements Stream {
     }
 
     @Override
+    public Transaction link(Transaction txn) {
+        return mSource.link(txn);
+    }
+
+    @Override
+    public Transaction link() {
+        return mSource.link();
+    }
+
+    @Override
     public long length() throws IOException {
         return mSource.length();
     }

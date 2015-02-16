@@ -117,8 +117,11 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
      * @param indexId non-zero index id
      * @return non-zero position if caller should call txnCommitSync
      */
-    public synchronized long dropIndex(long indexId, DurabilityMode mode) throws IOException {
-        writeOp(OP_DROP_INDEX, indexId);
+    public synchronized long dropIndex(long txnId, long indexId, DurabilityMode mode)
+        throws IOException
+    {
+        writeTxnOp(OP_DROP_INDEX, txnId);
+        writeLongLE(indexId);
         writeTerminator();
         return commitFlush(mode);
     }
@@ -130,10 +133,12 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
      * @param newName non-null new index name
      * @return non-zero position if caller should call txnCommitSync
      */
-    public synchronized long renameIndex(long indexId, byte[] newName, DurabilityMode mode)
+    public synchronized long renameIndex(long txnId, long indexId, byte[] newName,
+                                         DurabilityMode mode)
         throws IOException
     {
-        writeOp(OP_RENAME_INDEX, indexId);
+        writeTxnOp(OP_RENAME_INDEX, txnId);
+        writeLongLE(indexId);
         writeUnsignedVarInt(newName.length);
         writeBytes(newName);
         writeTerminator();
@@ -146,8 +151,11 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
      * @param indexId non-zero index id
      * @return non-zero position if caller should call txnCommitSync
      */
-    public synchronized long deleteIndex(long indexId, DurabilityMode mode) throws IOException {
-        writeOp(OP_DELETE_INDEX, indexId);
+    public synchronized long deleteIndex(long txnId, long indexId, DurabilityMode mode)
+        throws IOException
+    {
+        writeTxnOp(OP_DELETE_INDEX, txnId);
+        writeLongLE(indexId);
         writeTerminator();
         return commitFlush(mode);
     }
@@ -192,10 +200,20 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
     /**
      * Called after txnCommitFinal.
      *
+     * @param txn transaction committed
      * @param commitPos highest position to sync (exclusive)
      */
-    public void txnCommitSync(long commitPos) throws IOException {
+    public void txnCommitSync(Transaction txn, long commitPos) throws IOException {
         sync(false);
+    }
+
+    /**
+     * Called after txnCommitFinal.
+     *
+     * @param pending pending transaction committed
+     */
+    public void txnCommitPending(PendingTxn pending) throws IOException {
+        throw new UnsupportedOperationException();
     }
 
     public synchronized void txnStore(byte op, long txnId, long indexId, byte[] key, byte[] value)
@@ -308,6 +326,11 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
 
     public abstract long encoding();
 
+    /**
+     * Return a new or existing RedoWriter for a new transaction.
+     */
+    public abstract RedoWriter txnRedoWriter();
+
     // Caller must be synchronized.
     abstract boolean isOpen();
 
@@ -363,7 +386,9 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
     abstract void checkpointFinished() throws IOException;
 
     // Caller must be synchronized.
-    abstract void opWriteCheck() throws IOException;
+    void opWriteCheck() throws IOException {
+        // Always writable by default.
+    }
 
     /**
      * Write to the physical log.

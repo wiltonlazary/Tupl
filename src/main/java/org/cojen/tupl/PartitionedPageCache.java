@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * @author Brian S O'Neill
  */
-class PartitionedPageCache implements PageCache {
+final class PartitionedPageCache implements PageCache {
     private final DirectPageCache[] mPartitions;
     private final long mPartitionShift;
     private final long mCapacity;
@@ -46,8 +46,6 @@ class PartitionedPageCache implements PageCache {
 
         final int pcount = Utils.roundUpPower2(minPartitions);
         final double psize = capacity / (double) pcount;
-        final long zeroId = Utils.scramble(0);
-
         final int[] pcapacities = new int[pcount];
 
         capacity = 0;

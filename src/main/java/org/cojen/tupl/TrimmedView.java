@@ -23,7 +23,7 @@ import java.io.IOException;
  *
  * @author Brian S O'Neill
  */
-class TrimmedView implements View {
+final class TrimmedView implements View {
     private final View mSource;
     private final byte[] mPrefix;
     final int mTrim;
@@ -115,6 +115,11 @@ class TrimmedView implements View {
     public View viewPrefix(byte[] prefix, int trim) {
         SubView.prefixCheck(prefix, trim);
         return mSource.viewPrefix(applyPrefix(prefix), mTrim + trim);
+    }
+
+    @Override
+    public View viewTransformed(Transformer transformer) {
+        return TransformedView.apply(this, transformer);
     }
 
     @Override

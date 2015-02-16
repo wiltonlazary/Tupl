@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2015 Brian S O'Neill
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -16,23 +16,23 @@
 
 package org.cojen.tupl;
 
-import java.io.IOException;
-
 /**
- * 
+ * Base class for any object which can own or acquire locks.
  *
  * @author Brian S O'Neill
  */
-final class TrimmedStream extends WrappedStream {
-    private final TrimmedView mView;
+class LockOwner {
+    // LockOwner is currently waiting to acquire this lock. Used for deadlock detection.
+    Lock mWaitingFor;
 
-    TrimmedStream(TrimmedView view, Stream source) {
-        super(source);
-        mView = view;
-    }
+    private int mHashCode;
 
     @Override
-    public LockResult open(Transaction txn, byte[] key) throws IOException {
-        return mSource.open(txn, mView.applyPrefix(key));
+    public final int hashCode() {
+        int hash = mHashCode;
+        if (hash == 0) {
+            mHashCode = hash = Utils.randomSeed();
+        }
+        return hash;
     }
 }

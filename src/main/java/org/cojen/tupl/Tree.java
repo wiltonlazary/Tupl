@@ -113,8 +113,7 @@ class Tree implements Index {
 
     @Override
     public final byte[] getName() {
-        byte[] name = mName;
-        return name == null ? null : name.clone();
+        return cloneArray(mName);
     }
 
     @Override
@@ -128,7 +127,7 @@ class Tree implements Index {
     }
 
     @Override
-    public Cursor newCursor(Transaction txn) {
+    public TreeCursor newCursor(Transaction txn) {
         return new TreeCursor(this, txn);
     }
 
@@ -137,7 +136,7 @@ class Tree implements Index {
         check(txn);
         Locker locker = lockForLoad(txn, key);
         try {
-            return mRoot.search(this, key);
+            return Node.search(mRoot, this, key);
         } finally {
             if (locker != null) {
                 locker.unlock();
@@ -236,6 +235,11 @@ class Tree implements Index {
     }
 
     @Override
+    public final View viewTransformed(Transformer transformer) {
+        return TransformedView.apply(this, transformer);
+    }
+
+    @Override
     public final View viewReverse() {
         return new ReverseView(this);
     }
@@ -322,6 +326,7 @@ class Tree implements Index {
     final boolean verifyTree(Index view, VerificationObserver observer) throws IOException {
         TreeCursor cursor = new TreeCursor(this, Transaction.BOGUS);
         try {
+            cursor.autoload(false);
             cursor.first();
             int height = cursor.height();
             if (!observer.indexBegin(view, height)) {
@@ -342,12 +347,19 @@ class Tree implements Index {
 
     @Override
     public final void close() throws IOException {
+        close(false);
+    }
+
+    /**
+     * @return root node if forDelete; null if already closed
+     */
+    final Node close(boolean forDelete) throws IOException {
         Node root = mRoot;
         root.acquireExclusive();
         try {
             if (root.mPage == EMPTY_BYTES) {
                 // Already closed.
-                return;
+                return null;
             }
 
             if (isInternal(mId)) {
@@ -363,7 +375,7 @@ class Tree implements Index {
                 try {
                     root.acquireExclusive();
                     if (root.mPage == EMPTY_BYTES) {
-                        return;
+                        return null;
                     }
                     if (root.mLastCursorFrame != null) {
                         root.invalidateCursors(mDatabase.mTreeNodeMap);
@@ -373,23 +385,34 @@ class Tree implements Index {
                 }
             }
 
+            // Root node reference cannot be cleared, so instead make it non-functional. Move
+            // the page reference into a new evictable Node object, allowing it to be recycled.
+
+            Node newRoot = root.cloneNode(true);
+            mDatabase.swapIfDirty(root, newRoot);
+            root.closeRoot();
+
+            if (forDelete) {
+                mDatabase.treeClosed(this, null);
+                return newRoot;
+            }
+
             if (mDatabase.mPageDb.isDurable()) {
-                root.forceEvictTree(mDatabase);
-
-                // Root node reference cannot be cleared, so instead make it
-                // non-functional. Move the page reference into a new evictable Node object,
-                // allowing it to be recycled.
-
-                mDatabase.makeEvictable(root.closeRoot(false));
-                mDatabase.treeClosed(this);
+                newRoot.acquireShared();
+                try {
+                    mDatabase.treeClosed(this, newRoot);
+                } finally {
+                    newRoot.releaseShared();
+                }
             } else {
                 // Non-durable tree cannot be truly closed because nothing would reference it
                 // anymore. As per the interface contract, make this reference unmodifiable,
                 // but also register a replacement tree instance. Closing a non-durable tree
                 // has little practical value.
-
-                mDatabase.replaceClosedTree(this, root.closeRoot(true));
+                mDatabase.replaceClosedTree(this, newRoot);
             }
+
+            return null;
         } finally {
             root.releaseExclusive();
         }
@@ -406,28 +429,24 @@ class Tree implements Index {
 
     @Override
     public final void drop() throws IOException {
-        drop(DROP_IF_EMPTY);
+        drop(0);
     }
 
-    static final int DROP_TO_TRASH = 0, DROP_IF_EMPTY = 1, DROP_EMPTY_FROM_TRASH = 2;
-
     /**
-     * @param mode DROP_TO_TRASH, DROP_IF_EMPTY, or DROP_EMPTY_FROM_TRASH
-     * @return trashed root node; null if not DROP_TO_TRASH
+     * @param txnId non-zero if drop is performed by recovery
      */
-    final Node drop(int mode) throws IOException {
-        Node trashedRoot;
+    final void drop(long txnId) throws IOException {
         long rootId;
         int cachedState;
 
-        final Node root = mRoot;
+        Node root = mRoot;
         root.acquireExclusive();
         try {
             if (root.mPage == EMPTY_BYTES) {
                 throw new ClosedIndexException();
             }
 
-            if (mode != DROP_TO_TRASH && (!root.isLeaf() || root.hasKeys())) {
+            if (!root.isLeaf() || root.hasKeys()) {
                 // Note that this check also covers the transactional case, because deletes
                 // store ghosts. The message could be more accurate, but it would require
                 // scanning the whole index looking for ghosts. Using LockMode.UNSAFE deletes
@@ -448,20 +467,30 @@ class Tree implements Index {
             rootId = root.mId;
             cachedState = root.mCachedState;
 
-            if (mode == DROP_TO_TRASH) {
-                trashedRoot = root.closeRoot(true);
-            } else {
-                mDatabase.makeEvictable(root.closeRoot(false));
-                trashedRoot = null;
-            }
+            Node discard = root.cloneNode(false);
+            root.closeRoot();
+            discard.makeEvictable();
         } finally {
             root.releaseExclusive();
         }
 
         // Drop with root latch released, avoiding deadlock when commit lock is acquired.
-        mDatabase.dropClosedTree(this, rootId, cachedState, mode);
+        mDatabase.dropClosedTree(this, rootId, cachedState, txnId);
+    }
 
-        return trashedRoot;
+    final void deleteCheck() throws ClosedIndexException {
+        Node root = mRoot;
+        root.acquireExclusive();
+        try {
+            if (root.mPage == EMPTY_BYTES) {
+                throw new ClosedIndexException();
+            }
+            if (isInternal(mId)) {
+                throw new IllegalStateException("Cannot close an internal index");
+            }
+        } finally {
+            root.releaseExclusive();
+        }
     }
 
     /**
@@ -614,7 +643,13 @@ class Tree implements Index {
             if (len == 0xffff) {
                 break;
             }
-            din.skipBytes(len);
+            while (len > 0) {
+                int amt = din.skipBytes(len);
+                if (amt <= 0) {
+                    break;
+                }
+                len -= amt;
+            }
         }
     }
 
@@ -647,7 +682,6 @@ class Tree implements Index {
                     // Latch coupling upwards is fine because nothing should be searching a
                     // tree which is filling up.
                     node.acquireExclusive();
-                    childNode.releaseExclusive();
                     // TODO: inline and specialize
                     node.insertSplitChildRef(this, frame.mNodePos, childNode);
                 }
@@ -702,12 +736,27 @@ class Tree implements Index {
      */
     final Node finishSplit(final TreeCursorFrame frame, Node node) throws IOException {
         while (node == mRoot) {
-            Node stub;
-            if (hasStub()) {
+            Node stubNode = null;
+
+            popStub: {
+                Stub stub = mStubTail;
+                hasStub: {
+                    while (stub != null) {
+                        if (stub.mNode.mId == Node.STUB_ID) {
+                            break hasStub;
+                        }
+                        // Node was evicted, so pop it off and try next one.
+                        mStubTail = stub = stub.mParent;
+                    }
+                    break popStub;
+                }
+
                 // Don't wait for stub latch, to avoid deadlock. The stub stack
                 // is latched up upwards here, but downwards by cursors.
-                stub = tryPopStub();
-                if (stub == null) {
+                stubNode = stub.mNode;
+                if (stubNode.tryAcquireExclusive()) {
+                    mStubTail = stub.mParent;
+                } else {
                     // Latch not immediately available, so release root latch
                     // and try again. This implementation spins, but root
                     // splits are expected to be infrequent.
@@ -722,12 +771,21 @@ class Tree implements Index {
                     }
                     continue;
                 }
-                stub = Tree.validateStub(stub);
-            } else {
-                stub = null;
+
+                // Check if popped stub is still valid. It must not have been evicted and it
+                // actually has cursors bound to it.
+
+                if (stubNode.mId == Node.STUB_ID && stubNode.mLastCursorFrame != null) {
+                    // Allow non-durable database to recycle the old id.
+                    stubNode.mId = -stub.mDeletedId;
+                } else {
+                    stubNode.releaseExclusive();
+                    stubNode = null;
+                }
             }
+
             try {
-                node.finishSplitRoot(this, stub);
+                node.finishSplitRoot(this, stubNode);
                 // Must return the node as referenced by the frame, which is no
                 // longer the root node.
                 node.releaseExclusive();
@@ -842,8 +900,8 @@ class Tree implements Index {
         return redo == null ? 0 : redo.storeNoLock(mId, key, value, mDatabase.mDurabilityMode);
     }
 
-    final void txnCommitSync(long commitPos) throws IOException {
-        mDatabase.mRedoWriter.txnCommitSync(commitPos);
+    final void txnCommitSync(Transaction txn, long commitPos) throws IOException {
+        mDatabase.mRedoWriter.txnCommitSync(txn, commitPos);
     }
 
     /**
@@ -856,74 +914,19 @@ class Tree implements Index {
     /**
      * Caller must exclusively hold root latch.
      */
-    final void addStub(Node node) {
-        mStubTail = new Stub(mStubTail, node);
+    final void addStub(Node node, long deletedId) {
+        mStubTail = new Stub(mStubTail, node, deletedId);
     }
 
-    /**
-     * Caller must exclusively hold root latch.
-     */
-    final boolean hasStub() {
-        Stub stub = mStubTail;
-        while (stub != null) {
-            if (stub.mNode.mId == Node.STUB_ID) {
-                return true;
-            }
-            // Node was evicted, so pop it off and try next one.
-            mStubTail = stub = stub.mParent;
-        }
-        return false;
-    }
-
-    /**
-     * Attempts to exclusively latch and pop the tail stub node. Returns null
-     * if latch cannot be immediatly obtained. Caller must exclusively hold
-     * root latch and have checked that a stub exists.
-     */
-    final Node tryPopStub() {
-        Stub stub = mStubTail;
-        if (stub.mNode.tryAcquireExclusive()) {
-            mStubTail = stub.mParent;
-            return stub.mNode;
-        }
-        return null;
-    }
-
-    /**
-     * Exclusively latches and pops the tail stub node. Caller must exclusively
-     * hold root latch and have checked that a stub exists.
-     */
-    /*
-    final Node popStub() {
-        Stub stub = mStubTail;
-        stub.mNode.acquireExclusive();
-        mStubTail = stub.mParent;
-        return stub.mNode;
-    }
-    */
-
-    /**
-     * Checks if popped stub is still valid, because it has not been evicted
-     * and it actually has cursors bound to it. Caller must hold exclusive
-     * latch, which is released if node is not valid.
-     *
-     * @return node if valid, null otherwise
-     */
-    static final Node validateStub(Node node) {
-        if (node.mId == Node.STUB_ID && node.mLastCursorFrame != null) {
-            return node;
-        }
-        node.releaseExclusive();
-        return null;
-    }
-
-    static final class Stub {
+    private static final class Stub {
         final Stub mParent;
         final Node mNode;
+        final long mDeletedId;
 
-        Stub(Stub parent, Node node) {
+        Stub(Stub parent, Node node, long deletedId) {
             mParent = parent;
             mNode = node;
+            mDeletedId = deletedId;
         }
     }
 }

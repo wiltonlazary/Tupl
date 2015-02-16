@@ -69,11 +69,14 @@ final class Node extends Latch {
 
     static final int VALUE_FRAGMENTED = 0x40;
 
-    // Links within usage list, guarded by Database.mUsageLatch.
+    // Usage list this node belongs to.
+    final NodeUsageList mUsageList;
+
+    // Links within usage list, guarded by NodeUsageList.
     Node mMoreUsed; // points to more recently used node
     Node mLessUsed; // points to less recently used node
 
-    // Links within dirty list, guarded by OrderedPageAllocator.
+    // Links within dirty list, guarded by PageAllocator.
     Node mNextDirty;
     Node mPrevDirty;
 
@@ -213,16 +216,17 @@ final class Node extends Latch {
     Node mNodeChainNext;
 
     // Linked stack of TreeCursorFrames bound to this Node.
-    TreeCursorFrame mLastCursorFrame;
+    transient TreeCursorFrame mLastCursorFrame;
 
     // Set by a partially completed split.
-    Split mSplit;
+    transient Split mSplit;
 
-    Node(int pageSize) {
-        mPage = new byte[pageSize];
+    Node(NodeUsageList usageList, int pageSize) {
+        this(usageList, new byte[pageSize]);
     }
 
-    private Node(byte[] page) {
+    private Node(NodeUsageList usageList, byte[] page) {
+        mUsageList = usageList;
         mPage = page;
     }
 
@@ -239,26 +243,9 @@ final class Node extends Latch {
     }
 
     /**
-     * Close the root node when closing a tree. Returns a new node which allows
-     * the page to be recycled.
-     *
-     * @param clone true to clone state into new node
+     * Close the root node when closing a tree.
      */
-    Node closeRoot(boolean clone) {
-        // Allocate node first, in case an OutOfMemoryError is thrown.
-        Node newNode = new Node(mPage);
-
-        if (clone) {
-            newNode.mId = mId;
-            newNode.mCachedState = mCachedState;
-            newNode.mType = mType;
-            newNode.mGarbage = mGarbage;
-            newNode.mLeftSegTail = mLeftSegTail;
-            newNode.mRightSegTail = mRightSegTail;
-            newNode.mSearchVecStart = mSearchVecStart;
-            newNode.mSearchVecEnd = mSearchVecEnd;
-        }
-
+    void closeRoot() {
         // Prevent node from being marked dirty.
         mId = STUB_ID;
         mCachedState = CACHED_CLEAN;
@@ -272,7 +259,23 @@ final class Node extends Latch {
         mRightSegTail = 1;
         mSearchVecStart = 2;
         mSearchVecEnd = 0;
+    }
 
+    /**
+     * @param full when false, only wrap the page instance
+     */
+    Node cloneNode(boolean full) {
+        Node newNode = new Node(mUsageList, mPage);
+        if (full) {
+            newNode.mId = mId;
+            newNode.mCachedState = mCachedState;
+            newNode.mType = mType;
+            newNode.mGarbage = mGarbage;
+            newNode.mLeftSegTail = mLeftSegTail;
+            newNode.mRightSegTail = mRightSegTail;
+            newNode.mSearchVecStart = mSearchVecStart;
+            newNode.mSearchVecEnd = mSearchVecEnd;
+        }
         return newNode;
     }
 
@@ -287,167 +290,195 @@ final class Node extends Latch {
     }
 
     /**
-     * Root search.
-     *
-     * @param key search key
-     * @return copy of value or null if not found
+     * Indicate that a non-root node is most recently used. Root node is not managed in usage
+     * list and cannot be evicted. Caller must hold any latch on node. Latch is never released
+     * by this method, even if an exception is thrown.
      */
-    byte[] search(Tree tree, byte[] key) throws IOException {
-        acquireShared();
-        // Note: No need to check if root has split, since root splits are always
-        // completed before releasing the root latch.
-        return isLeaf() ? subSearchLeaf(tree, key) : subSearch(tree, this, null, key, false);
+    void used() {
+        mUsageList.used(this);
     }
 
     /**
-     * Sub search into internal node with shared or exclusive latch held. Latch is
-     * released by the time this method returns.
+     * Indicate that node is least recently used, allowing it to be recycled immediately
+     * without evicting another node. Node must be latched by caller, which is always released
+     * by this method.
+     */
+    void unused() {
+        mUsageList.unused(this);
+    }
+
+    /**
+     * Allow a Node which was allocated as unevictable to be evictable, starting off as the
+     * most recently used.
+     */
+    void makeEvictable() {
+        mUsageList.makeEvictable(this);
+    }
+
+    /**
+     * Allow a Node which was allocated as unevictable to be evictable, as the least recently
+     * used.
+     */
+    void makeEvictableNow() {
+        mUsageList.makeEvictableNow(this);
+    }
+
+    /**
+     * Allow a Node which was allocated as evictable to be unevictable.
+     */
+    void makeUnevictable() {
+        mUsageList.makeUnevictable(this);
+    }
+
+    /**
+     * Search for a value, starting from the root node.
      *
-     * @param parentLatch shared latch held on parent; is null for root or if
-     * exclusive latch is held on this node
+     * @param node root node
      * @param key search key
-     * @param exclusiveHeld is true if exclusive latch is held on this node
      * @return copy of value or null if not found
      */
-    private static byte[] subSearch(final Tree tree, Node node, Latch parentLatch,
-                                    final byte[] key, boolean exclusiveHeld)
-        throws IOException
-    {
-        // Caller invokes Database.used for this Node. Root node is not
-        // managed in usage list, because it cannot be evicted.
+    static byte[] search(Node node, Tree tree, byte[] key) throws IOException {
+        node.acquireShared();
 
-        int childPos;
-        long childId;
+        // Note: No need to check if root has split, since root splits are always completed
+        // before releasing the root latch. Also, Database.used is not invoked for the root
+        // node. Root node is not managed in usage list, because it cannot be evicted.
 
-        loop: while (true) {
-            childPos = internalPos(node.binarySearch(key));
-            childId = node.retrieveChildRefId(childPos);
-            Node childNode = tree.mDatabase.mTreeNodeMap.get(childId);
+        if (!node.isLeaf()) {
+            // Shared latch held on parent. Is null for root or if exclusive latch is held on
+            // active node.
+            Latch parentLatch = null;
+            boolean exclusiveHeld = false;
 
-            childCheck: if (childNode != null) {
-                childNode.acquireShared();
+            loop: while (true) {
+                int childPos = internalPos(node.binarySearch(key));
+                long childId = node.retrieveChildRefId(childPos);
+                Node childNode = tree.mDatabase.mTreeNodeMap.get(childId);
 
-                // Need to check again in case evict snuck in.
-                if (childId != childNode.mId) {
-                    childNode.releaseShared();
-                    break childCheck;
-                }
+                childCheck: if (childNode != null) {
+                    childNode.acquireShared();
 
-                if (!exclusiveHeld && parentLatch != null) {
-                    parentLatch.releaseShared();
-                }
-
-                if (childNode.mSplit != null) {
-                    childNode = childNode.mSplit.selectNodeShared(childNode, key);
-                }
-
-                if (childNode.isLeaf()) {
-                    node.release(exclusiveHeld);
-                    tree.mDatabase.used(childNode);
-                    return childNode.subSearchLeaf(tree, key);
-                } else {
-                    // Keep shared latch on this parent node, in case sub search
-                    // needs to upgrade its shared latch.
-                    if (exclusiveHeld) {
-                        node.downgrade();
-                        exclusiveHeld = false;
+                    // Need to check again in case evict snuck in.
+                    if (childId != childNode.mId) {
+                        childNode.releaseShared();
+                        break childCheck;
                     }
-                    tree.mDatabase.used(childNode);
-                    // Tail call: return subSearch(tree, childNode, node, key, false);
-                    parentLatch = node;
-                    node = childNode;
-                    continue loop;
+
+                    if (!exclusiveHeld && parentLatch != null) {
+                        parentLatch.releaseShared();
+                    }
+
+                    if (childNode.mSplit != null) {
+                        childNode = childNode.mSplit.selectNodeShared(childNode, key);
+                    }
+
+                    if (childNode.isLeaf()) {
+                        node.release(exclusiveHeld);
+                        childNode.used();
+                        node = childNode;
+                        break loop;
+                    } else {
+                        // Keep shared latch on this parent node, in case sub search
+                        // needs to upgrade its shared latch.
+                        if (exclusiveHeld) {
+                            node.downgrade();
+                            exclusiveHeld = false;
+                        }
+                        childNode.used();
+                        parentLatch = node;
+                        node = childNode;
+                        continue;
+                    }
+                } // end childCheck
+
+                // Child needs to be loaded.
+
+                tryLoadChild: {
+                    if (!exclusiveHeld) {
+                        if (!node.tryUpgrade()) {
+                            break tryLoadChild;
+                        }
+                        exclusiveHeld = true;
+                        if (parentLatch != null) {
+                            parentLatch.releaseShared();
+                            parentLatch = null;
+                        }
+                    }
+
+                    // Succeeded in obtaining an exclusive latch, so now load the child.
+
+                    node = node.loadChild(tree.mDatabase, childId, true);
+
+                    if (node.isLeaf()) {
+                        node.downgrade();
+                        break loop;
+                    }
+
+                    // Keep exclusive latch on internal child, because it will most likely need
+                    // to load its own child nodes to continue the search. This eliminates the
+                    // latch upgrade step.
+
+                    continue;
                 }
-            } // end childCheck
 
-            // Child needs to be loaded.
+                // Release shared latch, re-acquire exclusive latch, and start over.
 
-            if (/*exclusiveHeld =*/ node.tryUpgrade(parentLatch, exclusiveHeld)) {
-                // Succeeded in upgrading latch, so break out to load child.
-                parentLatch = null;
-                break loop;
-            }
+                long id = node.mId;
+                node.releaseShared();
+                node.acquireExclusive();
 
-            // Release shared latch, re-acquire exclusive latch, and start over.
+                if (node.mId != id && node != tree.mRoot) {
+                    // Node got evicted or dirtied when latch was released. To be
+                    // safe, the search must be retried from the root.
+                    node.releaseExclusive();
+                    if (parentLatch != null) {
+                        parentLatch.releaseShared();
+                    }
+                    // Retry with a cursor, which is reliable, but slower.
+                    TreeCursor cursor = new TreeCursor(tree, Transaction.BOGUS);
+                    try {
+                        cursor.find(key);
+                        byte[] value = cursor.value();
+                        cursor.reset();
+                        return value;
+                    } catch (Throwable e) {
+                        throw closeOnFailure(cursor, e);
+                    }
+                }
 
-            long id = node.mId;
-            node.releaseShared();
-            node.acquireExclusive();
+                exclusiveHeld = true;
 
-            if (node.mId != id && node != tree.mRoot) {
-                // Node got evicted or dirtied when latch was released. To be
-                // safe, the search must be retried from the root.
-                node.releaseExclusive();
                 if (parentLatch != null) {
                     parentLatch.releaseShared();
+                    parentLatch = null;
                 }
-                // Retry with a cursor, which is reliable, but slower.
-                TreeCursor cursor = new TreeCursor(tree, Transaction.BOGUS);
-                try {
-                    cursor.find(key);
-                    byte[] value = cursor.value();
-                    cursor.reset();
-                    return value;
-                } catch (Throwable e) {
-                    throw closeOnFailure(cursor, e);
+
+                if (node.mSplit != null) {
+                    // Node might have split while shared latch was not held.
+                    node = node.mSplit.selectNodeExclusive(node, key);
                 }
-            }
 
-            exclusiveHeld = true;
-
-            if (parentLatch != null) {
-                parentLatch.releaseShared();
-                parentLatch = null;
-            }
-
-            if (node.mSplit != null) {
-                // Node might have split while shared latch was not held.
-                node = node.mSplit.selectNodeExclusive(node, key);
-            }
-
-            if (node == tree.mRoot) {
-                // This is the root node, and so no parent latch exists. It's
-                // possible that a delete slipped in when the latch was
-                // released, and that the root is now a leaf.
-                if (node.isLeaf()) {
-                    node.downgrade();
-                    return node.subSearchLeaf(tree, key);
+                if (node == tree.mRoot) {
+                    // This is the root node, and so no parent latch exists. It's possible that
+                    // a delete slipped in when the latch was released, and that the root is
+                    // now a leaf.
+                    if (node.isLeaf()) {
+                        node.downgrade();
+                        break loop;
+                    }
                 }
-            }
-        } // end loop
-
-        // If this point is reached, exclusive latch for this node is held and
-        // child needs to be loaded. Parent latch has been released.
-
-        Node childNode = node.loadChild(tree.mDatabase, childPos, childId, true);
-
-        if (childNode.isLeaf()) {
-            childNode.downgrade();
-            return childNode.subSearchLeaf(tree, key);
-        } else {
-            // Keep exclusive latch on internal child, because it will most
-            // likely need to load its own child nodes to continue the
-            // search. This eliminates the latch upgrade step.
-            return subSearch(tree, childNode, null, key, true);
+            } // end loop
         }
-    }
 
-    /**
-     * Sub search into leaf with shared latch held. Latch is released by the time
-     * this method returns.
-     *
-     * @param key search key
-     * @return copy of value or null if not found
-     */
-    private byte[] subSearchLeaf(final Tree tree, final byte[] key) throws IOException {
-        // Same code as binarySearch, but instead of returning the position, it
-        // directly copies the value if found. This avoids having to decode the
-        // found value location twice.
+        // Sub search into leaf with shared latch held.
 
-        final byte[] page = mPage;
+        // Same code as binarySearch, but instead of returning the position, it directly copies
+        // the value if found. This avoids having to decode the found value location twice.
+
+        final byte[] page = node.mPage;
         final int keyLen = key.length;
-        int lowPos = mSearchVecStart;
-        int highPos = mSearchVecEnd;
+        int lowPos = node.mSearchVecStart;
+        int highPos = node.mSearchVecEnd;
 
         int lowMatch = 0;
         int highMatch = 0;
@@ -485,14 +516,14 @@ final class Node extends Latch {
                 highMatch = i;
             } else {
                 try {
-                    return retrieveLeafValueAtLoc(tree, page, compareLoc + compareLen);
+                    return node.retrieveLeafValueAtLoc(tree, page, compareLoc + compareLen);
                 } finally {
-                    releaseShared();
+                    node.releaseShared();
                 }
             }
         }
 
-        releaseShared();
+        node.releaseShared();
         return null;
     }
 
@@ -504,12 +535,10 @@ final class Node extends Latch {
      * @param releaseParent when true, release this node latch always; when false, release only
      * if an exception is thrown
      */
-    Node loadChild(Database db, int childPos, long childId, boolean releaseParent)
-        throws IOException
-    {
+    Node loadChild(Database db, long childId, boolean releaseParent) throws IOException {
         Node childNode;
         try {
-            childNode = db.allocLatchedNode();
+            childNode = db.allocLatchedNode(childId);
             childNode.mId = childId;
         } catch (Throwable e) {
             releaseExclusive();
@@ -579,7 +608,7 @@ final class Node extends Latch {
             }
         }
 
-        return loadChild(tree.mDatabase, childPos, childId, false);
+        return loadChild(tree.mDatabase, childId, false);
     }
 
     /**
@@ -653,7 +682,7 @@ final class Node extends Latch {
         sibling.releaseExclusive();
 
         // Split complete, so allow new node to be evictable.
-        db.makeEvictable(sibling);
+        sibling.makeEvictable();
 
         if (stub != null) {
             stub.releaseExclusive();
@@ -788,49 +817,12 @@ final class Node extends Latch {
             return null;
         }
 
-        // Check if 0 (already evicted) or stub.
-        if (mId <= STUB_ID) {
-            mId = 0;
-        } else {
+        // Check if <= 0 (already evicted) or stub.
+        if (mId > STUB_ID) {
             doEvict(db);
         }
 
         return this;
-    }
-
-    /**
-     * Evict all tree nodes, starting from the root. Intended to be used only
-     * when tree is no longer referenced, ensuring all dirty nodes are written.
-     * Caller must hold exclusive latch on node. Latch is released by this
-     * method when an exception is thrown.
-     */
-    void forceEvictTree(Database db) throws IOException {
-        // Cursor frames might still exist, if cursors are not being reset properly. Since tree
-        // is not referenced, the original cursors are gone. The frames are just garbage.
-        mLastCursorFrame = null;
-
-        if (mId == 0) {
-            return;
-        }
-
-        if (isInternal()) {
-            final NodeMap map = db.mTreeNodeMap;
-            int childPtr = mSearchVecEnd + 2;
-            final int highestPtr = childPtr + (highestInternalPos() << 2);
-            for (; childPtr <= highestPtr; childPtr += 8) {
-                long childId = decodeUnsignedInt48LE(mPage, childPtr);
-                Node child = map.get(childId);
-                if (child != null) {
-                    child.acquireExclusive();
-                    if (childId == child.mId) {
-                        child.forceEvictTree(db);
-                    }
-                    child.releaseExclusive();
-                }
-            }
-        }
-
-        doEvict(db);
     }
 
     /**
@@ -898,7 +890,7 @@ final class Node extends Latch {
     }
 
     private static Node createEmptyNode(byte type) {
-        Node empty = new Node(EMPTY_BYTES);
+        Node empty = new Node(null, EMPTY_BYTES);
         empty.mId = STUB_ID;
         empty.mCachedState = CACHED_CLEAN;
         empty.mType = type;
@@ -1013,26 +1005,10 @@ final class Node extends Latch {
     }
 
     boolean shouldMerge(int availBytes) {
-        return mSplit == null && availBytes >= ((mPage.length - TN_HEADER_SIZE) >> 1);
-    }
-
-    /**
-     * Returns true if exclusive latch is held and parent latch is released. When
-     * false is returned, no state of any latches has changed.
-     *
-     * @param parentLatch optional shared latch
-     */
-    private boolean tryUpgrade(Latch parentLatch, boolean exclusiveHeld) {
-        if (exclusiveHeld) {
-            return true;
-        }
-        if (tryUpgrade()) {
-            if (parentLatch != null) {
-                parentLatch.releaseShared();
-            }
-            return true;
-        }
-        return false;
+        return mSplit == null
+            & (((mType & (LOW_EXTREMITY | HIGH_EXTREMITY)) == 0
+                 & availBytes >= ((mPage.length - TN_HEADER_SIZE) >> 1))
+                | !hasKeys());
     }
 
     /**
@@ -1422,7 +1398,7 @@ final class Node extends Latch {
         }
 
         // Ghost will be deleted later when locks are released.
-        tree.mLockManager.ghosted(txn, tree, key, keyHash);
+        tree.mLockManager.ghosted(tree, key, keyHash);
 
         // Replace value with ghost.
         page[valueHeaderLoc] = (byte) -1;
@@ -1634,7 +1610,7 @@ final class Node extends Latch {
      * vector, or negative if leaf must be split. Complement of negative value
      * is maximum space available.
      */
-    private int createLeafEntry(Tree tree, int pos, final int encodedLen) {
+    int createLeafEntry(Tree tree, int pos, final int encodedLen) {
         int searchVecStart = mSearchVecStart;
         int searchVecEnd = mSearchVecEnd;
 
@@ -2225,7 +2201,7 @@ final class Node extends Latch {
 
         try {
             // Split complete, so allow new node to be evictable.
-            tree.mDatabase.makeEvictable(newChild);
+            newChild.makeEvictable();
         } catch (Throwable e) {
             releaseExclusive();
             throw e;
@@ -3142,9 +3118,15 @@ final class Node extends Latch {
             loc += len;
         }
 
-        // Increment garbage by the size of the encoded entry.
-        mGarbage += loc - entryLoc;
+        doDeleteLeafEntry(pos, loc - entryLoc);
+    }
 
+    void doDeleteLeafEntry(int pos, int entryLen) {
+        // Increment garbage by the size of the encoded entry.
+        mGarbage += entryLen;
+
+        byte[] page = mPage;
+        int searchVecStart = mSearchVecStart;
         int searchVecEnd = mSearchVecEnd;
 
         if (pos < ((searchVecEnd - searchVecStart + 2) >> 1)) {
@@ -3398,7 +3380,7 @@ final class Node extends Latch {
             frame = frame.mPrevCousin;
         }
 
-        tree.addStub(child);
+        tree.addStub(child, toDelete);
 
         // The page can be deleted earlier in the method, but doing it here
         // might prevent corruption if an unexpected exception occurs.
@@ -3432,8 +3414,14 @@ final class Node extends Latch {
      * Calculate encoded value length for leaf, including header.
      */
     private static int calculateFragmentedValueLength(byte[] value) {
-        int len = value.length;
-        return len + ((len <= 8192) ? 2 : 3);
+        return calculateFragmentedValueLength(value.length);
+    }
+
+    /**
+     * Calculate encoded value length for leaf, including header.
+     */
+    static int calculateFragmentedValueLength(int vlength) {
+        return vlength + ((vlength <= 8192) ? 2 : 3);
     }
 
     /**
@@ -3497,20 +3485,32 @@ final class Node extends Latch {
      * @param fragmented 0 or VALUE_FRAGMENTED
      * @return page location for first byte of value (first location after header)
      */
-    private static int copyToLeafValue(byte[] page, int fragmented, byte[] value, int valueLoc) {
-        final int len = value.length;
-        if (len <= 127 && fragmented == 0) {
-            page[valueLoc++] = (byte) len;
-        } else if (len <= 8192) {
-            page[valueLoc++] = (byte) (0x80 | fragmented | ((len - 1) >> 8));
-            page[valueLoc++] = (byte) (len - 1);
+    private static int copyToLeafValue(byte[] page, int fragmented, byte[] value, int vloc) {
+        final int vlen = value.length;
+        vloc = encodeLeafValueHeader(page, fragmented, vlen, vloc);
+        arraycopy(value, 0, page, vloc, vlen);
+        return vloc;
+    }
+
+    /**
+     * @param fragmented 0 or VALUE_FRAGMENTED
+     * @return page location for first byte of value (first location after header)
+     */
+    static int encodeLeafValueHeader(byte[] page, int fragmented, int vlen, int vloc) {
+        if (vlen <= 127 && fragmented == 0) {
+            page[vloc++] = (byte) vlen;
         } else {
-            page[valueLoc++] = (byte) (0xa0 | fragmented | ((len - 1) >> 16));
-            page[valueLoc++] = (byte) ((len - 1) >> 8);
-            page[valueLoc++] = (byte) (len - 1);
+            vlen--;
+            if (vlen <= 8192) {
+                page[vloc++] = (byte) (0x80 | fragmented | (vlen >> 8));
+                page[vloc++] = (byte) vlen;
+            } else {
+                page[vloc++] = (byte) (0xa0 | fragmented | (vlen >> 16));
+                page[vloc++] = (byte) (vlen >> 8);
+                page[vloc++] = (byte) vlen;
+            }
         }
-        arraycopy(value, 0, page, valueLoc, len);
-        return valueLoc;
+        return vloc;
     }
 
     /**
@@ -3610,7 +3610,7 @@ final class Node extends Latch {
             throw new ClosedIndexException();
         }
 
-        Node newNode = tree.mDatabase.allocUnevictableNode();
+        Node newNode = tree.mDatabase.allocDirtyNode(NodeUsageList.MODE_UNEVICTABLE);
         tree.mDatabase.mTreeNodeMap.put(newNode);
         newNode.mGarbage = 0;
 
@@ -3899,7 +3899,7 @@ final class Node extends Latch {
         final byte[] page = mPage;
 
         // Alloc early in case an exception is thrown.
-        final Node newNode = tree.mDatabase.allocUnevictableNode();
+        final Node newNode = tree.mDatabase.allocDirtyNode(NodeUsageList.MODE_UNEVICTABLE);
         tree.mDatabase.mTreeNodeMap.put(newNode);
         newNode.mGarbage = 0;
 

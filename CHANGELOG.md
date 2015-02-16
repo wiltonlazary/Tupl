@@ -1,11 +1,41 @@
 Changelog
 =========
 
+v1.1.11
+------
+* Ensure that any failure to push into the undo log is cleaned up.
+* Modify replication interface to handle race condition during checkpoint.
+* Ensure durability of index creation and alteration operations.
+* Enhancements for safely handling checkpoint abort.
+* Support weaker durability modes with replication.
+
+v1.1.10
+------
+* Fix race conditions in node allocation and recycling code.
+* Minor performance optimizations for large values and for simple loads.
+
+v1.1.9
+------
+* Fix assertion failure caused by aggressive eviction before the very first checkpoint.
+* Added simple verification and file compaction tools.
+* Checkpoint and redo durability improvements.
+
+v1.1.8
+------
+* Fix for corruption caused by parent nodes being evicted before their child nodes.
+* Stripe page allocation to improve concurrency.
+* Merge extremity nodes less aggressively, optimizing for queue access patterns.
+
+v1.1.7
+------
+* Fix for temporary deadlock at the beginning of a checkpoint.
+
 v1.1.6
 ------
 * Added support for a secondary cache. A secondary cache is slower than a primary cache, but a
   very large primary cache can cause high garbage collection overhead.
 * Added method to delete a non-empty index.
+* Closing an index no longer forces all the tree nodes to be evicted.
 
 v1.1.5
 ------

@@ -45,14 +45,6 @@ final class RedoLog extends RedoWriter {
     private static final long MAGIC_NUMBER = 431399725605778814L;
     private static final int ENCODING_VERSION = 20130106;
 
-    static int randomInt() {
-        Random rnd = new Random();
-        int x;
-        // Cannot return zero, since it breaks Xorshift RNG.
-        while ((x = rnd.nextInt()) == 0);
-        return x;
-    }
-
     private final Crypto mCrypto;
     private final File mBaseFile;
     private final FileFactory mFileFactory;
@@ -95,6 +87,7 @@ final class RedoLog extends RedoWriter {
     }
 
     /**
+     * @param crypto optional
      * @param factory optional
      * @param logId first log id to open
      */
@@ -211,7 +204,7 @@ final class RedoLog extends RedoWriter {
             }
         }
 
-        mNextTermRndSeed = randomInt();
+        mNextTermRndSeed = Utils.randomSeed();
 
         byte[] buf = new byte[8 + 4 + 8 + 4];
         int offset = 0;
@@ -268,6 +261,11 @@ final class RedoLog extends RedoWriter {
     @Override
     public final long encoding() {
         return 0;
+    }
+
+    @Override
+    public final RedoWriter txnRedoWriter() {
+        return this;
     }
 
     @Override
@@ -354,11 +352,6 @@ final class RedoLog extends RedoWriter {
     }
 
     @Override
-    void opWriteCheck() {
-        // Always writable.
-    }
-
-    @Override
     void write(byte[] buffer, int len) throws IOException {
         mPosition += len;
         mOut.write(buffer, 0, len);
@@ -378,7 +371,7 @@ final class RedoLog extends RedoWriter {
         if (oldChannel != null) {
             // Ensure old file is forced before current file. Proper ordering is critical.
             try {
-                oldChannel.force(metadata);
+                oldChannel.force(true);
             } catch (ClosedChannelException e) {
                 // Ignore.
             }
@@ -388,7 +381,7 @@ final class RedoLog extends RedoWriter {
         FileChannel channel = mChannel;
         if (channel != null) {
             try {
-                channel.force(metadata);
+                channel.force(true);
             } catch (ClosedChannelException e) {
                 // Ignore.
             }
@@ -418,14 +411,8 @@ final class RedoLog extends RedoWriter {
     }
 
     // Caller must be synchronized (replay is exempt)
-    int nextTermRnd() throws IOException {
-        // Xorshift RNG by George Marsaglia.
-        int x = mTermRndSeed;
-        x ^= x << 13;
-        x ^= x >>> 17;
-        x ^= x << 5;
-        mTermRndSeed = x;
-        return x;
+    int nextTermRnd() {
+        return mTermRndSeed = Utils.nextRandom(mTermRndSeed);
     }
 
     private boolean replay(DataIn in, RedoVisitor visitor, EventListener listener)

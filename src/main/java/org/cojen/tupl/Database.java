@@ -25,6 +25,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
+import java.io.Flushable;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.IOException;
@@ -36,8 +37,6 @@ import java.io.Writer;
 import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
-
-import java.math.BigInteger;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -106,11 +105,10 @@ import static org.cojen.tupl.Utils.*;
  * @author Brian S O'Neill
  * @see DatabaseConfig
  */
-public final class Database implements CauseCloseable {
+public final class Database implements CauseCloseable, Flushable {
     private static final int DEFAULT_CACHED_NODES = 1000;
-    // +2 for registry and key map root nodes, +1 for one user index, and +2
-    // for usage list to function correctly. It always assumes that the least
-    // recently used node points to a valid, more recently used node.
+    // +2 for registry and key map root nodes, +1 for one user index, and +2 for at least one
+    // usage list to function correctly.
     private static final int MIN_CACHED_NODES = 5;
 
     // Approximate byte overhead per node. Influenced by many factors,
@@ -175,16 +173,17 @@ public final class Database implements CauseCloseable {
 
     private final BufferPool mSpareBufferPool;
 
-    private final Latch mUsageLatch;
-    private int mMaxNodeCount;
-    private int mNodeCount;
-    private Node mMostRecentlyUsed;
-    private Node mLeastRecentlyUsed;
+    private final NodeUsageList[] mUsageLists;
 
     private final Lock mSharedCommitLock;
 
     // Is either CACHED_DIRTY_0 or CACHED_DIRTY_1. Access is guarded by commit lock.
     private byte mCommitState;
+
+    // Set during checkpoint after commit state has switched. If checkpoint aborts, next
+    // checkpoint will resume with this commit header and master undo log.
+    private byte[] mCommitHeader;
+    private UndoLog mCommitMasterUndoLog;
 
     // Is false for empty databases which have never checkpointed.
     private volatile boolean mHasCheckpointed = true;
@@ -213,7 +212,7 @@ public final class Database implements CauseCloseable {
     private final LHashTable.Obj<TreeRef> mOpenTreesById;
     private final ReferenceQueue<Tree> mOpenTreesRefQueue;
 
-    private final PageAllocator mAllocator;
+    private final NodeDirtyList mDirtyList;
 
     // Map of all loaded non-root nodes.
     final NodeMap mTreeNodeMap;
@@ -345,14 +344,11 @@ public final class Database implements CauseCloseable {
         config.mMinCachedBytes = byteCountFromNodes(minCache, pageSize);
         config.mMaxCachedBytes = byteCountFromNodes(maxCache, pageSize);
 
-        mUsageLatch = new Latch();
-        mMaxNodeCount = maxCache;
-
         mDurabilityMode = config.mDurabilityMode;
         mDefaultLockTimeoutNanos = config.mLockTimeoutNanos;
         mLockManager = new LockManager(config.mLockUpgradeRule, mDefaultLockTimeoutNanos);
 
-        mTreeNodeMap = new NodeMap(mMaxNodeCount);
+        mTreeNodeMap = new NodeMap(maxCache);
 
         if (mBaseFile != null && !config.mReadOnly && config.mMkdirs) {
             FileFactory factory = config.mFileFactory;
@@ -456,29 +452,60 @@ public final class Database implements CauseCloseable {
 
             mSharedCommitLock = mPageDb.sharedCommitLock();
 
-            // Pre-allocate nodes. They are automatically added to the usage
-            // list, and so nothing special needs to be done to allow them to
-            // get used. Since the initial state is clean, evicting these
-            // nodes does nothing.
+            // Pre-allocate nodes. They are automatically added to the usage lists, and so
+            // nothing special needs to be done to allow them to get used. Since the initial
+            // state is clean, evicting these nodes does nothing.
 
             if (mEventListener != null) {
                 mEventListener.notify(EventType.CACHE_INIT_BEGIN,
                                       "Initializing %1$d cached nodes", minCache);
             }
 
+            NodeUsageList[] usageLists;
             try {
-                for (int i=minCache; --i>=0; ) {
-                    mUsageLatch.acquireExclusive();
-                    doAllocLatchedNode(true).releaseExclusive();
+                int stripes = roundUpPower2(Runtime.getRuntime().availableProcessors() * 4);
+
+                int stripeSize;
+                while (true) {
+                    stripeSize = maxCache / stripes;
+                    if (stripes <= 1 || stripeSize >= 100) {
+                        break;
+                    }
+                    stripes >>= 1;
+                }
+
+                int rem = maxCache % stripes;
+
+                usageLists = new NodeUsageList[stripes];
+  
+                for (int i=0; i<stripes; i++) {
+                    int size = stripeSize;
+                    if (rem > 0) {
+                        size++;
+                        rem--;
+                    }
+                    usageLists[i] = new NodeUsageList(this, size);
+                }
+
+                stripeSize = minCache / stripes;
+                rem = minCache % stripes;
+
+                for (NodeUsageList usageList : usageLists) {
+                    int size = stripeSize;
+                    if (rem > 0) {
+                        size++;
+                        rem--;
+                    }
+                    usageList.initialize(size);
                 }
             } catch (OutOfMemoryError e) {
-                mMostRecentlyUsed = null;
-                mLeastRecentlyUsed = null;
-
+                usageLists = null;
                 throw new OutOfMemoryError
                     ("Unable to allocate the minimum required number of cached nodes: " +
                      minCache + " (" + (minCache * (long) (pageSize + NODE_OVERHEAD)) + " bytes)");
             }
+
+            mUsageLists = usageLists;
 
             if (mEventListener != null) {
                 double duration = (System.nanoTime() - cacheInitStart) / 1_000_000_000.0;
@@ -503,7 +530,12 @@ public final class Database implements CauseCloseable {
             // Also verifies the database and replication encodings.
             Node rootNode = loadRegistryRoot(header, config.mReplManager);
 
-            mRegistry = newTreeInstance(Tree.REGISTRY_ID, null, null, rootNode);
+            // Cannot call newTreeInstance because mRedoWriter isn't set yet.
+            if (config.mReplManager != null) {
+                mRegistry = new TxnTree(this, Tree.REGISTRY_ID, null, null, rootNode);
+            } else {
+                mRegistry = new Tree(this, Tree.REGISTRY_ID, null, null, rootNode);
+            }
 
             mOpenTreesLatch = new Latch();
             if (openMode == OPEN_TEMP) {
@@ -527,15 +559,15 @@ public final class Database implements CauseCloseable {
             if (openMode == OPEN_TEMP) {
                 mRegistryKeyMap = null;
             } else {
-                mRegistryKeyMap = openInternalTree(Tree.REGISTRY_KEY_MAP_ID, true);
+                mRegistryKeyMap = openInternalTree(Tree.REGISTRY_KEY_MAP_ID, true, config);
             }
 
-            mAllocator = new PageAllocator(mPageDb);
+            mDirtyList = new NodeDirtyList();
 
             mFragmentCache = new FragmentCache(this, mTreeNodeMap);
 
             if (openMode != OPEN_TEMP) {
-                Tree tree = openInternalTree(Tree.FRAGMENTED_TRASH_ID, false);
+                Tree tree = openInternalTree(Tree.FRAGMENTED_TRASH_ID, false, config);
                 if (tree != null) {
                     mFragmentedTrash = new FragmentedTrash(tree);
                 }
@@ -559,7 +591,7 @@ public final class Database implements CauseCloseable {
                     recoveryStart = System.nanoTime();
                 }
 
-                if (mPageDb instanceof DurablePageDb) {
+                if (mPageDb.isDurable()) {
                     File primer = primerFile();
                     try {
                         if (config.mCachePriming && primer.exists()) {
@@ -712,16 +744,26 @@ public final class Database implements CauseCloseable {
         c.register(mRedoWriter);
         c.register(mTempFileManager);
 
-        if (config.mCachePriming && mPageDb instanceof DurablePageDb) {
+        if (config.mCachePriming && mPageDb.isDurable()) {
             c.register(new ShutdownPrimer(this));
         }
 
-        if (mRedoWriter instanceof ReplRedoWriter) {
+        // Must tag the trashed trees before starting replication and recovery. Otherwise,
+        // trees recently deleted might get double deleted.
+        Tree trashed = openNextTrashedTree(null);
+
+        if (trashed != null) {
+            Thread deletion = new Thread(new Deletion(trashed, true), "IndexDeletion");
+            deletion.setDaemon(true);
+            deletion.start();
+        }
+
+        if (mRedoWriter instanceof ReplRedoController) {
             // Start replication and recovery.
-            ReplRedoWriter writer = (ReplRedoWriter) mRedoWriter;
+            ReplRedoController controller = (ReplRedoController) mRedoWriter;
             try {
                 // Pass the original listener, in case it has been specialized.
-                writer.recover(config.mReplInitialTxnId, config.mEventListener);
+                controller.recover(config.mReplInitialTxnId, config.mEventListener);
             } catch (Throwable e) {
                 closeQuietly(null, this, e);
                 throw e;
@@ -731,14 +773,6 @@ public final class Database implements CauseCloseable {
         }
 
         c.start();
-
-        Tree trashed = openAnyTrashedTree();
-
-        if (trashed != null) {
-            Thread deletion = new Thread(new Deletion(trashed, true), "IndexDeletion");
-            deletion.setDaemon(true);
-            deletion.start();
-        }
     }
 
     static class ShutdownPrimer implements Checkpointer.Shutdown {
@@ -791,37 +825,6 @@ public final class Database implements CauseCloseable {
             deleteNumberedFiles(mBaseFile, REDO_FILE_SUFFIX);
         }
     }
-
-    /*
-    void trace() throws IOException {
-        int[] inBuckets = new int[16];
-        int[] leafBuckets = new int[16];
-
-        java.util.BitSet pages = mPageDb.tracePages();
-        mRegistry.mRoot.tracePages(this, pages, inBuckets, leafBuckets);
-        mRegistryKeyMap.mRoot.tracePages(this, pages, inBuckets, leafBuckets);
-
-        Cursor all = indexRegistryByName().newCursor(null);
-        for (all.first(); all.key() != null; all.next()) {
-            Index ix = indexById(all.value());
-            System.out.println(ix.getNameString());
-
-            Cursor c = ix.newCursor(Transaction.BOGUS);
-            c.first();
-            System.out.println("height: " + ((TreeCursor) c).height());
-            c.reset();
-
-            ((Tree) ix).mRoot.tracePages(this, pages, inBuckets, leafBuckets);
-            System.out.println("unaccounted: " + pages.cardinality());
-            System.out.println("internal avail: " + Arrays.toString(inBuckets));
-            System.out.println("leaf avail: " + Arrays.toString(leafBuckets));
-        }
-        all.reset();
-
-        System.out.println("unaccounted: " + pages.cardinality());
-        System.out.println(pages);
-    }
-    */
 
     /**
      * Returns the given named index, returning null if not found.
@@ -954,7 +957,7 @@ public final class Database implements CauseCloseable {
      * @throws IllegalArgumentException if index belongs to another database instance
      */
     public void renameIndex(Index index, byte[] newName) throws IOException {
-        renameIndex(index, newName.clone(), true);
+        renameIndex(index, newName.clone(), 0);
     }
 
     /**
@@ -967,28 +970,31 @@ public final class Database implements CauseCloseable {
      * @throws IllegalArgumentException if index belongs to another database instance
      */
     public void renameIndex(Index index, String newName) throws IOException {
-        renameIndex(index, newName.getBytes("UTF-8"), true);
+        renameIndex(index, newName.getBytes("UTF-8"), 0);
     }
 
     /**
      * @param newName not cloned
+     * @param redoTxnId non-zero if rename is performed by recovery
      */
-    void renameIndex(Index index, byte[] newName, boolean doRedo) throws IOException {
+    void renameIndex(final Index index, final byte[] newName, final long redoTxnId)
+        throws IOException
+    {
         // Design note: Rename is a Database method instead of an Index method because it
         // offers an extra degree of safety. It's too easy to call rename and pass a byte[] by
         // an accident when something like remove was desired instead. Requiring access to the
         // Database instance makes this operation a bit more of a hassle to use, which is
         // desirable. Rename is not expected to be a common operation.
 
-        Tree tree = accessTree(index);
+        final Tree tree = accessTree(index);
 
-        byte[] idKey;
-        byte[] oldName, oldNameKey;
-        byte[] newNameKey;
+        final byte[] idKey, trashIdKey;
+        final byte[] oldName, oldNameKey;
+        final byte[] newNameKey;
 
-        Transaction txn;
+        final Transaction txn;
 
-        Node root = tree.mRoot;
+        final Node root = tree.mRoot;
         root.acquireExclusive();
         try {
             if (root.mPage == EMPTY_BYTES) {
@@ -1005,12 +1011,14 @@ public final class Database implements CauseCloseable {
             }
 
             idKey = newKey(KEY_TYPE_INDEX_ID, tree.mIdBytes);
+            trashIdKey = newKey(KEY_TYPE_TRASH_ID, tree.mIdBytes);
             oldNameKey = newKey(KEY_TYPE_INDEX_NAME, oldName);
             newNameKey = newKey(KEY_TYPE_INDEX_NAME, newName);
 
-            txn = newNoRedoTransaction();
+            txn = newNoRedoTransaction(redoTxnId);
             try {
                 txn.lockExclusive(mRegistryKeyMap.mId, idKey);
+                txn.lockExclusive(mRegistryKeyMap.mId, trashIdKey);
                 // Lock in a consistent order, avoiding deadlocks.
                 if (compareKeys(oldNameKey, newNameKey) <= 0) {
                     txn.lockExclusive(mRegistryKeyMap.mId, oldNameKey);
@@ -1029,26 +1037,45 @@ public final class Database implements CauseCloseable {
             root.releaseExclusive();
         }
 
-        RedoWriter redo;
-        long commitPos = 0;
-
         try {
             Cursor c = mRegistryKeyMap.newCursor(txn);
             try {
                 c.autoload(false);
+
+                c.find(trashIdKey);
+                if (c.value() != null) {
+                    throw new IllegalStateException("Index is deleted");
+                }
+
                 c.find(newNameKey);
                 if (c.value() != null) {
                     throw new IllegalStateException("New name is used by another index");
                 }
+
                 c.store(tree.mIdBytes);
             } finally {
                 c.reset();
             }
 
-            if (!doRedo) {
-                redo = null;
-            } else if ((redo = mRedoWriter) != null) {
-                commitPos = redo.renameIndex(tree.mId, newName, mDurabilityMode);
+            RedoWriter redo;
+            if (redoTxnId == 0 && (redo = mRedoWriter) != null) {
+                long commitPos;
+
+                final Lock commitLock = sharedCommitLock();
+                commitLock.lock();
+                try {
+                    commitPos = redo.renameIndex
+                        (txn.txnId(), tree.mId, newName, mDurabilityMode.alwaysRedo());
+                } finally {
+                    commitLock.unlock();
+                }
+
+                if (commitPos != 0) {
+                    // Must wait for durability confirmation before performing actions below
+                    // which cannot be easily rolled back. No global latches or locks are held
+                    // while waiting.
+                    redo.txnCommitSync(txn, commitPos);
+                }
             }
 
             mRegistryKeyMap.delete(txn, oldNameKey);
@@ -1070,11 +1097,6 @@ public final class Database implements CauseCloseable {
             throw closeOnFailure(this, e);
         } finally {
             txn.reset();
-        }
-
-        if (redo != null && commitPos != 0) {
-            // Don't hold locks and latches during sync.
-            redo.txnCommitSync(commitPos);
         }
     }
 
@@ -1112,55 +1134,96 @@ public final class Database implements CauseCloseable {
      * @see Index#drop Index.drop
      */
     public Runnable deleteIndex(Index index) throws IOException {
+        return deleteIndex(index, 0);
+    }
+
+    /**
+     * @param redoTxnId non-zero if delete is performed by recovery
+     */
+    Runnable deleteIndex(Index index, long redoTxnId) throws IOException {
         // Design note: This is a Database method instead of an Index method because it offers
         // an extra degree of safety. See notes in renameIndex.
-
         Tree tree = accessTree(index);
-        byte[] name = tree.mName;
-        Node trashedRoot = tree.drop(Tree.DROP_TO_TRASH);
-        Tree trashed = newTreeInstance(tree.mId, tree.mIdBytes, name, trashedRoot);
+        tree.deleteCheck();
+
+        Node root = moveToTrash(tree, redoTxnId);
+
+        if (root == null) {
+            // Handle concurrent delete attempt.
+            throw new ClosedIndexException();
+        }
+
+        Tree trashed = newTreeInstance(tree.mId, tree.mIdBytes, tree.mName, root);
 
         return new Deletion(trashed, false);
     }
 
     /**
+     * @param last null to start with first
      * @return null if none available
      */
-    private Tree openAnyTrashedTree() throws IOException {
+    private Tree openNextTrashedTree(byte[] lastIdBytes) throws IOException {
         View view = mRegistryKeyMap.viewPrefix(new byte[] {KEY_TYPE_TRASH_ID}, 1);
+
+        if (lastIdBytes == null) {
+            // Tag all the entries that should be deleted automatically. Entries created later
+            // will have a different prefix, and so they'll be ignored.
+            Cursor c = view.newCursor(Transaction.BOGUS);
+            try {
+                for (c.first(); c.key() != null; c.next()) {
+                    byte[] name = c.value();
+                    if (name.length != 0) {
+                        name[0] |= 0x80;
+                        c.store(name);
+                    }
+                }
+            } finally {
+                c.reset();
+            }
+        }
 
         byte[] treeIdBytes, name, rootIdBytes;
 
-        Cursor c = view.newCursor(null);
+        Cursor c = view.newCursor(Transaction.BOGUS);
         try {
-            c.first();
+            if (lastIdBytes == null) {
+                c.first();
+            } else {
+                c.findGt(lastIdBytes);
+            }
+
             while (true) {
                 treeIdBytes = c.key();
+
                 if (treeIdBytes == null) {
                     return null;
                 }
 
                 rootIdBytes = mRegistry.load(Transaction.BOGUS, treeIdBytes);
-                if (rootIdBytes != null) {
-                    break;
+
+                if (rootIdBytes == null) {
+                    // Clear out bogus entry in the trash.
+                    c.store(null);
+                } else {
+                    name = c.value();
+                    if (name[0] < 0) {
+                        // Found a tagged entry.
+                        break;
+                    }
                 }
 
-                // Clear out bogus entry in the trash.
-                c.store(null);
                 c.next();
             }
-
-            name = c.value();
         } finally {
             c.reset();
         }
 
         long rootId = decodeLongLE(rootIdBytes, 0);
 
-        if (name.length == 0) {
+        if ((name[0] & ~0x80) == 0) {
             name = null;
         } else {
-            // Trim off the first byte.
+            // Trim off the tag byte.
             byte[] actual = new byte[name.length - 1];
             System.arraycopy(name, 1, actual, 0, actual.length);
             name = actual;
@@ -1197,11 +1260,14 @@ public final class Database implements CauseCloseable {
                                 mTrashed.getId(), mTrashed.getNameString());
             }
 
+            final byte[] idBytes = mTrashed.mIdBytes;
+
             try {
                 long start = System.nanoTime();
 
                 mTrashed.deleteAll();
-                mTrashed.drop(Tree.DROP_EMPTY_FROM_TRASH);
+                mTrashed.close();
+                removeFromTrash(mTrashed);
 
                 if (listener != null) {
                     double duration = (System.nanoTime() - start) / 1_000_000_000.0;
@@ -1219,12 +1285,13 @@ public final class Database implements CauseCloseable {
                          "Index deletion failed: %1$d, name: %2$s, exception: %3$s",
                          mTrashed.getId(), mTrashed.getNameString(), rootCause(e));
                 }
+                closeQuietly(null, mTrashed);
                 return;
             }
 
             if (mResumed) {
                 try {
-                    mTrashed = openAnyTrashedTree();
+                    mTrashed = openNextTrashedTree(idBytes);
                 } catch (IOException e) {
                     if ((!mClosed || mClosedCause != null) && listener != null) {
                         listener.notify
@@ -1272,8 +1339,12 @@ public final class Database implements CauseCloseable {
     }
 
     private Transaction doNewTransaction(DurabilityMode durabilityMode) {
+        RedoWriter redo = mRedoWriter;
+        if (redo != null) {
+            redo = redo.txnRedoWriter();
+        }
         return new Transaction
-            (this, durabilityMode, LockMode.UPGRADABLE_READ, mDefaultLockTimeoutNanos);
+            (this, redo, durabilityMode, LockMode.UPGRADABLE_READ, mDefaultLockTimeoutNanos);
     }
 
     Transaction newAlwaysRedoTransaction() {
@@ -1281,11 +1352,26 @@ public final class Database implements CauseCloseable {
     }
 
     /**
-     * Convenience method which returns a transaction intended for locking. Caller can make
-     * modifications, but they won't go to the redo log.
+     * Convenience method which returns a transaction intended for locking and undo. Caller can
+     * make modifications, but they won't go to the redo log.
      */
     Transaction newNoRedoTransaction() {
-        return new Transaction(this, DurabilityMode.NO_REDO, LockMode.UPGRADABLE_READ, -1);
+        RedoWriter redo = mRedoWriter;
+        if (redo != null) {
+            redo = redo.txnRedoWriter();
+        }
+        return new Transaction(this, redo, DurabilityMode.NO_REDO, LockMode.UPGRADABLE_READ, -1);
+    }
+
+    /**
+     * Convenience method which returns a transaction intended for locking and undo. Caller can
+     * make modifications, but they won't go to the redo log.
+     *
+     * @param redoTxnId non-zero if operation is performed by recovery
+     */
+    Transaction newNoRedoTransaction(long redoTxnId) {
+        return redoTxnId == 0 ? newNoRedoTransaction() :
+            new Transaction(this, redoTxnId, LockMode.UPGRADABLE_READ, -1);
     }
 
     /**
@@ -1311,24 +1397,18 @@ public final class Database implements CauseCloseable {
      * @return non-zero transaction id
      */
     long nextTransactionId() throws IOException {
-        RedoWriter redo = mRedoWriter;
-        if (redo != null) {
-            // Replicas cannot create loggable transactions.
-            redo.opWriteCheck();
-        }
-
         long txnId;
         do {
             synchronized (mTxnIdLock) {
                 txnId = ++mTxnId;
             }
         } while (txnId == 0);
-
         return txnId;
     }
 
     /**
-     * Called only by UndoLog.
+     * Should only be called after all log entries have been truncated or rolled back. Caller
+     * does not need to hold db commit lock.
      */
     void unregister(UndoLog log) {
         synchronized (mTxnIdLock) {
@@ -1355,7 +1435,7 @@ public final class Database implements CauseCloseable {
      * @return actual amount allocated
      */
     public long preallocate(long bytes) throws IOException {
-        if (!mClosed && mPageDb instanceof DurablePageDb) {
+        if (!mClosed && mPageDb.isDurable()) {
             int pageSize = mPageSize;
             long pageCount = (bytes + pageSize - 1) / pageSize;
             if (pageCount > 0) {
@@ -1397,7 +1477,7 @@ public final class Database implements CauseCloseable {
      * @return a snapshot control object, which must be closed when no longer needed
      */
     public Snapshot beginSnapshot() throws IOException {
-        if (!(mPageDb instanceof DurablePageDb)) {
+        if (!(mPageDb.isDurable())) {
             throw new UnsupportedOperationException("Snapshot only allowed for durable databases");
         }
         checkClosed();
@@ -1470,7 +1550,7 @@ public final class Database implements CauseCloseable {
      * @see DatabaseConfig#cachePriming
      */
     public void createCachePrimer(OutputStream out) throws IOException {
-        if (!(mPageDb instanceof DurablePageDb)) {
+        if (!(mPageDb.isDurable())) {
             throw new UnsupportedOperationException
                 ("Cache priming only allowed for durable databases");
         }
@@ -1517,7 +1597,7 @@ public final class Database implements CauseCloseable {
      * @see DatabaseConfig#cachePriming
      */
     public void applyCachePrimer(InputStream in) throws IOException {
-        if (!(mPageDb instanceof DurablePageDb)) {
+        if (!(mPageDb.isDurable())) {
             throw new UnsupportedOperationException
                 ("Cache priming only allowed for durable databases");
         }
@@ -1587,9 +1667,9 @@ public final class Database implements CauseCloseable {
             mSharedCommitLock.unlock();
         }
 
-        mUsageLatch.acquireShared();
-        stats.mCachedPages = mNodeCount;
-        mUsageLatch.releaseShared();
+        for (NodeUsageList usageList : mUsageLists) {
+            stats.mCachedPages += usageList.size();
+        }
 
         if (!mPageDb.isDurable() && stats.mTotalPages == 0) {
             stats.mTotalPages = stats.mCachedPages;
@@ -1736,6 +1816,7 @@ public final class Database implements CauseCloseable {
      * committed with {@link DurabilityMode#NO_FLUSH no-flush} effectively
      * become {@link DurabilityMode#NO_SYNC no-sync} durable.
      */
+    @Override
     public void flush() throws IOException {
         if (!mClosed && mRedoWriter != null) {
             mRedoWriter.flush();
@@ -1755,14 +1836,13 @@ public final class Database implements CauseCloseable {
     }
 
     /**
-     * Durably sync and checkpoint all changes to the database. In addition to
-     * ensuring that all transactions are durable, checkpointing ensures that
-     * non-transactional modifications are durable. Checkpoints are performed
-     * automatically by a background thread, at a {@link
-     * DatabaseConfig#checkpointRate configurable} rate.
+     * Durably sync and checkpoint all changes to the database. In addition to ensuring that
+     * all committed transactions are durable, checkpointing ensures that non-transactional
+     * modifications are durable. Checkpoints are performed automatically by a background
+     * thread, at a {@link DatabaseConfig#checkpointRate configurable} rate.
      */
     public void checkpoint() throws IOException {
-        if (!mClosed && mPageDb instanceof DurablePageDb) {
+        if (!mClosed && mPageDb.isDurable()) {
             try {
                 checkpoint(false, 0, 0);
             } catch (Throwable e) {
@@ -2047,7 +2127,7 @@ public final class Database implements CauseCloseable {
      * side effect of shutting down, all extraneous files are deleted.
      */
     public void shutdown() throws IOException {
-        close(null, mPageDb instanceof DurablePageDb);
+        close(null, mPageDb.isDurable());
     }
 
     private void close(Throwable cause, boolean shutdown) throws IOException {
@@ -2102,10 +2182,20 @@ public final class Database implements CauseCloseable {
             lock.lock();
         }
         try {
-            closeNodeCache();
+            if (mUsageLists != null) {
+                for (NodeUsageList usageList : mUsageLists) {
+                    if (usageList != null) {
+                        usageList.close();
+                    }
+                }
+            }
 
-            if (mAllocator != null) {
-                mAllocator.clearDirtyNodes();
+            if (mTreeNodeMap != null) {
+                mTreeNodeMap.clear();
+            }
+
+            if (mDirtyList != null) {
+                mDirtyList.clear();
             }
 
             IOException ex = null;
@@ -2123,7 +2213,9 @@ public final class Database implements CauseCloseable {
                 ex = closeQuietly(ex, mLockFile, cause);
             }
 
-            mLockManager.close();
+            if (mLockManager != null) {
+                mLockManager.close();
+            }
 
             if (ex != null) {
                 throw ex;
@@ -2146,7 +2238,10 @@ public final class Database implements CauseCloseable {
         }
     }
 
-    void treeClosed(Tree tree) {
+    /**
+     * @param newRoot optional replacement node, to be stored in the node map; must be latched
+     */
+    void treeClosed(Tree tree, Node newRoot) {
         mOpenTreesLatch.acquireExclusive();
         try {
             TreeRef ref = mOpenTreesById.getValue(tree.mId);
@@ -2154,6 +2249,10 @@ public final class Database implements CauseCloseable {
                 ref.clear();
                 mOpenTrees.remove(tree.mName);
                 mOpenTreesById.remove(tree.mId);
+            }
+            if (newRoot != null) {
+                newRoot.makeEvictableNow();
+                mTreeNodeMap.put(newRoot);
             }
         } finally {
             mOpenTreesLatch.releaseExclusive();
@@ -2183,128 +2282,182 @@ public final class Database implements CauseCloseable {
     }
 
     /**
-     * @param mode DROP_TO_TRASH, DROP_EMPTY, or DROP_EMPTY_FROM_TRASH
+     * @param redoTxnId non-zero if drop is performed by recovery
      */
-    void dropClosedTree(Tree tree, long rootId, int cachedState, int mode)
+    void dropClosedTree(final Tree tree, final long rootId,
+                        final int cachedState, final long redoTxnId)
         throws IOException
     {
-        RedoWriter redo = mRedoWriter;
+        final byte[] name;
+        byte[] idKey = null, nameKey = null;
 
-        long commitPos;
+        final Transaction txn;
+
+        mOpenTreesLatch.acquireExclusive();
+        try {
+            TreeRef ref = mOpenTreesById.getValue(tree.mId);
+            if (ref == null || ref.get() != tree) {
+                return;
+            }
+
+            name = tree.mName;
+            if (name != null) {
+                idKey = newKey(KEY_TYPE_INDEX_ID, tree.mIdBytes);
+                nameKey = newKey(KEY_TYPE_INDEX_NAME, name);
+            }
+
+            txn = newNoRedoTransaction(redoTxnId);
+            try {
+                // Acquire locks to prevent tree from being re-opened. No deadlocks should
+                // be possible with tree latch held exclusively, but order in a safe
+                // fashion anyhow. A registry lookup can only follow a key map lookup.
+                if (name != null) {
+                    txn.lockExclusive(mRegistryKeyMap.mId, idKey);
+                    txn.lockExclusive(mRegistryKeyMap.mId, nameKey);
+                }
+
+                txn.lockExclusive(mRegistry.mId, tree.mIdBytes);
+
+                ref.clear();
+
+                if (name != null) {
+                    mOpenTrees.remove(name);
+                }
+
+                mOpenTreesById.remove(tree.mId);
+            } catch (Throwable e) {
+                txn.reset();
+                throw e;
+            }
+        } finally {
+            mOpenTreesLatch.releaseExclusive();
+        }
+
+        // Complete the drop operation without preventing other indexes from being opened
+        // or dropped concurrently.
+
+        try {
+            if (name != null) {
+                mRegistryKeyMap.remove(txn, idKey, name);
+                mRegistryKeyMap.remove(txn, nameKey, tree.mIdBytes);
+            }
+
+            mRegistry.delete(txn, tree.mIdBytes);
+
+            RedoWriter redo;
+            if (redoTxnId == 0 && (redo = mRedoWriter) != null) {
+                long commitPos;
+
+                final Lock commitLock = sharedCommitLock();
+                commitLock.lock();
+                try {
+                    commitPos = redo.dropIndex
+                        (txn.txnId(), tree.mId, mDurabilityMode.alwaysRedo());
+                } finally {
+                    commitLock.unlock();
+                }
+
+                if (commitPos != 0) {
+                    // Must wait for durability confirmation before performing actions below
+                    // which cannot be easily rolled back. No global latches or locks are held
+                    // while waiting.
+                    redo.txnCommitSync(txn, commitPos);
+                }
+            }
+
+            txn.commit();
+
+            final Lock commitLock = sharedCommitLock();
+            commitLock.lock();
+            try {
+                deletePage(rootId, cachedState);
+            } finally {
+                commitLock.unlock();
+            }
+        } catch (Throwable e) {
+            DatabaseException.rethrowIfRecoverable(e);
+            throw closeOnFailure(this, e);
+        } finally {
+            txn.reset();
+        }
+    }
+
+    /**
+     * @param redoTxnId non-zero if move is performed by recovery
+     * @return root node of deleted tree; null if closed or already in the trash
+     */
+    private Node moveToTrash(final Tree tree, final long redoTxnId) throws IOException {
+        final byte[] idKey = newKey(KEY_TYPE_INDEX_ID, tree.mIdBytes);
+        final byte[] trashIdKey = newKey(KEY_TYPE_TRASH_ID, tree.mIdBytes);
+
+        final Transaction txn = newNoRedoTransaction(redoTxnId);
+        try {
+            if (mRegistryKeyMap.load(txn, trashIdKey) != null) {
+                // Already in the trash.
+                return null;
+            }
+
+            byte[] treeName = mRegistryKeyMap.exchange(txn, idKey, null);
+
+            if (treeName == null) {
+                // A trash entry with just a zero indicates that the name is null.
+                mRegistryKeyMap.store(txn, trashIdKey, new byte[1]);
+            } else {
+                byte[] nameKey = newKey(KEY_TYPE_INDEX_NAME, treeName);
+                mRegistryKeyMap.remove(txn, nameKey, tree.mIdBytes);
+                // Tag the trash entry to indicate that name is non-null. Note that nameKey
+                // instance is modified directly.
+                nameKey[0] = 1;
+                mRegistryKeyMap.store(txn, trashIdKey, nameKey);
+            }
+
+            RedoWriter redo;
+            if (redoTxnId == 0 && (redo = mRedoWriter) != null) {
+                long commitPos;
+
+                final Lock commitLock = sharedCommitLock();
+                commitLock.lock();
+                try {
+                    commitPos = redo.deleteIndex
+                        (txn.txnId(), tree.mId, mDurabilityMode.alwaysRedo());
+                } finally {
+                    commitLock.unlock();
+                }
+
+                if (commitPos != 0) {
+                    // Must wait for durability confirmation before performing actions below
+                    // which cannot be easily rolled back. No global latches or locks are held
+                    // while waiting.
+                    redo.txnCommitSync(txn, commitPos);
+                }
+            }
+
+            txn.commit();
+        } catch (Throwable e) {
+            DatabaseException.rethrowIfRecoverable(e);
+            throw closeOnFailure(this, e);
+        } finally {
+            txn.reset();
+        }
+
+        return tree.close(true);
+    }
+
+    /**
+     * Must be called after all entries in the tree have been deleted and tree is closed.
+     */
+    void removeFromTrash(Tree tree) throws IOException {
+        byte[] trashIdKey = newKey(KEY_TYPE_TRASH_ID, tree.mIdBytes);
 
         final Lock commitLock = sharedCommitLock();
         commitLock.lock();
         try {
-            final byte[] name, idKey, nameKey, trashIdKey;
-
-            Transaction txn;
-            mOpenTreesLatch.acquireExclusive();
-            try {
-                TreeRef ref = mOpenTreesById.getValue(tree.mId);
-
-                if (ref == null || ref.get() != tree) {
-                    if (ref != null || mode != Tree.DROP_EMPTY_FROM_TRASH) {
-                        return;
-                    }
-                }
-
-                name = tree.mName;
-
-                if (name == null) {
-                    idKey = null;
-                    nameKey = null;
-                } else {
-                    idKey = newKey(KEY_TYPE_INDEX_ID, tree.mIdBytes);
-                    nameKey = newKey(KEY_TYPE_INDEX_NAME, name);
-                }
-
-                trashIdKey = newKey(KEY_TYPE_TRASH_ID, tree.mIdBytes);
-
-                txn = newNoRedoTransaction();
-                try {
-                    // Acquire locks to prevent tree from being re-opened. No deadlocks should
-                    // be possible with tree latch held exclusively, but order in a safe
-                    // fashion anyhow. A registry lookup can only follow a key map lookup.
-
-                    if (idKey != null) {
-                        txn.lockExclusive(mRegistryKeyMap.mId, idKey);
-                    }
-                    if (nameKey != null) {
-                        txn.lockExclusive(mRegistryKeyMap.mId, nameKey);
-                    }
-
-                    txn.lockExclusive(mRegistryKeyMap.mId, trashIdKey);
-
-                    if (mode != Tree.DROP_TO_TRASH) {
-                        txn.lockExclusive(mRegistry.mId, tree.mIdBytes);
-                    }
-
-                    if (ref != null) {
-                        ref.clear();
-                    }
-
-                    if (name != null) {
-                        mOpenTrees.remove(name);
-                    }
-
-                    mOpenTreesById.remove(tree.mId);
-                } catch (Throwable e) {
-                    txn.reset();
-                    throw e;
-                }
-            } finally {
-                mOpenTreesLatch.releaseExclusive();
-            }
-
-            // Complete the drop operation without preventing other indexes from being opened
-            // or dropped concurrently.
-
-            try {
-                if (idKey != null) {
-                    mRegistryKeyMap.remove(txn, idKey, name);
-                }
-                if (nameKey != null) {
-                    mRegistryKeyMap.remove(txn, nameKey, tree.mIdBytes);
-                }
-
-                if (mode == Tree.DROP_TO_TRASH) {
-                    byte[] trashedName = nameKey == null ? EMPTY_BYTES : nameKey;
-                    mRegistryKeyMap.store(txn, trashIdKey, trashedName);
-                } else {
-                    mRegistryKeyMap.store(txn, trashIdKey, null);
-                    mRegistry.delete(txn, tree.mIdBytes);
-                }
-
-                if (redo == null || mode == Tree.DROP_EMPTY_FROM_TRASH) {
-                    // Only record one redo operation when deleting an index.
-                    commitPos = 0;
-                } else {
-                    DurabilityMode durability = mDurabilityMode.alwaysRedo();
-                    if (mode == Tree.DROP_TO_TRASH) {
-                        commitPos = redo.deleteIndex(tree.mId, durability);
-                    } else {
-                        commitPos = redo.dropIndex(tree.mId, durability);
-                    }
-                }
-
-                txn.commit();
-
-                if (mode != Tree.DROP_TO_TRASH) {
-                    deletePage(rootId, cachedState);
-                }
-            } catch (Throwable e) {
-                DatabaseException.rethrowIfRecoverable(e);
-                throw closeOnFailure(this, e);
-            } finally {
-                txn.reset();
-            }
+            mRegistryKeyMap.delete(Transaction.BOGUS, trashIdKey);
+            mRegistry.delete(Transaction.BOGUS, tree.mIdBytes);
+        } catch (Throwable e) {
+            throw closeOnFailure(this, e);
         } finally {
             commitLock.unlock();
-        }
-
-        if (redo != null && commitPos != 0) {
-            // Don't hold commit lock during sync.
-            redo.txnCommitSync(commitPos);
         }
     }
 
@@ -2312,8 +2465,27 @@ public final class Database implements CauseCloseable {
      * @param rootId pass zero to create
      * @return unlatched and unevictable root node
      */
-    private Node loadTreeRoot(long rootId) throws IOException {
-        Node rootNode = allocLatchedNode(false);
+    private Node loadTreeRoot(final long rootId) throws IOException {
+        if (rootId != 0) {
+            // Check if root node is still around after tree was closed.
+            final int hash = NodeMap.hash(rootId);
+            final Node rootNode = mTreeNodeMap.get(rootId, hash);
+            if (rootNode != null) {
+                rootNode.acquireShared();
+                try {
+                    if (rootId == rootNode.mId) {
+                        rootNode.makeUnevictable();
+                        mTreeNodeMap.remove(rootNode, hash);
+                        return rootNode;
+                    }
+                } finally {
+                    rootNode.releaseShared();
+                }
+            }
+        }
+
+        final Node rootNode = allocLatchedNode(rootId, NodeUsageList.MODE_UNEVICTABLE);
+
         try {
             if (rootId == 0) {
                 rootNode.asEmptyRoot();
@@ -2321,13 +2493,14 @@ public final class Database implements CauseCloseable {
                 try {
                     rootNode.read(this, rootId);
                 } catch (IOException e) {
-                    makeEvictableNow(rootNode);
+                    rootNode.makeEvictableNow();
                     throw e;
                 }
             }
         } finally {
             rootNode.releaseExclusive();
         }
+
         return rootNode;
     }
 
@@ -2376,6 +2549,12 @@ public final class Database implements CauseCloseable {
     }
 
     private Tree openInternalTree(long treeId, boolean create) throws IOException {
+        return openInternalTree(treeId, create, null);
+    }
+
+    private Tree openInternalTree(long treeId, boolean create, DatabaseConfig config)
+        throws IOException
+    {
         final Lock commitLock = sharedCommitLock();
         commitLock.lock();
         try {
@@ -2391,7 +2570,15 @@ public final class Database implements CauseCloseable {
                 }
                 rootId = 0;
             }
-            return newTreeInstance(treeId, treeIdBytes, null, loadTreeRoot(rootId));
+
+            Node root = loadTreeRoot(rootId);
+
+            // Cannot call newTreeInstance because mRedoWriter isn't set yet.
+            if (config != null && config.mReplManager != null) {
+                return new TxnTree(this, treeId, treeIdBytes, null, root);
+            }
+
+            return newTreeInstance(treeId, treeIdBytes, null, root);
         } finally {
             commitLock.unlock();
         }
@@ -2400,7 +2587,7 @@ public final class Database implements CauseCloseable {
     private Index openIndex(byte[] name, boolean create) throws IOException {
         checkClosed();
 
-        Tree tree = quickFindIndex(null, name);
+        Tree tree = quickFindIndex(name);
         if (tree != null) {
             return tree;
         }
@@ -2409,7 +2596,7 @@ public final class Database implements CauseCloseable {
         commitLock.lock();
         try {
             // Cleaup before opening more indexes.
-            cleanupUnreferencedTrees(null);
+            cleanupUnreferencedTrees();
 
             byte[] nameKey = newKey(KEY_TYPE_INDEX_NAME, name);
             byte[] treeIdBytes = mRegistryKeyMap.load(null, nameKey);
@@ -2423,6 +2610,8 @@ public final class Database implements CauseCloseable {
             } else if (!create) {
                 return null;
             } else {
+                Transaction createTxn = null;
+
                 mOpenTreesLatch.acquireExclusive();
                 try {
                     treeIdBytes = mRegistryKeyMap.load(null, nameKey);
@@ -2445,20 +2634,35 @@ public final class Database implements CauseCloseable {
                                      (Transaction.BOGUS, treeIdBytes, EMPTY_BYTES));
 
                             critical = false;
-                            if (!mRegistryKeyMap.insert(null, nameKey, treeIdBytes)) {
-                                critical = true;
-                                mRegistry.delete(Transaction.BOGUS, treeIdBytes);
-                                throw new DatabaseException("Unable to insert index name");
-                            }
 
-                            idKey = newKey(KEY_TYPE_INDEX_ID, treeIdBytes);
+                            try {
+                                idKey = newKey(KEY_TYPE_INDEX_ID, treeIdBytes);
 
-                            critical = false;
-                            if (!mRegistryKeyMap.insert(null, idKey, name)) {
-                                mRegistryKeyMap.delete(null, nameKey);
+                                if (mRedoWriter instanceof ReplRedoController) {
+                                    // Confirmation is required when replicated.
+                                    createTxn = newTransaction(DurabilityMode.SYNC);
+                                } else {
+                                    createTxn = newAlwaysRedoTransaction();
+                                }
+
+                                if (!mRegistryKeyMap.insert(createTxn, idKey, name)) {
+                                    throw new DatabaseException("Unable to insert index id");
+                                }
+                                if (!mRegistryKeyMap.insert(createTxn, nameKey, treeIdBytes)) {
+                                    throw new DatabaseException("Unable to insert index name");
+                                }
+                            } catch (Throwable e) {
                                 critical = true;
-                                mRegistry.delete(Transaction.BOGUS, treeIdBytes);
-                                throw new DatabaseException("Unable to insert index id");
+                                try {
+                                    if (createTxn != null) {
+                                        createTxn.reset();
+                                    }
+                                    mRegistry.delete(Transaction.BOGUS, treeIdBytes);
+                                    critical = false;
+                                } catch (Throwable e2) {
+                                    e.addSuppressed(e2);
+                                }
+                                throw e;
                             }
                         } catch (Throwable e) {
                             if (!critical) {
@@ -2468,7 +2672,24 @@ public final class Database implements CauseCloseable {
                         }
                     }
                 } finally {
+                    // Release to allow opening other indexes while blocked on commit.
                     mOpenTreesLatch.releaseExclusive();
+                }
+
+                if (createTxn != null) {
+                    try {
+                        createTxn.commit();
+                    } catch (Throwable e) {
+                        try {
+                            createTxn.reset();
+                            mRegistry.delete(Transaction.BOGUS, treeIdBytes);
+                        } catch (Throwable e2) {
+                            e.addSuppressed(e2);
+                            throw closeOnFailure(this, e);
+                        }
+                        DatabaseException.rethrowIfRecoverable(e);
+                        throw closeOnFailure(this, e);
+                    }
                 }
             }
 
@@ -2479,7 +2700,7 @@ public final class Database implements CauseCloseable {
                 // Pass the transaction to acquire the lock.
                 byte[] rootIdBytes = mRegistry.load(txn, treeIdBytes);
 
-                tree = quickFindIndex(txn, name);
+                tree = quickFindIndex(name);
                 if (tree != null) {
                     // Another thread got the lock first and loaded the index.
                     return tree;
@@ -2578,7 +2799,7 @@ public final class Database implements CauseCloseable {
     /**
      * @return null if not found
      */
-    private Tree quickFindIndex(Transaction txn, byte[] name) throws IOException {
+    private Tree quickFindIndex(byte[] name) throws IOException {
         TreeRef treeRef;
         mOpenTreesLatch.acquireShared();
         try {
@@ -2594,21 +2815,19 @@ public final class Database implements CauseCloseable {
             mOpenTreesLatch.releaseShared();
         }
 
-        // Ensure that all nodes of cleared tree reference are evicted before
-        // potentially replacing them. Weak references are cleared before they
-        // are enqueued, and so polling the queue does not guarantee node
-        // eviction. Process the tree directly.
-        cleanupUnreferencedTree(txn, treeRef);
+        // Ensure that root node of cleared tree reference is available in the node map before
+        // potentially replacing it. Weak references are cleared before they are enqueued, and
+        // so polling the queue does not guarantee node eviction. Process the tree directly.
+        cleanupUnreferencedTree(treeRef);
 
         return null;
     }
 
     /**
      * Tree instances retain a reference to an unevictable root node. If tree is no longer in
-     * use, evict everything, including the root node. Method cannot be called while a
-     * checkpoint is in progress.
+     * use, allow it to be evicted. Method cannot be called while a checkpoint is in progress.
      */
-    private void cleanupUnreferencedTrees(Transaction txn) throws IOException {
+    private void cleanupUnreferencedTrees() throws IOException {
         final ReferenceQueue<Tree> queue = mOpenTreesRefQueue;
         if (queue == null) {
             return;
@@ -2620,7 +2839,7 @@ public final class Database implements CauseCloseable {
                     break;
                 }
                 if (ref instanceof TreeRef) {
-                    cleanupUnreferencedTree(txn, (TreeRef) ref);
+                    cleanupUnreferencedTree((TreeRef) ref);
                 }
             }
         } catch (Exception e) {
@@ -2630,50 +2849,26 @@ public final class Database implements CauseCloseable {
         }
     }
 
-    private void cleanupUnreferencedTree(Transaction txn, TreeRef ref) throws IOException {
-        // Acquire lock to prevent tree from being reloaded too soon.
-
-        byte[] treeIdBytes = new byte[8];
-        encodeLongBE(treeIdBytes, 0, ref.mId);
-
-        if (txn == null) {
-            txn = newNoRedoTransaction();
-        } else {
-            txn.enter();
-        }
-
+    private void cleanupUnreferencedTree(TreeRef ref) throws IOException {
+        Node root = ref.mRoot;
+        root.acquireShared();
         try {
-            // Pass the transaction to acquire the lock.
-            mRegistry.load(txn, treeIdBytes);
-
-            mOpenTreesLatch.acquireShared();
+            mOpenTreesLatch.acquireExclusive();
             try {
                 LHashTable.ObjEntry<TreeRef> entry = mOpenTreesById.get(ref.mId);
                 if (entry == null || entry.value != ref) {
                     return;
                 }
-            } finally {
-                mOpenTreesLatch.releaseShared();
-            }
-
-            Node root = ref.mRoot;
-            root.acquireExclusive();
-            root.forceEvictTree(this);
-            root.releaseExclusive();
-
-            mOpenTreesLatch.acquireExclusive();
-            try {
-                mOpenTreesById.remove(ref.mId);
                 mOpenTrees.remove(ref.mName);
+                mOpenTreesById.remove(ref.mId);
+                root.makeEvictableNow();
+                mTreeNodeMap.put(root);
             } finally {
                 mOpenTreesLatch.releaseExclusive();
             }
         } finally {
-            txn.exit();
+            root.releaseShared();
         }
-
-        // Move root node into usage list, allowing it to be re-used.
-        makeEvictableNow(ref.mRoot);
     }
 
     private static byte[] newKey(byte type, byte[] payload) {
@@ -2691,7 +2886,12 @@ public final class Database implements CauseCloseable {
     }
 
     /**
-     * Access the shared commit lock, which prevents commits while held.
+     * Access the shared commit lock, which prevents commits while held. In general, it should
+     * be acquired before any node latches, but postponing acquisition reduces the total time
+     * held. Checkpoints don't have to wait as long for the exclusive commit lock. Because node
+     * latching first isn't the canonical ordering, acquiring the shared commit lock later must
+     * be prepared to abort. Try to acquire first, and if it fails, release the node latch and
+     * do over.
      */
     Lock sharedCommitLock() {
         return mSharedCommitLock;
@@ -2719,98 +2919,38 @@ public final class Database implements CauseCloseable {
     }
 
     /**
-     * Returns a new or recycled Node instance, latched exclusively, with an id
-     * of zero and a clean state.
+     * Returns a new or recycled Node instance, latched exclusively, with an undefined id and a
+     * clean state.
+     *
+     * @param anyNodeId id of any node, for spreading allocations around
      */
-    Node allocLatchedNode() throws IOException {
-        return allocLatchedNode(true);
+    Node allocLatchedNode(long anyNodeId) throws IOException {
+        return allocLatchedNode(anyNodeId, 0);
     }
 
     /**
-     * Returns a new or recycled Node instance, latched exclusively, with an id
-     * of zero and a clean state.
+     * Returns a new or recycled Node instance, latched exclusively, with an undefined id and a
+     * clean state.
      *
-     * @param evictable true if allocated node can be automatically evicted
+     * @param anyNodeId id of any node, for spreading allocations around
+     * @param mode MODE_UNEVICTABLE if allocated node cannot be automatically evicted
      */
-    Node allocLatchedNode(boolean evictable) throws IOException {
-        final Latch usageLatch = mUsageLatch;
+    Node allocLatchedNode(long anyNodeId, int mode) throws IOException {
+        mode |= mPageDb.allocMode();
+
+        NodeUsageList[] usageLists = mUsageLists;
+        int listIx = ((int) anyNodeId) & (usageLists.length - 1);
+
         for (int trial = 1; trial <= 3; trial++) {
-            usageLatch.acquireExclusive();
-            alloc: {
-                int max = mMaxNodeCount;
-
-                if (max == 0) {
-                    break alloc;
+            for (int i=0; i<usageLists.length; i++) {
+                Node node = usageLists[listIx].tryAllocLatchedNode(trial, mode);
+                if (node != null) {
+                    return node;
                 }
-
-                if (mNodeCount < max &&
-                    (trial > 1
-                     || mLeastRecentlyUsed == null || mLeastRecentlyUsed.mMoreUsed == null))
-                {
-                    return doAllocLatchedNode(evictable);
+                if (--listIx < 0) {
+                    listIx = usageLists.length - 1;
                 }
-
-                if (!evictable && mLeastRecentlyUsed.mMoreUsed == mMostRecentlyUsed) {
-                    // Cannot allow list to shrink to less than two elements.
-                    break alloc;
-                }
-
-                do {
-                    Node node = mLeastRecentlyUsed;
-                    (mLeastRecentlyUsed = node.mMoreUsed).mLessUsed = null;
-                    node.mMoreUsed = null;
-                    (node.mLessUsed = mMostRecentlyUsed).mMoreUsed = node;
-                    mMostRecentlyUsed = node;
-
-                    if (!node.tryAcquireExclusive()) {
-                        continue;
-                    }
-
-                    if (trial == 1) {
-                        if (node.mCachedState != CACHED_CLEAN && mNodeCount < mMaxNodeCount) {
-                            // Grow the cache instead of evicting.
-                            node.releaseExclusive();
-                            return doAllocLatchedNode(evictable);
-                        }
-
-                        // For first attempt, release the usage latch early to prevent blocking
-                        // other allocations while node is evicted. Subsequent attempts retain
-                        // the latch, preventing potential allocation starvation.
-
-                        usageLatch.releaseExclusive();
-
-                        if ((node = Node.evict(node, this)) != null) {
-                            if (!evictable) {
-                                makeUnevictable(node);
-                            }
-                            // Return with node latch still held.
-                            return node;
-                        }
-
-                        usageLatch.acquireExclusive();
-
-                        if (mMaxNodeCount == 0) {
-                            break alloc;
-                        }
-                    } else {
-                        try {
-                            if ((node = Node.evict(node, this)) != null) {
-                                if (!evictable) {
-                                    doMakeUnevictable(node);
-                                }
-                                usageLatch.releaseExclusive();
-                                // Return with node latch still held.
-                                return node;
-                            }
-                        } catch (Throwable e) {
-                            usageLatch.releaseExclusive();
-                            throw e;
-                        }
-                    }
-                } while (--max > 0);
             }
-
-            usageLatch.releaseExclusive();
 
             checkClosed();
 
@@ -2818,68 +2958,16 @@ public final class Database implements CauseCloseable {
             commitLock.lock();
             try {
                 // Try to free up nodes from unreferenced trees.
-                cleanupUnreferencedTrees(null);
+                cleanupUnreferencedTrees();
             } finally {
                 commitLock.unlock();
             }
         }
 
-        throw new CacheExhaustedException();
-    }
-
-    /**
-     * Caller must acquire mUsageLatch, which is released by this method.
-     */
-    private Node doAllocLatchedNode(boolean evictable) throws DatabaseException {
-        try {
-            checkClosed();
-            Node node = new Node(mPageSize);
-            node.acquireExclusive();
-            mNodeCount++;
-            if (evictable) {
-                if ((node.mLessUsed = mMostRecentlyUsed) == null) {
-                    mLeastRecentlyUsed = node;
-                } else {
-                    mMostRecentlyUsed.mMoreUsed = node;
-                }
-                mMostRecentlyUsed = node;
-            }
-            // Return with node latch still held.
-            return node;
-        } finally {
-            mUsageLatch.releaseExclusive();
-        }
-    }
-
-    /**
-     * Unlinks all nodes from each other in usage list, and prevents new nodes
-     * from being allocated.
-     */
-    private void closeNodeCache() {
-        final Latch usageLatch = mUsageLatch;
-        usageLatch.acquireExclusive();
-        try {
-            // Prevent new allocations.
-            mMaxNodeCount = 0;
-
-            Node node = mLeastRecentlyUsed;
-            mLeastRecentlyUsed = null;
-            mMostRecentlyUsed = null;
-
-            while (node != null) {
-                Node next = node.mMoreUsed;
-                node.mLessUsed = null;
-                node.mMoreUsed = null;
-
-                // Make node appear to be evicted.
-                node.mId = 0;
-
-                node = next;
-            }
-
-            mTreeNodeMap.clear();
-        } finally {
-            usageLatch.releaseExclusive();
+        if (mPageDb.isDurable()) {
+            throw new CacheExhaustedException();
+        } else {
+            throw new DatabaseFullException();
         }
     }
 
@@ -2888,109 +2976,30 @@ public final class Database implements CauseCloseable {
      * dirty. Caller must hold commit lock.
      */
     Node allocDirtyNode() throws IOException {
-        Node node = allocLatchedNode(true);
-        try {
-            dirty(node, mAllocator.allocPage(node));
-            return node;
-        } catch (IOException e) {
-            node.releaseExclusive();
-            throw e;
-        }
+        return allocDirtyNode(0);
     }
 
     /**
      * Returns a new or recycled Node instance, latched exclusively, marked
      * dirty and unevictable. Caller must hold commit lock.
+     *
+     * @param mode MODE_UNEVICTABLE if allocated node cannot be automatically evicted
      */
-    Node allocUnevictableNode() throws IOException {
-        Node node = allocLatchedNode(false);
-        try {
-            dirty(node, mAllocator.allocPage(node));
-            return node;
-        } catch (IOException e) {
-            makeEvictableNow(node);
-            node.releaseExclusive();
-            throw e;
-        }
+    Node allocDirtyNode(int mode) throws IOException {
+        Node node = mPageDb.allocLatchedNode(this, mode);
+        node.mCachedState = mCommitState;
+        mDirtyList.add(node);
+        return node;
     }
 
     /**
-     * Allow a Node which was allocated as unevictable to be evictable,
-     * starting off as the most recently used.
+     * Returns a new or recycled Node instance, latched exclusively and marked
+     * dirty. Caller must hold commit lock.
      */
-    void makeEvictable(Node node) {
-        final Latch usageLatch = mUsageLatch;
-        usageLatch.acquireExclusive();
-        try {
-            if (mMaxNodeCount == 0) {
-                // Closed.
-                return;
-            }
-            if (node.mMoreUsed != null || node.mLessUsed != null) {
-                throw new IllegalStateException();
-            }
-            (node.mLessUsed = mMostRecentlyUsed).mMoreUsed = node;
-            mMostRecentlyUsed = node;
-        } finally {
-            usageLatch.releaseExclusive();
-        }
-    }
-
-    /**
-     * Allow a Node which was allocated as unevictable to be evictable, as the
-     * least recently used.
-     */
-    void makeEvictableNow(Node node) {
-        final Latch usageLatch = mUsageLatch;
-        usageLatch.acquireExclusive();
-        try {
-            if (mMaxNodeCount == 0) {
-                // Closed.
-                return;
-            }
-            if (node.mMoreUsed != null || node.mLessUsed != null) {
-                throw new IllegalStateException();
-            }
-            (node.mMoreUsed = mLeastRecentlyUsed).mLessUsed = node;
-            mLeastRecentlyUsed = node;
-        } finally {
-            usageLatch.releaseExclusive();
-        }
-    }
-
-    /**
-     * Allow a Node which was allocated as evictable to be unevictable.
-     */
-    void makeUnevictable(final Node node) {
-        final Latch usageLatch = mUsageLatch;
-        usageLatch.acquireExclusive();
-        try {
-            if (mMaxNodeCount == 0) {
-                // Closed.
-                return;
-            }
-            doMakeUnevictable(node);
-        } finally {
-            usageLatch.releaseExclusive();
-        }
-    }
-
-    /**
-     * Caller must hold mUsageLatch.
-     */
-    private void doMakeUnevictable(final Node node) {
-        final Node lessUsed = node.mLessUsed;
-        final Node moreUsed = node.mMoreUsed;
-        if (lessUsed == null) {
-            (mLeastRecentlyUsed = moreUsed).mLessUsed = null;
-        } else if (moreUsed == null) {
-            (mMostRecentlyUsed = lessUsed).mMoreUsed = null;
-        } else {
-            lessUsed.mMoreUsed = moreUsed;
-            moreUsed.mLessUsed = lessUsed;
-        }
-        node.mMoreUsed = null;
-        node.mLessUsed = null;
+    Node allocDirtyFragmentNode() throws IOException {
+        Node node = allocDirtyNode();
+        mFragmentCache.put(node);
+        return node;
     }
 
     /**
@@ -3027,15 +3036,18 @@ public final class Database implements CauseCloseable {
         if (node.mCachedState == mCommitState) {
             return false;
         } else {
+            long newId = mPageDb.allocPage();
+            mDirtyList.add(node);
             long oldId = node.mId;
-            long newId = mAllocator.allocPage(node);
             if (oldId != 0) {
                 mPageDb.deletePage(oldId);
+                mTreeNodeMap.remove(node, NodeMap.hash(oldId));
             }
             if (node.mCachedState != CACHED_CLEAN) {
                 node.write(mPageDb);
             }
             dirty(node, newId);
+            mTreeNodeMap.put(node);
             return true;
         }
     }
@@ -3047,8 +3059,9 @@ public final class Database implements CauseCloseable {
      */
     void markUndoLogDirty(Node node) throws IOException {
         if (node.mCachedState != mCommitState) {
+            long newId = mPageDb.allocPage();
+            mDirtyList.add(node);
             long oldId = node.mId;
-            long newId = mAllocator.allocPage(node);
             mPageDb.deletePage(oldId);
             node.write(mPageDb);
             dirty(node, newId);
@@ -3061,8 +3074,9 @@ public final class Database implements CauseCloseable {
      * method, even if an exception is thrown.
      */
     void doMarkDirty(Tree tree, Node node) throws IOException {
+        long newId = mPageDb.allocPage();
+        mDirtyList.add(node);
         long oldId = node.mId;
-        long newId = mAllocator.allocPage(node);
         if (oldId != 0) {
             mPageDb.deletePage(oldId);
             mTreeNodeMap.remove(node, NodeMap.hash(oldId));
@@ -3088,21 +3102,20 @@ public final class Database implements CauseCloseable {
     }
 
     /**
+     * Remove the old node from the dirty list and swap in the new node. Caller must hold
+     * commit lock and latched the old node. The cached state of the nodes is not altered.
+     */
+    void swapIfDirty(Node oldNode, Node newNode) {
+        mDirtyList.swapIfDirty(oldNode, newNode);
+    }
+
+    /**
      * Caller must hold commit lock and exclusive latch on node. This method
      * should only be called for nodes whose existing data is not needed.
      */
     void redirty(Node node) {
         node.mCachedState = mCommitState;
-        mAllocator.dirty(node);
-    }
-
-    /**
-     * Caller must hold commit lock and exclusive latch on node. This method should only be
-     * called for nodes whose existing data is not needed and it is known that node is already
-     * in the allocator's dirty list.
-     */
-    void redirtyQ(Node node) {
-        node.mCachedState = mCommitState;
+        mDirtyList.add(node);
     }
 
     /**
@@ -3147,48 +3160,21 @@ public final class Database implements CauseCloseable {
             }
 
             mTreeNodeMap.remove(node, NodeMap.hash(id));
-            node.mId = 0;
+
+            // When id is <= 1, it won't be moved to a secondary cache. Preserve the original
+            // id for non-durable database to recycle it. Durable database relies on free list.
+            node.mId = -id;
 
             // When node is re-allocated, it will be evicted. Ensure that eviction
             // doesn't write anything.
             node.mCachedState = CACHED_CLEAN;
-        } finally {
+        } catch (Throwable e) {
             node.releaseExclusive();
+            throw e;
         }
 
-        // Indicate that node is least recently used, allowing it to be
-        // re-allocated immediately without evicting another node. Node must be
-        // unlatched at this point, to prevent it from being immediately
-        // promoted to most recently used by allocLatchedNode.
-        final Latch usageLatch = mUsageLatch;
-        usageLatch.acquireExclusive();
-        try {
-            if (mMaxNodeCount == 0) {
-                // Closed.
-                return;
-            }
-            Node lessUsed = node.mLessUsed;
-            if (lessUsed == null) {
-                // Node might already be least...
-                if (node.mMoreUsed != null) {
-                    // ...confirmed.
-                    return;
-                }
-                // ...Node isn't in the usage list at all.
-            } else {
-                Node moreUsed = node.mMoreUsed;
-                if ((lessUsed.mMoreUsed = moreUsed) == null) {
-                    mMostRecentlyUsed = lessUsed;
-                } else {
-                    moreUsed.mLessUsed = lessUsed;
-                }
-                node.mLessUsed = null;
-            }
-            (node.mMoreUsed = mLeastRecentlyUsed).mLessUsed = node;
-            mLeastRecentlyUsed = node;
-        } finally {
-            usageLatch.releaseExclusive();
-        }
+        // Always releases the node latch.
+        node.unused();
     }
 
     /**
@@ -3198,49 +3184,11 @@ public final class Database implements CauseCloseable {
         if (id != 0) {
             if (cachedState == mCommitState) {
                 // Newly reserved page was never used, so recycle it.
-                mAllocator.recyclePage(id);
+                mPageDb.recyclePage(id);
             } else {
                 // Old data must survive until after checkpoint.
                 mPageDb.deletePage(id);
             }
-        }
-    }
-
-    /**
-     * Deletes a page without the possibility of recycling it. Caller must hold commit lock.
-     *
-     * @param id must be greater than one
-     */
-    void forceDeletePage(long id) throws IOException {
-        mPageDb.deletePage(id);
-    }
-
-    /**
-     * Indicate that a non-root node is most recently used. Root node is not
-     * managed in usage list and cannot be evicted. Caller must hold any latch
-     * on node. Latch is never released by this method, even if an exception is
-     * thrown.
-     */
-    void used(Node node) {
-        // Because this method can be a bottleneck, don't wait for exclusive
-        // latch. If node is popular, it will get more chances to be identified
-        // as most recently used. This strategy works well enough because cache
-        // eviction is always a best-guess approach.
-        final Latch usageLatch = mUsageLatch;
-        if (usageLatch.tryAcquireExclusive()) {
-            Node moreUsed = node.mMoreUsed;
-            if (moreUsed != null) {
-                Node lessUsed = node.mLessUsed;
-                if ((moreUsed.mLessUsed = lessUsed) == null) {
-                    mLeastRecentlyUsed = moreUsed;
-                } else {
-                    lessUsed.mMoreUsed = moreUsed;
-                }
-                node.mMoreUsed = null;
-                (node.mLessUsed = mMostRecentlyUsed).mMoreUsed = node;
-                mMostRecentlyUsed = node;
-            }
-            usageLatch.releaseExclusive();
         }
     }
 
@@ -3327,9 +3275,8 @@ public final class Database implements CauseCloseable {
                 } else {
                     int voffset = remainder;
                     while (true) {
-                        Node node = allocDirtyNode();
+                        Node node = allocDirtyFragmentNode();
                         try {
-                            mFragmentCache.put(node);
                             encodeInt48LE(newValue, poffset, node.mId);
                             arraycopy(value, voffset, node.mPage, 0, pageSize);
                             if (pageCount == 1) {
@@ -3383,9 +3330,8 @@ public final class Database implements CauseCloseable {
                     } else {
                         int voffset = 0;
                         while (true) {
-                            Node node = allocDirtyNode();
+                            Node node = allocDirtyFragmentNode();
                             try {
-                                mFragmentCache.put(node);
                                 encodeInt48LE(newValue, offset, node.mId);
                                 byte[] page = node.mPage;
                                 if (pageCount > 1) {
@@ -3413,9 +3359,9 @@ public final class Database implements CauseCloseable {
                     // Value is sparse, so just store a null pointer.
                     encodeInt48LE(newValue, offset, 0);
                 } else {
-                    Node inode = allocDirtyNode();
+                    Node inode = allocDirtyFragmentNode();
                     encodeInt48LE(newValue, offset, inode.mId);
-                    int levels = calculateInodeLevels(vlength, pageSize);
+                    int levels = calculateInodeLevels(vlength);
                     writeMultilevelFragments(levels, inode, value, 0, vlength);
                 }
             }
@@ -3437,32 +3383,29 @@ public final class Database implements CauseCloseable {
         return newValue;
     }
 
-    static int calculateInodeLevels(long vlength, int pageSize) {
+    int calculateInodeLevels(long vlength) {
+        long[] caps = mFragmentInodeLevelCaps;
         int levels = 0;
-
-        if (vlength >= 0 && vlength < (Long.MAX_VALUE / 2)) {
-            long len = (vlength + (pageSize - 1)) / pageSize;
-            if (len > 1) {
-                int ptrCount = pageSize / 6;
-                do {
-                    levels++;
-                } while ((len = (len + (ptrCount - 1)) / ptrCount) > 1);
+        while (levels < caps.length) {
+            if (vlength <= caps[levels]) {
+                break;
             }
-        } else {
-            BigInteger bPageSize = BigInteger.valueOf(pageSize);
-            BigInteger bLen = (valueOfUnsigned(vlength)
-                               .add(bPageSize.subtract(BigInteger.ONE))).divide(bPageSize);
-            if (bLen.compareTo(BigInteger.ONE) > 0) {
-                BigInteger bPtrCount = bPageSize.divide(BigInteger.valueOf(6));
-                BigInteger bPtrCountM1 = bPtrCount.subtract(BigInteger.ONE);
-                do {
-                    levels++;
-                } while ((bLen = (bLen.add(bPtrCountM1)).divide(bPtrCount))
-                         .compareTo(BigInteger.ONE) > 0);
-            }
+            levels++;
         }
-
         return levels;
+    }
+
+    static long decodeFullFragmentedValueLength(int header, byte[] fragmented, int off) {
+        switch ((header >> 2) & 0x03) {
+        default:
+            return decodeUnsignedShortLE(fragmented, off);
+        case 1:
+            return decodeIntLE(fragmented, off) & 0xffffffffL;
+        case 2:
+            return decodeUnsignedInt48LE(fragmented, off);
+        case 3:
+            return decodeLongLE(fragmented, off);
+        }
     }
 
     /**
@@ -3474,80 +3417,41 @@ public final class Database implements CauseCloseable {
                                           byte[] value, int voffset, long vlength)
         throws IOException
     {
-        long levelCap;
-        long[] childNodeIds;
-        Node[] childNodes;
         try {
             byte[] page = inode.mPage;
             level--;
-            levelCap = levelCap(level);
-
-            // Pre-allocate and reference the required child nodes in order for
-            // parent node latch to be released early. FragmentCache can then
-            // safely evict the parent node if necessary.
+            long levelCap = levelCap(level);
 
             int childNodeCount = (int) ((vlength + (levelCap - 1)) / levelCap);
-            childNodeIds = new long[childNodeCount];
-            childNodes = new Node[childNodeCount];
-            try {
-                int poffset = 0;
-                for (int i=0; i<childNodeCount; poffset += 6, i++) {
-                    Node childNode = allocDirtyNode();
-                    encodeInt48LE(page, poffset, childNodeIds[i] = childNode.mId);
-                    childNodes[i] = childNode;
-                    // Allow node to be evicted, but don't write anything yet.
-                    childNode.mCachedState = CACHED_CLEAN;
+
+            int poffset = 0;
+            for (int i=0; i<childNodeCount; poffset += 6, i++) {
+                Node childNode = allocDirtyFragmentNode();
+                encodeInt48LE(page, poffset, childNode.mId);
+
+                int len = (int) Math.min(levelCap, vlength);
+                if (level <= 0) {
+                    byte[] childPage = childNode.mPage;
+                    arraycopy(value, voffset, childPage, 0, len);
+                    // Zero fill the rest, making it easier to extend later.
+                    fill(childPage, len, childPage.length, (byte) 0);
                     childNode.releaseExclusive();
+                } else {
+                    writeMultilevelFragments(level, childNode, value, voffset, len);
                 }
-                // Zero fill the rest, making it easier to extend later.
-                fill(page, poffset, page.length, (byte) 0);
-            } catch (Throwable e) {
-                // Panic.
-                close(e);
-                throw e;
+
+                vlength -= len;
+                voffset += len;
             }
 
-            mFragmentCache.put(inode);
+            // Zero fill the rest, making it easier to extend later.
+            fill(page, poffset, page.length, (byte) 0);
+        } catch (Throwable e) {
+            // Panic.
+            close(e);
+            throw e;
         } finally {
             inode.releaseExclusive();
-        }
-
-        for (int i=0; i<childNodeIds.length; i++) {
-            long childNodeId = childNodeIds[i];
-            Node childNode = childNodes[i];
-
-            latchChild: {
-                if (childNodeId == childNode.mId) {
-                    childNode.acquireExclusive();
-                    if (childNodeId == childNode.mId) {
-                        // Since commit lock is held, only need to switch the state. Calling
-                        // redirty is unnecessary and it would screw up the dirty list order
-                        // for no good reason. Use the quick variant.
-                        redirtyQ(childNode);
-                        break latchChild;
-                    }
-                    childNode.releaseExclusive();
-                }
-                // Child node was evicted, although it was clean.
-                childNode = allocLatchedNode();
-                childNode.mId = childNodeId;
-                redirty(childNode);
-            }
-
-            int len = (int) Math.min(levelCap, vlength);
-            if (level <= 0) {
-                byte[] childPage = childNode.mPage;
-                arraycopy(value, voffset, childPage, 0, len);
-                // Zero fill the rest, making it easier to extend later.
-                fill(childPage, len, childPage.length, (byte) 0);
-                mFragmentCache.put(childNode);
-                childNode.releaseExclusive();
-            } else {
-                writeMultilevelFragments(level, childNode, value, voffset, len);
-            }
-
-            vlength -= len;
-            voffset += len;
         }
     }
 
@@ -3642,7 +3546,7 @@ public final class Database implements CauseCloseable {
             long inodeId = decodeUnsignedInt48LE(fragmented, off);
             if (inodeId != 0) {
                 Node inode = mFragmentCache.get(inodeId);
-                int levels = calculateInodeLevels(vLen, mPageSize);
+                int levels = calculateInodeLevels(vLen);
                 readMultilevelFragments(levels, inode, value, 0, vLen);
             }
         }
@@ -3659,32 +3563,32 @@ public final class Database implements CauseCloseable {
                                          byte[] value, int voffset, int vlength)
         throws IOException
     {
-        byte[] page = inode.mPage;
-        level--;
-        long levelCap = levelCap(level);
+        try {
+            byte[] page = inode.mPage;
+            level--;
+            long levelCap = levelCap(level);
 
-        // Copy all child node ids and release parent latch early.
-        // FragmentCache can then safely evict the parent node if necessary.
-        int childNodeCount = (int) ((vlength + (levelCap - 1)) / levelCap);
-        long[] childNodeIds = new long[childNodeCount];
-        for (int poffset = 0, i=0; i<childNodeCount; poffset += 6, i++) {
-            childNodeIds[i] = decodeUnsignedInt48LE(page, poffset);
-        }
-        inode.releaseShared();
+            int childNodeCount = (int) ((vlength + (levelCap - 1)) / levelCap);
 
-        for (long childNodeId : childNodeIds) {
-            int len = (int) Math.min(levelCap, vlength);
-            if (childNodeId != 0) {
-                Node childNode = mFragmentCache.get(childNodeId);
-                if (level <= 0) {
-                    arraycopy(childNode.mPage, 0, value, voffset, len);
-                    childNode.releaseShared();
-                } else {
-                    readMultilevelFragments(level, childNode, value, voffset, len);
+            for (int poffset = 0, i=0; i<childNodeCount; poffset += 6, i++) {
+                long childNodeId = decodeUnsignedInt48LE(page, poffset);
+                int len = (int) Math.min(levelCap, vlength);
+
+                if (childNodeId != 0) {
+                    Node childNode = mFragmentCache.get(childNodeId);
+                    if (level <= 0) {
+                        arraycopy(childNode.mPage, 0, value, voffset, len);
+                        childNode.releaseShared();
+                    } else {
+                        readMultilevelFragments(level, childNode, value, voffset, len);
+                    }
                 }
+
+                vlength -= len;
+                voffset += len;
             }
-            vlength -= len;
-            voffset += len;
+        } finally {
+            inode.releaseShared();
         }
     }
 
@@ -3744,7 +3648,7 @@ public final class Database implements CauseCloseable {
             long inodeId = decodeUnsignedInt48LE(fragmented, off);
             if (inodeId != 0) {
                 Node inode = removeInode(inodeId);
-                int levels = calculateInodeLevels(vLen, mPageSize);
+                int levels = calculateInodeLevels(vLen);
                 deleteMultilevelFragments(levels, inode, vLen);
             }
         }
@@ -3788,7 +3692,7 @@ public final class Database implements CauseCloseable {
     private Node removeInode(long nodeId) throws IOException {
         Node node = mFragmentCache.remove(nodeId);
         if (node == null) {
-            node = allocLatchedNode(false);
+            node = allocLatchedNode(nodeId, NodeUsageList.MODE_UNEVICTABLE);
             node.mId = nodeId;
             node.mType = TYPE_FRAGMENT;
             node.mCachedState = readNodePage(nodeId, node.mPage);
@@ -3806,7 +3710,7 @@ public final class Database implements CauseCloseable {
                 deleteNode(node);
             } else if (!mHasCheckpointed) {
                 // Page was never used if nothing has ever been checkpointed.
-                mAllocator.recyclePage(nodeId);
+                mPageDb.recyclePage(nodeId);
             } else {
                 // Page is clean if not in a Node, and so it must survive until
                 // after the next checkpoint.
@@ -3892,20 +3796,25 @@ public final class Database implements CauseCloseable {
         if (!mHasCheckpointed) {
             // Read is reloading an evicted node which is known to be dirty.
             mSharedCommitLock.lock();
-            try {
-                return mCommitState;
-            } finally {
-                mSharedCommitLock.unlock();
-            }
+            // Need to check again once full lock has been acquired.
+            byte state = mHasCheckpointed ? CACHED_CLEAN : mCommitState;
+            mSharedCommitLock.unlock();
+            return state;
         }
 
-        // TODO: Keep some sort of cache of ids known to be dirty. If reloaded
-        // before commit, then they're still dirty. Without this optimization,
-        // too many pages are allocated when: evictions are high, write rate is
-        // high, and commits are bogged down. A Bloom filter is not
-        // appropriate, because of false positives. A random evicting cache
-        // works well -- it has no collision chains. Evict whatever else was
-        // there in the slot. An array of longs should suffice.
+        // NOTE: An optimization is possible here, but it's a bit tricky. Too many pages are
+        // allocated when evictions are high, write rate is high, and commits are bogged down.
+        // Keep some sort of cache of ids known to be dirty. If reloaded before commit, then
+        // they're still dirty.
+        //
+        // A Bloom filter is not appropriate, because of false positives. A random evicting
+        // cache works well -- it has no collision chains. Evict whatever else was there in the
+        // slot. An array of longs should suffice.
+        //
+        // When a child node is loaded with a dirty state, the parent nodes must be updated as
+        // well. This might force them to be evicted, and then the optimization is lost. A
+        // better approach would avoid the optimization if the parent node is clean or doesn't
+        // match the current commit state.
 
         return CACHED_CLEAN;
     }
@@ -3921,7 +3830,7 @@ public final class Database implements CauseCloseable {
             }
 
             // Now's a good time to clean things up.
-            cleanupUnreferencedTrees(null);
+            cleanupUnreferencedTrees();
 
             final Node root = mRegistry.mRoot;
 
@@ -3963,6 +3872,29 @@ public final class Database implements CauseCloseable {
 
             mLastCheckpointNanos = nowNanos;
 
+            if (mEventListener != null) {
+                // Note: Events should not be delivered when exclusive commit lock is held.
+                // The listener implementation might introduce extra blocking.
+                mEventListener.notify(EventType.CHECKPOINT_BEGIN, "Checkpoint begin");
+            }
+
+            boolean resume = true;
+
+            byte[] header = mCommitHeader;
+            UndoLog masterUndoLog = mCommitMasterUndoLog;
+
+            if (header == null) {
+                // Not resumed. Allocate new header early, before acquiring locks.
+                header = new byte[mPageDb.pageSize()];
+                resume = false;
+                if (masterUndoLog != null) {
+                    throw new AssertionError();
+                }
+            }
+
+            int hoff = mPageDb.extraCommitDataOffset();
+            encodeIntLE(header, hoff + I_ENCODING_VERSION, ENCODING_VERSION);
+
             final RedoWriter redo = mRedoWriter;
             if (redo != null) {
                 // File-based redo log should create a new file, but not write to it yet.
@@ -3982,6 +3914,10 @@ public final class Database implements CauseCloseable {
                 commitLock.unlock();
             }
 
+            if (!resume) {
+                encodeLongLE(header, hoff + I_ROOT_PAGE_ID, root.mId);
+            }
+
             final long redoNum, redoPos, redoTxnId;
             if (redo == null) {
                 redoNum = 0;
@@ -3989,52 +3925,75 @@ public final class Database implements CauseCloseable {
                 redoTxnId = 0;
             } else {
                 // Switch and capture state while commit lock is held.
-                redo.checkpointSwitch();
-                redoNum = redo.checkpointNumber();
-                redoPos = redo.checkpointPosition();
-                redoTxnId = redo.checkpointTransactionId();
+                try {
+                    redo.checkpointSwitch();
+                    redoNum = redo.checkpointNumber();
+                    redoPos = redo.checkpointPosition();
+                    redoTxnId = redo.checkpointTransactionId();
+                } catch (Throwable e) {
+                    redo.checkpointAborted();
+                    throw e;
+                }
             }
 
-            if (mEventListener != null) {
-                mEventListener.notify(EventType.CHECKPOINT_BEGIN,
-                                      "Checkpoint begin: %1$d, %2$d", redoNum, redoPos);
-            }
+            encodeLongLE(header, hoff + I_CHECKPOINT_NUMBER, redoNum);
+            encodeLongLE(header, hoff + I_REDO_TXN_ID, redoTxnId);
+            encodeLongLE(header, hoff + I_REDO_POSITION, redoPos);
+
+            encodeLongLE(header, hoff + I_REPL_ENCODING,
+                         mRedoWriter == null ? 0 : mRedoWriter.encoding());
 
             mCheckpointFlushState = CHECKPOINT_FLUSH_PREPARE;
 
-            UndoLog masterUndoLog;
             try {
                 // TODO: I don't like all this activity with exclusive commit
                 // lock held. UndoLog can be refactored to store into a special
                 // Tree, but this requires more features to be added to Tree
                 // first. Specifically, large values and appending to them.
 
+                final long txnId;
                 final long masterUndoLogId;
+
                 synchronized (mTxnIdLock) {
-                    int count = mUndoLogCount;
-                    if (count == 0) {
-                        masterUndoLog = null;
-                        masterUndoLogId = 0;
+                    txnId = mTxnId;
+
+                    if (resume) {
+                        masterUndoLogId = masterUndoLog == null ? 0 : masterUndoLog.topNodeId();
                     } else {
-                        masterUndoLog = new UndoLog(this, 0);
-                        byte[] workspace = null;
-                        for (UndoLog log = mTopUndoLog; log != null; log = log.mPrev) {
-                            workspace = log.writeToMaster(masterUndoLog, workspace);
+                        int count = mUndoLogCount;
+                        if (count == 0) {
+                            masterUndoLogId = 0;
+                        } else {
+                            masterUndoLog = new UndoLog(this, 0);
+                            byte[] workspace = null;
+                            for (UndoLog log = mTopUndoLog; log != null; log = log.mPrev) {
+                                workspace = log.writeToMaster(masterUndoLog, workspace);
+                            }
+                            masterUndoLogId = masterUndoLog.topNodeId();
+                            if (masterUndoLogId == 0) {
+                                // Nothing was actually written to the log.
+                                masterUndoLog = null;
+                            }
                         }
-                        masterUndoLogId = masterUndoLog.topNodeId();
-                        if (masterUndoLogId == 0) {
-                            // Nothing was actually written to the log.
-                            masterUndoLog = null;
-                        }
+
+                        // Stash it to resume after an aborted checkpoint.
+                        mCommitMasterUndoLog = masterUndoLog;
                     }
                 }
 
-                mPageDb.commit(new PageDb.CommitCallback() {
+                encodeLongLE(header, hoff + I_TRANSACTION_ID, txnId);
+                encodeLongLE(header, hoff + I_MASTER_UNDO_LOG_PAGE_ID, masterUndoLogId);
+
+                mPageDb.commit(resume, header, new PageDb.CommitCallback() {
                     @Override
-                    public byte[] prepare() throws IOException {
-                        return flush(redoNum, redoPos, redoTxnId, masterUndoLogId);
+                    public void prepare(boolean resume, byte[] header) throws IOException {
+                        flush(resume, header);
                     }
                 });
+
+                // Reset for next checkpoint.
+                mCommitHeader = null;
+                mCommitMasterUndoLog = null;
             } catch (IOException e) {
                 if (mCheckpointFlushState == CHECKPOINT_FLUSH_PREPARE) {
                     // Exception was thrown with locks still held.
@@ -4063,7 +4022,7 @@ public final class Database implements CauseCloseable {
 
             if (mEventListener != null) {
                 double duration = (System.nanoTime() - mLastCheckpointNanos) / 1_000_000_000.0;
-                mEventListener.notify(EventType.CHECKPOINT_BEGIN,
+                mEventListener.notify(EventType.CHECKPOINT_COMPLETE,
                                       "Checkpoint completed in %1$1.3f seconds",
                                       duration, TimeUnit.SECONDS);
             }
@@ -4076,21 +4035,26 @@ public final class Database implements CauseCloseable {
      * Method is invoked with exclusive commit lock and shared root node latch
      * held. Both are released by this method.
      */
-    private byte[] flush(final long redoNum, final long redoPos, final long redoTxnId,
-                         final long masterUndoLogId)
-        throws IOException
-    {
-        final long txnId;
-        synchronized (mTxnIdLock) {
-            txnId = mTxnId;
+    private void flush(final boolean resume, final byte[] header) throws IOException {
+        int stateToFlush = mCommitState;
+
+        if (resume) {
+            // Resume after an aborted checkpoint.
+            if (header != mCommitHeader) {
+                throw new AssertionError();
+            }
+            stateToFlush ^= 1;
+        } else {
+            if (!mHasCheckpointed) {
+                mHasCheckpointed = true; // Must be set before switching commit state.
+            }
+            mCommitState = (byte) (stateToFlush ^ 1);
+            mCommitHeader = header;
         }
-        final Node root = mRegistry.mRoot;
-        final long rootId = root.mId;
-        final int stateToFlush = mCommitState;
-        mHasCheckpointed = true; // Must be set before switching commit state.
+
         mCheckpointFlushState = stateToFlush;
-        mCommitState = (byte) (stateToFlush ^ 1);
-        root.releaseShared();
+
+        mRegistry.mRoot.releaseShared();
         mPageDb.exclusiveCommitLock().unlock();
 
         if (mRedoWriter != null) {
@@ -4102,22 +4066,10 @@ public final class Database implements CauseCloseable {
         }
 
         try {
-            mAllocator.flushDirtyNodes(stateToFlush);
+            mDirtyList.flush(mPageDb, stateToFlush);
         } finally {
             mCheckpointFlushState = CHECKPOINT_NOT_FLUSHING;
         }
-
-        byte[] header = new byte[HEADER_SIZE];
-        encodeIntLE(header, I_ENCODING_VERSION, ENCODING_VERSION);
-        encodeLongLE(header, I_ROOT_PAGE_ID, rootId);
-        encodeLongLE(header, I_MASTER_UNDO_LOG_PAGE_ID, masterUndoLogId);
-        encodeLongLE(header, I_TRANSACTION_ID, txnId);
-        encodeLongLE(header, I_CHECKPOINT_NUMBER, redoNum);
-        encodeLongLE(header, I_REDO_TXN_ID, redoTxnId);
-        encodeLongLE(header, I_REDO_POSITION, redoPos);
-        encodeLongLE(header, I_REPL_ENCODING, mRedoWriter == null ? 0 : mRedoWriter.encoding());
-
-        return header;
     }
 
     // Called by DurablePageDb with header latch held.
