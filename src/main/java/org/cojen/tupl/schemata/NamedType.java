@@ -14,7 +14,7 @@
  *  limitations under the License.
  */
 
-package org.cojen.tupl.map;
+package org.cojen.tupl.schemata;
 
 import java.util.Arrays;
 

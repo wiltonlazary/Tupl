@@ -14,7 +14,7 @@
  *  limitations under the License.
  */
 
-package org.cojen.tupl.map;
+package org.cojen.tupl.schemata;
 
 import java.io.IOException;
 
@@ -23,34 +23,40 @@ import org.cojen.tupl.Transaction;
 import org.cojen.tupl.io.Utils;
 
 /**
- * 
+ *
  *
  * @author Brian S O'Neill
  */
-public class MapType extends Type {
-    private static final long HASH_BASE = 7558341980033698328L;
+public class AssembledType extends Type {
+    private static final long HASH_BASE = 3315411704127731845L;
 
-    private final Type mKeyType;
-    private final Type mValueType;
+    private final Type[] mElementTypes;
 
-    MapType(Schemata schemata, long typeId, short flags, Type keyType, Type valueType) {
+    AssembledType(Schemata schemata, long typeId, short flags, Type[] elementTypes) {
         super(schemata, typeId, flags);
-        mKeyType = keyType;
-        mValueType = valueType;
+        mElementTypes = elementTypes;
     }
 
-    public Type getKeyType() {
-        return mKeyType;
-    }
+    public Type[] getElementTypes() {
+        Type[] types = mElementTypes;
+        if (types != null && types.length != 0) {
+            types = types.clone();
+        }
 
-    public Type getValueType() {
-        return mValueType;
+        return types;
     }
 
     @Override
     public boolean isFixedLength() {
-        return mKeyType != null && mKeyType.isFixedLength()
-            && (mValueType == null || mValueType.isFixedLength());
+        Type[] types = mElementTypes;
+        if (types != null) {
+            for (Type t : types) {
+                if (!t.isFixedLength()) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     @Override
@@ -79,55 +85,51 @@ public class MapType extends Type {
 
     @Override
     void appendTo(StringBuilder b) {
-        b.append("MapType");
+        b.append("AssembledType");
         b.append(" {");
         appendCommon(b);
         b.append(", ");
-        b.append("keyType=");
-        appendType(b, mKeyType);
-        b.append(", ");
-        b.append("valueType=");
-        appendType(b, mValueType);
+        b.append("elementTypes=");
+        appendTypes(b, mElementTypes);
         b.append('}');
     }
 
-    static MapType decode(Transaction txn, Schemata schemata, long typeId, byte[] value)
+    static AssembledType decode(Transaction txn, Schemata schemata, long typeId, byte[] value)
         throws IOException
     {
-        if (value[0] != TYPE_PREFIX_MAP) {
+        if (value[0] != TYPE_PREFIX_ASSEMBLED) {
             throw new IllegalArgumentException();
         }
-        return new MapType(schemata, typeId,
-                           (short) Utils.decodeUnsignedShortBE(value, 1), // flags
-                           schemata.decodeType(txn, value, 3),   // keyType
-                           schemata.decodeType(txn, value, 11)); // valueType
+        return new AssembledType(schemata, typeId,
+                                 (short) Utils.decodeUnsignedShortBE(value, 1), // flags
+                                 schemata.decodeTypes(txn, value, 3)); // elementTypes
     }
 
     @Override
     long computeHash() {
-        long hash = mixHash(HASH_BASE + mFlags, mKeyType);
-        hash = mixHash(hash, mValueType);
-        return hash;
+        return mixHash(HASH_BASE + mFlags, mElementTypes);
     }
 
     @Override
     byte[] encodeValue() {
-        byte[] value = new byte[1 + 2 + 8 + 8];
-        value[0] = TYPE_PREFIX_MAP;
+        byte[] value = new byte[1 + 2 + mElementTypes.length * 8];
+        value[0] = TYPE_PREFIX_ASSEMBLED;
         Utils.encodeShortBE(value, 1, mFlags);
-        encodeType(value, 3, mKeyType);
-        encodeType(value, 11, mValueType);
+        int off = 3;
+        for (Type t : mElementTypes) {
+            encodeType(value, off, t);
+            off += 8;
+        }
         return value;
     }
 
     @Override
     @SuppressWarnings("unchecked")
     <T extends Type> T equivalent(T type) {
-        if (type instanceof MapType) {
-            MapType other = (MapType) type;
+        if (type instanceof AssembledType) {
+            AssembledType other = (AssembledType) type;
             if (mFlags == other.mFlags &&
-                equalTypeIds(mKeyType, other.mKeyType) &&
-                equalTypeIds(mValueType, other.mValueType))
+                equalTypeIds(mElementTypes, other.mElementTypes))
             {
                 return (T) this;
             }

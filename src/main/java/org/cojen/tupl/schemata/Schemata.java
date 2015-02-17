@@ -14,7 +14,7 @@
  *  limitations under the License.
  */
 
-package org.cojen.tupl.map;
+package org.cojen.tupl.schemata;
 
 import java.io.IOException;
 
@@ -28,7 +28,7 @@ import org.cojen.tupl.View;
 
 import org.cojen.tupl.io.Utils;
 
-import static org.cojen.tupl.map.NumericType.*;
+import static org.cojen.tupl.schemata.NumericType.*;
 
 /**
  * 

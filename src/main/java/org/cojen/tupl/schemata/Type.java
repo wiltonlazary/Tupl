@@ -14,8 +14,7 @@
  *  limitations under the License.
  */
 
-// FIXME: rename to schemata
-package org.cojen.tupl.map;
+package org.cojen.tupl.schemata;
 
 import java.io.IOException;
 
