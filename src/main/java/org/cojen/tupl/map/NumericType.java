@@ -60,8 +60,6 @@ public final class NumericType extends Type {
     /** Big variable sized floating point decimal value. Bit length and range must be zero. */
     public static final short FORMAT_BIG_FLOAT_DECIMAL = 10;
 
-    // FIXME: Code generation converts one format to another. Don't expose the encoder stuff.
-
     private static final long HASH_BASE = 5353985800091834713L;
 
     private final short mFormat;

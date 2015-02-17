@@ -19,8 +19,6 @@ package org.cojen.tupl.map;
 
 import java.io.IOException;
 
-import org.cojen.tupl.Transaction;
-
 import org.cojen.tupl.io.Utils;
 
 /**
@@ -106,11 +104,6 @@ public abstract class Type {
      * whitespace. Implementation is not expected to be efficient.
      */
     public abstract byte[] parseKey(String str);
-
-    public Codec createCodec(Transaction txn) throws IOException {
-        // FIXME
-        throw null;
-    }
 
     @Override
     public String toString() {
