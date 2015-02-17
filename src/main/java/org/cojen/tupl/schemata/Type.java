@@ -16,6 +16,7 @@
 
 package org.cojen.tupl.schemata;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 
 import org.cojen.tupl.io.Utils;
@@ -39,8 +40,8 @@ public abstract class Type {
     public static final short FLAG_NULL_LOW = 8;
 
     /**
-     * For array and assembled types, set to indicate that elements smaller than one byte are
-     * packed together.
+     * For array and assembled types, set to indicate that non-byte aligned elements are packed
+     * together.
      */
     public static final short FLAG_PACK_ELEMENTS = 16;
 
@@ -83,26 +84,86 @@ public abstract class Type {
     /**
      * Converts the encoded data to a human-readable string. Implementation is not expected to
      * be efficient.
+     *
+     * @param offset bit offset
      */
-    public abstract String printData(byte[] data);
+    public String printData(byte[] data, int offset) {
+        StringBuilder b = new StringBuilder();
+        printData(b, data, offset);
+        return b.toString();
+    }
+
+    /**
+     * Converts the encoded data to a human-readable string. Implementation is not expected to
+     * be efficient.
+     *
+     * @param offset bit offset
+     * @return updated bit offset
+     */
+    public abstract int printData(StringBuilder b, byte[] data, int offset);
 
     /**
      * Converts the encoded key to a human-readable string. Implementation is not expected to
      * be efficient.
+     *
+     * @param offset bit offset
      */
-    public abstract String printKey(byte[] key);
+    public String printKey(byte[] key, int offset) {
+        StringBuilder b = new StringBuilder();
+        printKey(b, key, offset);
+        return b.toString();
+    }
+
+    /**
+     * Converts the encoded key to a human-readable string. Implementation is not expected to
+     * be efficient.
+     *
+     * @param offset bit offset
+     * @return updated bit offset
+     */
+    public abstract int printKey(StringBuilder b, byte[] key, int offset);
 
     /**
      * Converts a printed string to encoded data. Parser is strict except with respect to
      * whitespace. Implementation is not expected to be efficient.
+     *
+     * @param offset character offset
      */
-    public abstract byte[] parseData(String str);
+    public byte[] parseData(String str, int offset) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        parseData(out, str, offset);
+        return out.toByteArray();
+    }
+
+    /**
+     * Converts a printed string to encoded data. Parser is strict except with respect to
+     * whitespace. Implementation is not expected to be efficient.
+     *
+     * @param offset character offset
+     * @return updated character offset
+     */
+    public abstract int parseData(ByteArrayOutputStream out, String str, int offset);
 
     /**
      * Converts a printed string to an encoded key. Parser is strict except with respect to
      * whitespace. Implementation is not expected to be efficient.
+     *
+     * @param offset character offset
      */
-    public abstract byte[] parseKey(String str);
+    public byte[] parseKey(String str, int offset) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        parseKey(out, str, offset);
+        return out.toByteArray();
+    }
+
+    /**
+     * Converts a printed string to an encoded key. Parser is strict except with respect to
+     * whitespace. Implementation is not expected to be efficient.
+     *
+     * @param offset character offset
+     * @return updated character offset
+     */
+    public abstract int parseKey(ByteArrayOutputStream out, String str, int offset);
 
     @Override
     public String toString() {

@@ -16,6 +16,7 @@
 
 package org.cojen.tupl.schemata;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 
 import org.cojen.tupl.Transaction;
@@ -57,25 +58,25 @@ public class PolymorphicType extends Type {
     }
 
     @Override
-    public String printData(byte[] data) {
+    public int printData(StringBuilder b, byte[] data, int offset) {
         // FIXME
         throw null;
     }
 
     @Override
-    public String printKey(byte[] data) {
+    public int printKey(StringBuilder b, byte[] data, int offset) {
         // FIXME
         throw null;
     }
 
     @Override
-    public byte[] parseData(String str) {
+    public int parseData(ByteArrayOutputStream out, String str, int offset) {
         // FIXME
         throw null;
     }
 
     @Override
-    public byte[] parseKey(String str) {
+    public int parseKey(ByteArrayOutputStream out, String str, int offset) {
         // FIXME
         throw null;
     }

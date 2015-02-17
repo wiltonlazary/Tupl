@@ -63,6 +63,10 @@ public class Schemata {
 
         UnicodeType t7 = s.defineUnicodeType(t2, UnicodeType.ENCODING_UTF_32);
         System.out.println(t7);
+
+        System.out.println("----");
+
+        System.out.println(t1.printData(new byte[] {1, 2, 3, 4, 5}, 1));
     }
 
     private static final byte PRIMARY_IX_PREFIX = 1, HASH_IX_PREFIX = 2;
@@ -150,6 +154,7 @@ public class Schemata {
         }
     }
 
+    // FIXME: Use NumericType for length, unless length is fixed.
     public ArrayType defineArrayType(int flags, Type elementType, long minLength, long maxRange)
         throws IOException
     {

@@ -16,6 +16,8 @@
 
 package org.cojen.tupl.schemata;
 
+import java.io.ByteArrayOutputStream;
+
 import java.math.BigInteger;
 
 import org.cojen.tupl.io.Utils;
@@ -93,49 +95,99 @@ public final class NumericType extends Type {
     }
 
     @Override
-    public String printData(byte[] data) {
-        if (data == null) {
-            return "null";
-        }
-
-        data = toBigEndian(data);
-
+    public int printData(StringBuilder b, byte[] data, int offset) {
         switch (mFormat) {
-            // FIXME: honor bit length
-            // FIXME: non-divisible-by-8 length
         case FORMAT_FIXED_INTEGER:
-            return new BigInteger(data).toString();
+            switch (mMinBitLength) {
+            case 8:
+                b.append(decodeByte(data, offset));
+                break;
+            case 16:
+                b.append((short) decodeUnsignedShort(data, offset));
+                break;
+            case 32:
+                b.append(decodeInt(data, offset));
+                break;
+            case 64:
+                b.append(decodeLong(data, offset));
+                break;
+            default:
+                b.append(new BigInteger(normalize(data, offset)));
+                break;
+            }
+            return mMinBitLength;
 
-            // FIXME: honor bit length
-            // FIXME: non-divisible-by-8 length
         case FORMAT_FIXED_INTEGER_UNSIGNED:
-            return new BigInteger(1, data).toString();
+            switch (mMinBitLength) {
+            case 8:
+                b.append(decodeByte(data, offset) & 0xff);
+                break;
+            case 16:
+                b.append(decodeUnsignedShort(data, offset));
+                break;
+            case 32:
+                b.append(decodeInt(data, offset) & 0xffffffffL);
+                break;
+            default:
+                b.append(new BigInteger(1, normalize(data, offset)));
+                break;
+            }
+            return mMinBitLength;
 
         case FORMAT_FIXED_FLOAT:
-        case FORMAT_FIXED_FLOAT_DECIMAL:
-        case FORMAT_VARIABLE_INTEGER:
-        case FORMAT_VARIABLE_INTEGER_UNSIGNED:
-        case FORMAT_BIG_INTEGER:
-        case FORMAT_BIG_FLOAT_DECIMAL:
-        }
+            switch (mMinBitLength) {
+            case 32:
+                b.append(Float.intBitsToFloat(decodeInt(data, offset)));
+                break;
+            case 64:
+                b.append(Double.longBitsToDouble(decodeLong(data, offset)));
+                break;
+            default:
+                // FIXME: support 16-bit and 128-bit formats
+                throw new IllegalArgumentException();
+            }
+            return mMinBitLength;
 
-        // FIXME
-        throw null;
+        case FORMAT_FIXED_FLOAT_DECIMAL:
+            // FIXME: support float decimal
+            throw new IllegalArgumentException();
+
+        case FORMAT_VARIABLE_INTEGER:
+            // FIXME: support variable integer
+            throw new IllegalArgumentException();
+
+        case FORMAT_VARIABLE_INTEGER_UNSIGNED:
+            // FIXME: support variable integer
+            throw new IllegalArgumentException();
+
+        case FORMAT_BIG_INTEGER:
+            // FIXME: support big integer
+            throw new IllegalArgumentException();
+
+        case FORMAT_BIG_FLOAT_DECIMAL:
+            // FIXME: support big decimal
+            throw new IllegalArgumentException();
+
+        default:
+            throw new IllegalArgumentException();
+        }
     }
 
     @Override
-    public String printKey(byte[] data) {
-        if (data == null) {
-            return "null";
-        }
-
-        data = toBigEndian(data);
-
+    public int printKey(StringBuilder b, byte[] data, int offset) {
         // FIXME
         throw null;
     }
 
-    private byte[] toBigEndian(byte[] data) {
+    private byte[] normalize(byte[] data, int offset) {
+        byte[] norm = new byte[(mMinBitLength + 7) >>> 3];
+
+        for (int i=0; i<norm.length; i++) {
+            // FIXME
+        }
+
+        // FIXME: honor bit length
+        // FIXME: non-divisible-by-8 length
         if ((mFlags & FLAG_LITTLE_ENDIAN) != 0) {
             byte[] newData = new byte[data.length];
             for (int i=0; i<data.length; i++) {
@@ -146,14 +198,100 @@ public final class NumericType extends Type {
         return data;
     }
 
+    private static byte decodeByte(byte[] data, int offset) {
+        int i = offset >>> 3;
+        int r = offset & 7;
+        if (r == 0) {
+            return data[i];
+        } else {
+            return decodeByteUnaligned(data, i, r);
+        }
+    }
+
+    private static byte decodeByteUnaligned(byte[] data, int i, int r) {
+        return (byte) ((data[i] << r) | ((data[i + 1] & 0xff) >> (8 - r)));
+    }
+
+    private int decodeUnsignedShort(byte[] data, int offset) {
+        int i = offset >>> 3;
+        int r = offset & 7;
+        if (r == 0) {
+            if ((mFlags & FLAG_LITTLE_ENDIAN) != 0) {
+                return Utils.decodeUnsignedShortLE(data, i);
+            } else {
+                return Utils.decodeUnsignedShortBE(data, i);
+            }
+        } else {
+            return decodeUnsignedShortUnaligned(mFlags, data, i, r);
+        }
+    }
+
+    private static int decodeUnsignedShortUnaligned(int flags, byte[] data, int i, int r) {
+        if ((flags & FLAG_LITTLE_ENDIAN) != 0) {
+            return ((decodeByteUnaligned(data, i + 1, r) & 0xff) << 8)
+                | (decodeByteUnaligned(data, i, r)) & 0xff;
+        } else {
+            return ((decodeByteUnaligned(data, i, r) & 0xff) << 8)
+                | (decodeByteUnaligned(data, i + 1, r) & 0xff);
+        }
+    }
+
+    private int decodeInt(byte[] data, int offset) {
+        int i = offset >>> 3;
+        int r = offset & 7;
+        if (r == 0) {
+            if ((mFlags & FLAG_LITTLE_ENDIAN) != 0) {
+                return Utils.decodeIntLE(data, i);
+            } else {
+                return Utils.decodeIntBE(data, i);
+            }
+        } else {
+            return decodeIntUnaligned(mFlags, data, i, r);
+        }
+    }
+
+    private static int decodeIntUnaligned(int flags, byte[] data, int i, int r) {
+        if ((flags & FLAG_LITTLE_ENDIAN) != 0) {
+            return (decodeUnsignedShortUnaligned(flags, data, i + 2, r) << 16)
+                | decodeUnsignedShortUnaligned(flags, data, i, r);
+        } else {
+            return (decodeUnsignedShortUnaligned(flags, data, i, r) << 16)
+                | decodeUnsignedShortUnaligned(flags, data, i + 2, r);
+        }
+    }
+
+    private long decodeLong(byte[] data, int offset) {
+        int i = offset >>> 3;
+        int r = offset & 7;
+        if (r == 0) {
+            if ((mFlags & FLAG_LITTLE_ENDIAN) != 0) {
+                return Utils.decodeLongLE(data, i);
+            } else {
+                return Utils.decodeLongBE(data, i);
+            }
+        } else {
+            return decodeLongUnaligned(mFlags, data, i, r);
+        }
+    }
+
+    private static long decodeLongUnaligned(int flags, byte[] data, int i, int r) {
+        if ((flags & FLAG_LITTLE_ENDIAN) != 0) {
+            return (((long) decodeIntUnaligned(flags, data, i + 4, r)) << 32)
+                | (decodeIntUnaligned(flags, data, i, r) & 0xffffffffL);
+        } else {
+            return (((long) decodeIntUnaligned(flags, data, i, r)) << 32)
+                | (decodeIntUnaligned(flags, data, i + 4, r) & 0xffffffffL);
+        }
+    }
+
     @Override
-    public byte[] parseData(String str) {
+    public int parseData(ByteArrayOutputStream out, String str, int offset) {
         // FIXME
         throw null;
     }
 
     @Override
-    public byte[] parseKey(String str) {
+    public int parseKey(ByteArrayOutputStream out, String str, int offset) {
         // FIXME
         throw null;
     }
