@@ -91,7 +91,7 @@ final class TreeValueStream extends AbstractStream {
 
     @Override
     public void setLength(long length) throws IOException {
-        // FIXME: txn undo/redo; be careful with large keys to avoid redo corruption
+        // FIXME: txn undo/redo
         try {
             if (length < 0) {
                 mCursor.store(null);
@@ -131,7 +131,7 @@ final class TreeValueStream extends AbstractStream {
 
     @Override
     void doWrite(long pos, byte[] buf, int off, int len) throws IOException {
-        // FIXME: txn undo/redo; be careful with large keys to avoid redo corruption
+        // FIXME: txn undo/redo
         try {
             final TreeCursorFrame leaf = mCursor.leafExclusiveNotSplit();
 
@@ -197,10 +197,10 @@ final class TreeValueStream extends AbstractStream {
 
         final byte[] page = node.mPage;
         int loc = decodeUnsignedShortLE(page, node.mSearchVecStart + nodePos);
-        int header = page[loc++];
-        loc += (header >= 0 ? header : (((header & 0x3f) << 8) | (page[loc] & 0xff))) + 1;
+        // Skip the key.
+        loc += Node.keyLengthAtLoc(page, loc);
 
-        header = page[loc++];
+        int header = page[loc++];
         if (header >= 0) {
             // Not fragmented.
             return pos >= header ? -1 : 0;
@@ -217,7 +217,7 @@ final class TreeValueStream extends AbstractStream {
             return -1;
         }
 
-        if ((header & Node.VALUE_FRAGMENTED) == 0) {
+        if ((header & Node.ENTRY_FRAGMENTED) == 0) {
             // Not fragmented.
             return pos >= len ? -1 : 0;
         }
@@ -324,13 +324,12 @@ final class TreeValueStream extends AbstractStream {
         byte[] page = node.mPage;
         int loc = decodeUnsignedShortLE(page, node.mSearchVecStart + nodePos);
         // Skip the key.
-        int header = page[loc++];
-        loc += (header >= 0 ? header : (((header & 0x3f) << 8) | (page[loc] & 0xff))) + 1;
+        loc += Node.keyLengthAtLoc(page, loc);
 
         int vHeaderLoc = loc;
         long vLen;
 
-        header = page[loc++];
+        int header = page[loc++];
         nf: {
             if (header >= 0) {
                 vLen = header;
@@ -357,7 +356,7 @@ final class TreeValueStream extends AbstractStream {
                     throw null;
                 }
 
-                if ((header & Node.VALUE_FRAGMENTED) != 0) {
+                if ((header & Node.ENTRY_FRAGMENTED) != 0) {
                     // Value is fragmented.
                     break nf;
                 }
@@ -471,7 +470,7 @@ final class TreeValueStream extends AbstractStream {
             byte[] oldValue = new byte[(int) vLen];
             System.arraycopy(page, loc, oldValue, 0, oldValue.length);
 
-            node.deleteLeafEntry(mCursor.mTree, nodePos);
+            node.deleteLeafEntry(nodePos);
             frame.mNodePos = ~nodePos;
 
             // Method releases latch if an exception is thrown.
