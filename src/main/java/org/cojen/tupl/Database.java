@@ -3456,6 +3456,17 @@ public final class Database implements CauseCloseable, Flushable {
     }
 
     /**
+     * Reconstruct a fragmented key.
+     */
+    byte[] reconstructKey(byte[] fragmented, int off, int len) throws IOException {
+        try {
+            return reconstruct(fragmented, off, len);
+        } catch (LargeValueException e) {
+            throw new LargeKeyException(e.getLength(), e.getCause());
+        }
+    }
+
+    /**
      * Reconstruct a fragmented value.
      */
     byte[] reconstruct(byte[] fragmented, int off, int len) throws IOException {
