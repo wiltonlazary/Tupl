@@ -267,21 +267,16 @@ final class Node extends Latch implements DatabaseAccess {
         mSearchVecEnd = 0;
     }
 
-    /**
-     * @param full when false, only wrap the page instance
-     */
-    Node cloneNode(boolean full) {
+    Node cloneNode() {
         Node newNode = new Node(mUsageList, mPage);
-        if (full) {
-            newNode.mId = mId;
-            newNode.mCachedState = mCachedState;
-            newNode.mType = mType;
-            newNode.mGarbage = mGarbage;
-            newNode.mLeftSegTail = mLeftSegTail;
-            newNode.mRightSegTail = mRightSegTail;
-            newNode.mSearchVecStart = mSearchVecStart;
-            newNode.mSearchVecEnd = mSearchVecEnd;
-        }
+        newNode.mId = mId;
+        newNode.mCachedState = mCachedState;
+        newNode.mType = mType;
+        newNode.mGarbage = mGarbage;
+        newNode.mLeftSegTail = mLeftSegTail;
+        newNode.mRightSegTail = mRightSegTail;
+        newNode.mSearchVecStart = mSearchVecStart;
+        newNode.mSearchVecEnd = mSearchVecEnd;
         return newNode;
     }
 
@@ -372,7 +367,26 @@ final class Node extends Latch implements DatabaseAccess {
                 Node childNode = tree.mDatabase.mTreeNodeMap.get(childId);
 
                 childCheck: if (childNode != null) {
-                    childNode.acquireShared();
+                    latchChild: if (!childNode.tryAcquireShared()) {
+                        if (!exclusiveHeld) {
+                            childNode.acquireShared();
+                            break latchChild;
+                        }
+                        // If exclusive latch is held, then this node was just loaded. If child
+                        // node cannot be immediately latched, it might have been evicted out
+                        // of order. This can create a deadlock with a thread that may hold the
+                        // exclusive latch and is now trying to latch this node.
+                        if (childId != childNode.mId) {
+                            break childCheck;
+                        }
+                        if (!childNode.tryAcquireShared()) {
+                            // Be safe and start over with a Cursor. It doesn't have the same
+                            // deadlock potential, because it prevents visited nodes from being
+                            // evicted.
+                            node.releaseExclusive();
+                            return searchWithCursor(tree, key);
+                        }
+                    }
 
                     // Need to check again in case evict snuck in.
                     if (childId != childNode.mId) {
@@ -451,15 +465,7 @@ final class Node extends Latch implements DatabaseAccess {
                         parentLatch.releaseShared();
                     }
                     // Retry with a cursor, which is reliable, but slower.
-                    TreeCursor cursor = new TreeCursor(tree, Transaction.BOGUS);
-                    try {
-                        cursor.find(key);
-                        byte[] value = cursor.value();
-                        cursor.reset();
-                        return value;
-                    } catch (Throwable e) {
-                        throw closeOnFailure(cursor, e);
-                    }
+                    return searchWithCursor(tree, key);
                 }
 
                 exclusiveHeld = true;
@@ -641,6 +647,18 @@ final class Node extends Latch implements DatabaseAccess {
         }
 
         return childNode;
+    }
+
+    private static byte[] searchWithCursor(Tree tree, byte[] key) throws IOException {
+        TreeCursor cursor = new TreeCursor(tree, Transaction.BOGUS);
+        try {
+            cursor.find(key);
+            byte[] value = cursor.value();
+            cursor.reset();
+            return value;
+        } catch (Throwable e) {
+            throw closeOnFailure(cursor, e);
+        }
     }
 
     /**
@@ -2109,7 +2127,7 @@ final class Node extends Latch implements DatabaseAccess {
             encodeNormalKey(newKey, parentPage, parentKeyLoc);
             parent.mGarbage -= parentKeyGrowth;
         } else {
-            parent.updateInternalKey(childPos - 2, parentKeyGrowth, newKey, -1, newKeyLen);
+            parent.updateInternalKey(childPos - 2, parentKeyGrowth, newKey, newKeyLen);
         }
 
         int garbageAccum = 0;
@@ -2301,7 +2319,7 @@ final class Node extends Latch implements DatabaseAccess {
             encodeNormalKey(newKey, parentPage, parentKeyLoc);
             parent.mGarbage -= parentKeyGrowth;
         } else {
-            parent.updateInternalKey(childPos, parentKeyGrowth, newKey, -1, newKeyLen);
+            parent.updateInternalKey(childPos, parentKeyGrowth, newKey, newKeyLen);
         }
 
         int garbageAccum = 0;
@@ -2790,7 +2808,7 @@ final class Node extends Latch implements DatabaseAccess {
             arraycopy(rightPage, searchKeyLoc, parentPage, parentKeyLoc, searchKeyLen);
             parent.mGarbage -= parentKeyGrowth;
         } else {
-            parent.updateInternalKey
+            parent.updateInternalKeyEncoded
                 (childPos - 2, parentKeyGrowth, rightPage, searchKeyLoc, searchKeyLen);
         }
 
@@ -2976,7 +2994,7 @@ final class Node extends Latch implements DatabaseAccess {
             arraycopy(leftPage, searchKeyLoc, parentPage, parentKeyLoc, searchKeyLen);
             parent.mGarbage -= parentKeyGrowth;
         } else {
-            parent.updateInternalKey
+            parent.updateInternalKeyEncoded
                 (childPos, parentKeyGrowth, leftPage, searchKeyLoc, searchKeyLen);
         }
 
@@ -3238,14 +3256,38 @@ final class Node extends Latch implements DatabaseAccess {
     /**
      * Update an internal node key to be larger than what is currently allocated. Caller must
      * ensure that node has enough space available and that it's not split. New key must not
-     * force this node to split. If key is unencoded, it MUST be a normal key.
+     * force this node to split. Key MUST be a normal, non-fragmented key.
      *
      * @param pos must be positive
      * @param growth key size growth
-     * @param key unencoded or encoded key (encoded includes header)
-     * @param keyStart pass -1 if key is unencoded and starts at 0; >=0 for encoded key
+     * @param key normal unencoded key
      */
-    void updateInternalKey(int pos, int growth, byte[] key, int keyStart, int encodedLen) {
+    void updateInternalKey(int pos, int growth, byte[] key, int encodedLen) {
+        int entryLoc = doUpdateInternalKey(pos, growth, encodedLen);
+        encodeNormalKey(key, mPage, entryLoc);
+    }
+
+    /**
+     * Update an internal node key to be larger than what is currently allocated. Caller must
+     * ensure that node has enough space available and that it's not split. New key must not
+     * force this node to split.
+     *
+     * @param pos must be positive
+     * @param growth key size growth
+     * @param key page with encoded key
+     * @param keyStart encoded key start; includes header
+     */
+    void updateInternalKeyEncoded(int pos, int growth,
+                                  byte[] key, int keyStart, int encodedLen)
+    {
+        int entryLoc = doUpdateInternalKey(pos, growth, encodedLen);
+        arraycopy(key, keyStart, mPage, entryLoc, encodedLen);
+    }
+
+    /**
+     * @return entryLoc
+     */
+    int doUpdateInternalKey(int pos, final int growth, final int encodedLen) {
         int garbage = mGarbage + encodedLen - growth;
 
         // What follows is similar to createInternalEntry method, except the search
@@ -3257,8 +3299,6 @@ final class Node extends Latch implements DatabaseAccess {
         int leftSpace = searchVecStart - mLeftSegTail;
         int rightSpace = mRightSegTail - searchVecEnd
             - ((searchVecEnd - searchVecStart) << 2) - 17;
-
-        byte[] page = mPage;
 
         int entryLoc;
         alloc: {
@@ -3304,6 +3344,7 @@ final class Node extends Latch implements DatabaseAccess {
                     break makeRoom;
                 }
 
+                byte[] page = mPage;
                 arraycopy(page, searchVecStart, page, newSearchVecStart, vecLen + childIdsLen);
 
                 pos += newSearchVecStart;
@@ -3316,26 +3357,15 @@ final class Node extends Latch implements DatabaseAccess {
             // This point is reached for making room via node compaction.
 
             mGarbage = garbage;
-            entryLoc = compactInternal(encodedLen, pos, Integer.MIN_VALUE).mEntryLoc;
-
-            if (keyStart >= 0) {
-                arraycopy(key, keyStart, mPage, entryLoc, encodedLen);
-            } else {
-                encodeNormalKey(key, mPage, entryLoc);
-            }
-
-            return;
+            return compactInternal(encodedLen, pos, Integer.MIN_VALUE).mEntryLoc;
         }
 
-        // Copy new key and point to it.
-        if (keyStart >= 0) {
-            arraycopy(key, keyStart, page, entryLoc, encodedLen);
-        } else {
-            encodeNormalKey(key, page, entryLoc);
-        }
-        encodeShortLE(page, pos, entryLoc);
+        // Point to entry. Caller must copy the key to the location.
+        encodeShortLE(mPage, pos, entryLoc);
 
         mGarbage = garbage;
+
+        return entryLoc;
     }
 
     /**
@@ -3849,7 +3879,7 @@ final class Node extends Latch implements DatabaseAccess {
         final int searchVecEnd = mSearchVecEnd;
 
         Database db = getDatabase();
-        byte[] dest = db.removeSpareBuffer();
+        byte[] dest = db.removeSparePage();
 
         for (; searchVecLoc <= searchVecEnd; searchVecLoc += 2, newSearchVecLoc += 2) {
             if (searchVecLoc == pos) {
@@ -3868,7 +3898,7 @@ final class Node extends Latch implements DatabaseAccess {
         }
 
         // Recycle old page buffer.
-        db.addSpareBuffer(page);
+        db.addSparePage(page);
 
         // Write pointer to new allocation.
         encodeShortLE(dest, newLoc == 0 ? newSearchVecLoc : newLoc, destLoc);
@@ -4659,7 +4689,7 @@ final class Node extends Latch implements DatabaseAccess {
         final int searchVecEnd = mSearchVecEnd;
 
         Database db = getDatabase();
-        byte[] dest = db.removeSpareBuffer();
+        byte[] dest = db.removeSparePage();
 
         for (; searchVecLoc <= searchVecEnd; searchVecLoc += 2, newSearchVecLoc += 2) {
             if (searchVecLoc == keyPos) {
@@ -4698,7 +4728,7 @@ final class Node extends Latch implements DatabaseAccess {
         }
 
         // Recycle old page buffer.
-        db.addSpareBuffer(page);
+        db.addSparePage(page);
 
         // Write pointer to key entry.
         encodeShortLE(dest, newLoc, destLoc);
