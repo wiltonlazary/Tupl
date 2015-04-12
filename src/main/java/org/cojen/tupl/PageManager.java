@@ -253,36 +253,15 @@ final class PageManager {
         }
     }
 
-    /**
-     * Allocates pages for immediate use.
-     *
-     * @return actual amount allocated
-     */
-    public long allocatePages(long pageCount) throws IOException {
-        if (pageCount <= 0) {
-            return 0;
+    public void allocAndRecyclePage() throws IOException {
+        long pageId;
+        mRemoveLock.lock();
+        try {
+            pageId = mTotalPageCount++;
+        } finally {
+            mRemoveLock.unlock();
         }
-
-        PageDb.Stats stats = new PageDb.Stats();
-        addTo(stats);
-        pageCount -= stats.freePages;
-
-        if (pageCount <= 0) {
-            return 0;
-        }
-
-        for (int i=0; i<pageCount; i++) {
-            long pageId;
-            mRemoveLock.lock();
-            try {
-                pageId = mTotalPageCount++;
-            } finally {
-                mRemoveLock.unlock();
-            }
-            recyclePage(pageId);
-        }
-
-        return pageCount;
+        recyclePage(pageId);
     }
 
     /**
@@ -355,7 +334,11 @@ final class PageManager {
         throws IOException
     {
         Lock sharedCommitLock = commitLock.readLock();
-        long target = list.getRemoveScanTarget();
+
+        long target;
+        mRemoveLock.lock();
+        target = list.getRemoveScanTarget();
+        mRemoveLock.unlock();
 
         sharedCommitLock.lock();
         try {
