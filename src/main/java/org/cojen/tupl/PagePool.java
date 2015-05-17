@@ -23,14 +23,14 @@ package org.cojen.tupl;
  */
 final class PagePool extends Latch {
     private final transient WaitQueue mQueue;
-    private final byte[][] mPool;
+    private final /*P*/ byte[][] mPool;
     private int mPos;
 
     PagePool(int pageSize, int poolSize) {
         mQueue = new WaitQueue();
-        byte[][] pool = new byte[poolSize][];
+        /*P*/ byte[][] pool = PageOps.p_allocArray(poolSize);
         for (int i=0; i<poolSize; i++) {
-            pool[i] = new byte[pageSize];
+            pool[i] = PageOps.p_calloc(pageSize);
         }
         mPool = pool;
         mPos = poolSize;
@@ -39,7 +39,7 @@ final class PagePool extends Latch {
     /**
      * Remove a page from the pool, waiting for one to become available if necessary.
      */
-    byte[] remove() {
+    /*P*/ byte[] remove() {
         acquireExclusive();
         try {
             int pos;
@@ -55,7 +55,7 @@ final class PagePool extends Latch {
     /**
      * Add a previously removed page back into the pool.
      */
-    void add(byte[] page) {
+    void add(/*P*/ byte[] page) {
         acquireExclusive();
         try {
             int pos = mPos;
@@ -63,6 +63,22 @@ final class PagePool extends Latch {
             // Adjust pos after assignment to prevent harm if an array bounds exception was thrown.
             mPos = pos + 1;
             mQueue.signal();
+        } finally {
+            releaseExclusive();
+        }
+    }
+
+    /**
+     * Must be called when object is no longer referenced.
+     */
+    void delete() {
+        acquireExclusive();
+        try {
+            for (int i=0; i<mPos; i++) {
+                /*P*/ byte[] page = mPool[i];
+                mPool[i] = PageOps.p_null();
+                PageOps.p_delete(page);
+            }
         } finally {
             releaseExclusive();
         }

@@ -22,6 +22,8 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.IntBuffer;
 
+import static org.cojen.tupl.PageOps.*;
+
 /**
  * Page cache which uses direct buffers and very few Java objects, eliminating garbage
  * collection overhead. Caller should scramble page ids to reduce hash collisions.
@@ -105,7 +107,7 @@ final class DirectPageCache extends Latch implements PageCache {
 
     @Override
     public boolean add(final long pageId,
-                       final byte[] page, final int offset, final int length,
+                       final /*P*/ byte[] page, final int offset, final int length,
                        final boolean canEvict)
     {
         acquireExclusive();
@@ -128,7 +130,7 @@ final class DirectPageCache extends Latch implements PageCache {
                     if (getPageId(nodes, ptr) == pageId) {
                         // Found it.
                         mData.position((ptr / NODE_SIZE_IN_INTS) * mPageSize);
-                        mData.put(page, offset, length);
+                        p_copyToBB(page, offset, mData, length);
 
                         if (ptr != mMostRecentPtr) {
                             // Move to most recent.
@@ -197,7 +199,7 @@ final class DirectPageCache extends Latch implements PageCache {
 
             // Copy page into the data buffer.
             mData.position((ptr / NODE_SIZE_IN_INTS) * mPageSize);
-            mData.put(page, offset, length);
+            p_copyToBB(page, offset, mData, length);
 
             // Add new entry into the hashtable.
             nodes.put(ptr + CHAIN_NEXT_PTR_FIELD, hashTable[index]);
@@ -212,7 +214,7 @@ final class DirectPageCache extends Latch implements PageCache {
 
     @Override
     public boolean copy(final long pageId, final int start,
-                        final byte[] page, final int offset, final int length)
+                        final /*P*/ byte[] page, final int offset, final int length)
     {
         acquireShared();
         try {
@@ -233,7 +235,7 @@ final class DirectPageCache extends Latch implements PageCache {
                     if (getPageId(nodes, ptr) == pageId) {
                         // Found it.
                         mData.position(((ptr / NODE_SIZE_IN_INTS) * mPageSize) + start);
-                        mData.get(page, offset, length);
+                        p_copyFromBB(mData, page, offset, length);
                         return true;
                     }
                     if (chainNextPtr < 0) {
@@ -252,7 +254,7 @@ final class DirectPageCache extends Latch implements PageCache {
 
     @Override
     public boolean remove(final long pageId,
-                          final byte[] page, final int offset, final int length)
+                          final /*P*/ byte[] page, final int offset, final int length)
     {
         acquireExclusive();
         try {
@@ -273,10 +275,10 @@ final class DirectPageCache extends Latch implements PageCache {
                     if (getPageId(nodes, ptr) == pageId) {
                         // Found it.
 
-                        if (page != null) {
+                        if (page != PageOps.p_null()) {
                             // Copy data buffer into the page.
                             mData.position((ptr / NODE_SIZE_IN_INTS) * mPageSize);
-                            mData.get(page, offset, length);
+                            p_copyFromBB(mData, page, offset, length);
                         }
 
                         if (ptr != mLeastRecentPtr) {

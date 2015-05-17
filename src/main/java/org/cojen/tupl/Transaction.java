@@ -738,14 +738,14 @@ public class Transaction extends Locker {
      * Caller must hold commit lock.
      *
      * @param op OP_UNUPDATE or OP_UNDELETE
-     * @param payload Node-encoded key/value entry
+     * @param payload page with Node-encoded key/value entry
      */
-    final void pushUndoStore(long indexId, byte op, byte[] payload, int off, int len)
+    final void pushUndoStore(long indexId, byte op, /*P*/ byte[] payload, int off, int len)
         throws IOException
     {
         check();
         try {
-            undoLog().push(indexId, op, payload, off, len);
+            PageOps.p_undoPush(undoLog(), indexId, op, payload, off, len);
         } catch (Throwable e) {
             throw borked(e, false);
         }

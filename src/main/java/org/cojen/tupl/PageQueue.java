@@ -28,7 +28,8 @@ import org.cojen.tupl.io.PageArray;
 
 import static org.cojen.tupl.PageManager.ALLOC_NORMAL;
 import static org.cojen.tupl.PageManager.ALLOC_RESERVE;
-import static org.cojen.tupl.Utils.*;
+import static org.cojen.tupl.PageOps.*;
+import static org.cojen.tupl.Utils.scramble;
 
 /**
  * Used by PageManager to implement free lists.
@@ -87,7 +88,7 @@ final class PageQueue implements IntegerRef {
     // These fields are guarded by remove lock provided by caller.
     private long mRemovePageCount;
     private long mRemoveNodeCount;
-    private final byte[] mRemoveHead;
+    private final /*P*/ byte[] mRemoveHead;
     private long mRemoveHeadId;
     private int mRemoveHeadOffset;
     private long mRemoveHeadFirstPageId;
@@ -103,7 +104,7 @@ final class PageQueue implements IntegerRef {
     // These fields are guarded by mAppendLock.
     private final ReentrantLock mAppendLock;
     private final IdHeap mAppendHeap;
-    private final byte[] mAppendTail;
+    private final /*P*/ byte[] mAppendTail;
     private volatile long mAppendTailId;
     private long mAppendPageCount;
     private long mAppendNodeCount;
@@ -112,8 +113,8 @@ final class PageQueue implements IntegerRef {
     /**
      * Returns true if a valid PageQueue instance is encoded in the header.
      */
-    static boolean exists(byte[] header, int offset) {
-        return decodeLongLE(header, offset + I_REMOVE_HEAD_ID) != 0;
+    static boolean exists(/*P*/ byte[] header, int offset) {
+        return p_longGetLE(header, offset + I_REMOVE_HEAD_ID) != 0;
     }
 
     /**
@@ -143,7 +144,7 @@ final class PageQueue implements IntegerRef {
         mAggressive = aggressive;
         PageArray array = manager.pageArray();
 
-        mRemoveHead = new byte[array.pageSize()];
+        mRemoveHead = p_calloc(array.pageSize());
 
         if (appendLock == null) {
             // This lock must be reentrant. The appendPage method can call into
@@ -158,7 +159,15 @@ final class PageQueue implements IntegerRef {
         }
 
         mAppendHeap = new IdHeap(array.pageSize() - I_NODE_START);
-        mAppendTail = new byte[array.pageSize()];
+        mAppendTail = p_calloc(array.pageSize());
+    }
+
+    /**
+     * Must be called when object is no longer referenced.
+     */
+    void delete() {
+        p_delete(mRemoveHead);
+        p_delete(mAppendTail);
     }
 
     /**
@@ -192,22 +201,22 @@ final class PageQueue implements IntegerRef {
     /**
      * Initialize a restored queue. Caller must hold append and remove locks.
      */
-    void init(byte[] header, int offset) throws IOException {
-        mRemovePageCount = decodeLongLE(header, offset + I_REMOVE_PAGE_COUNT);
-        mRemoveNodeCount = decodeLongLE(header, offset + I_REMOVE_NODE_COUNT);
+    void init(/*P*/ byte[] header, int offset) throws IOException {
+        mRemovePageCount = p_longGetLE(header, offset + I_REMOVE_PAGE_COUNT);
+        mRemoveNodeCount = p_longGetLE(header, offset + I_REMOVE_NODE_COUNT);
 
-        mRemoveHeadId = decodeLongLE(header, offset + I_REMOVE_HEAD_ID);
-        mRemoveHeadOffset = decodeIntLE(header, offset + I_REMOVE_HEAD_OFFSET);
-        mRemoveHeadFirstPageId = decodeLongLE(header, offset + I_REMOVE_HEAD_FIRST_PAGE_ID);
+        mRemoveHeadId = p_longGetLE(header, offset + I_REMOVE_HEAD_ID);
+        mRemoveHeadOffset = p_intGetLE(header, offset + I_REMOVE_HEAD_OFFSET);
+        mRemoveHeadFirstPageId = p_longGetLE(header, offset + I_REMOVE_HEAD_FIRST_PAGE_ID);
 
-        mAppendHeadId = mAppendTailId = decodeLongLE(header, offset + I_APPEND_HEAD_ID);
+        mAppendHeadId = mAppendTailId = p_longGetLE(header, offset + I_APPEND_HEAD_ID);
 
         if (mRemoveHeadId == 0) {
             mRemoveStoppedId = mAppendHeadId;
         } else {
             mManager.pageArray().readPage(mRemoveHeadId, mRemoveHead);
             if (mRemoveHeadFirstPageId == 0) {
-                mRemoveHeadFirstPageId = decodeLongBE(mRemoveHead, I_FIRST_PAGE_ID);
+                mRemoveHeadFirstPageId = p_longGetBE(mRemoveHead, I_FIRST_PAGE_ID);
             }
         }
     }
@@ -285,10 +294,10 @@ final class PageQueue implements IntegerRef {
 
             mRemovePageCount--;
 
-            final byte[] head = mRemoveHead;
-            if (mRemoveHeadOffset < head.length) {
+            final /*P*/ byte[] head = mRemoveHead;
+            if (mRemoveHeadOffset < p_length(head)) {
                 // Pass this as an IntegerRef to mRemoveHeadOffset.
-                long delta = decodeUnsignedVarLong(head, this);
+                long delta = p_ulongGetVar(head, this);
                 if (delta > 0) {
                     mRemoveHeadFirstPageId = pageId + delta;
                     return pageId;
@@ -304,7 +313,7 @@ final class PageQueue implements IntegerRef {
             }
 
             // Move to the next node in the list.
-            long nextId = decodeLongBE(head, I_NEXT_NODE_ID);
+            long nextId = p_longGetBE(head, I_NEXT_NODE_ID);
 
             if (nextId == (mAggressive ? mAppendTailId : mAppendHeadId)) {
                 // Cannot remove from the append list. Those pages are off limits.
@@ -338,11 +347,11 @@ final class PageQueue implements IntegerRef {
         if (mAllocMode != ALLOC_RESERVE && mManager.isPageOutOfBounds(id)) {
             throw new CorruptDatabaseException("Invalid node id in free list: " + id);
         }
-        byte[] head = mRemoveHead;
+        /*P*/ byte[] head = mRemoveHead;
         mManager.pageArray().readPage(id, head);
         mRemoveHeadId = id;
         mRemoveHeadOffset = I_NODE_START;
-        mRemoveHeadFirstPageId = decodeLongBE(head, I_FIRST_PAGE_ID);
+        mRemoveHeadFirstPageId = p_longGetBE(head, I_FIRST_PAGE_ID);
     }
 
     /**
@@ -408,17 +417,17 @@ final class PageQueue implements IntegerRef {
             long newTailId = mManager.allocPage(mAllocMode);
             long firstPageId = appendHeap.remove();
 
-            byte[] tailBuf = mAppendTail;
-            encodeLongBE(tailBuf, I_NEXT_NODE_ID, newTailId);
-            encodeLongBE(tailBuf, I_FIRST_PAGE_ID, firstPageId);
+            /*P*/ byte[] tailBuf = mAppendTail;
+            p_longPutBE(tailBuf, I_NEXT_NODE_ID, newTailId);
+            p_longPutBE(tailBuf, I_FIRST_PAGE_ID, firstPageId);
 
             int end = appendHeap.drain(firstPageId,
                                        tailBuf,
                                        I_NODE_START,
-                                       tailBuf.length - I_NODE_START);
+                                       p_length(tailBuf) - I_NODE_START);
 
             // Clean out any cruft from previous usage and ensure delta terminator.
-            Arrays.fill(tailBuf, end, tailBuf.length, (byte) 0);
+            p_clear(tailBuf, end, p_length(tailBuf));
 
             mManager.pageArray().writePage(mAppendTailId, tailBuf);
 
@@ -447,9 +456,9 @@ final class PageQueue implements IntegerRef {
     /**
      * Caller must hold append and remove locks and have called preCommit.
      */
-    void commitStart(byte[] header, int offset) {
-        encodeLongLE(header, offset + I_REMOVE_PAGE_COUNT, mRemovePageCount + mAppendPageCount);
-        encodeLongLE(header, offset + I_REMOVE_NODE_COUNT, mRemoveNodeCount + mAppendNodeCount);
+    void commitStart(/*P*/ byte[] header, int offset) {
+        p_longPutLE(header, offset + I_REMOVE_PAGE_COUNT, mRemovePageCount + mAppendPageCount);
+        p_longPutLE(header, offset + I_REMOVE_NODE_COUNT, mRemoveNodeCount + mAppendNodeCount);
 
         if (mRemoveHeadId == 0 && mAppendPageCount > 0) {
             long headId = mAppendHeadId;
@@ -466,18 +475,18 @@ final class PageQueue implements IntegerRef {
                 }
             }
 
-            encodeLongLE(header, offset + I_REMOVE_HEAD_ID, headId);
-            encodeIntLE (header, offset + I_REMOVE_HEAD_OFFSET, I_NODE_START);
+            p_longPutLE(header, offset + I_REMOVE_HEAD_ID, headId);
+            p_intPutLE (header, offset + I_REMOVE_HEAD_OFFSET, I_NODE_START);
             // First page is defined in node itself, and init method reads it.
-            encodeLongLE(header, offset + I_REMOVE_HEAD_FIRST_PAGE_ID, 0);
+            p_longPutLE(header, offset + I_REMOVE_HEAD_FIRST_PAGE_ID, 0);
         } else {
-            encodeLongLE(header, offset + I_REMOVE_HEAD_ID, mRemoveHeadId);
-            encodeIntLE (header, offset + I_REMOVE_HEAD_OFFSET, mRemoveHeadOffset);
-            encodeLongLE(header, offset + I_REMOVE_HEAD_FIRST_PAGE_ID, mRemoveHeadFirstPageId);
+            p_longPutLE(header, offset + I_REMOVE_HEAD_ID, mRemoveHeadId);
+            p_intPutLE (header, offset + I_REMOVE_HEAD_OFFSET, mRemoveHeadOffset);
+            p_longPutLE(header, offset + I_REMOVE_HEAD_FIRST_PAGE_ID, mRemoveHeadFirstPageId);
         }
 
         // Post-commit, all appended pages are eligible to be removed.
-        encodeLongLE(header, offset + I_APPEND_HEAD_ID, mAppendTailId);
+        p_longPutLE(header, offset + I_APPEND_HEAD_ID, mAppendTailId);
 
         // Increase counts now, but not all pages are not available until after
         // commitEnd is called.
@@ -493,8 +502,8 @@ final class PageQueue implements IntegerRef {
      *
      * @param header header with contents filled in by commitStart
      */
-    void commitEnd(byte[] header, int offset) throws IOException {
-        long newAppendHeadId = decodeLongLE(header, offset + I_APPEND_HEAD_ID);
+    void commitEnd(/*P*/ byte[] header, int offset) throws IOException {
+        long newAppendHeadId = p_longGetLE(header, offset + I_APPEND_HEAD_ID);
 
         if (mRemoveHeadId == 0
             && mRemoveStoppedId != newAppendHeadId && mRemoveStoppedId != mAppendTailId)
@@ -535,44 +544,48 @@ final class PageQueue implements IntegerRef {
         long nodeId = mRemoveHeadId;
 
         if (nodeId != 0) {
-            byte[] node = mRemoveHead.clone();
-            long pageId = mRemoveHeadFirstPageId;
-            IntegerRef.Value nodeOffsetRef = new IntegerRef.Value();
-            nodeOffsetRef.value = mRemoveHeadOffset;
+            /*P*/ byte[] node = p_clone(mRemoveHead);
+            try {
+                long pageId = mRemoveHeadFirstPageId;
+                IntegerRef.Value nodeOffsetRef = new IntegerRef.Value();
+                nodeOffsetRef.value = mRemoveHeadOffset;
 
-            while (true) {
-                if (pageId < startId || pageId >= endId) {
-                    // Out of bounds.
-                    return false;
-                }
-
-                hash += scramble(pageId);
-                count++;
-
-                if (nodeOffsetRef.value < node.length) {
-                    long delta = decodeUnsignedVarLong(node, nodeOffsetRef);
-                    if (delta > 0) {
-                        pageId += delta;
-                        continue;
+                while (true) {
+                    if (pageId < startId || pageId >= endId) {
+                        // Out of bounds.
+                        return false;
                     }
-                }
 
-                if (nodeId >= startId && nodeId < endId) {
-                    // Count in-range queue nodes too.
-                    hash += scramble(nodeId);
+                    hash += scramble(pageId);
                     count++;
+
+                    if (nodeOffsetRef.value < p_length(node)) {
+                        long delta = p_ulongGetVar(node, nodeOffsetRef);
+                        if (delta > 0) {
+                            pageId += delta;
+                            continue;
+                        }
+                    }
+
+                    if (nodeId >= startId && nodeId < endId) {
+                        // Count in-range queue nodes too.
+                        hash += scramble(nodeId);
+                        count++;
+                    }
+
+                    // Move to the next queue node.
+
+                    nodeId = p_longGetBE(node, I_NEXT_NODE_ID);
+                    if (nodeId == mAppendTailId) {
+                        break;
+                    }
+
+                    mManager.pageArray().readPage(nodeId, node);
+                    pageId = p_longGetBE(node, I_FIRST_PAGE_ID);
+                    nodeOffsetRef.value = I_NODE_START;
                 }
-
-                // Move to the next queue node.
-
-                nodeId = decodeLongBE(node, I_NEXT_NODE_ID);
-                if (nodeId == mAppendTailId) {
-                    break;
-                }
-
-                mManager.pageArray().readPage(nodeId, node);
-                pageId = decodeLongBE(node, I_FIRST_PAGE_ID);
-                nodeOffsetRef.value = I_NODE_START;
+            } finally {
+                p_delete(node);
             }
         }
 
@@ -600,43 +613,47 @@ final class PageQueue implements IntegerRef {
             return count;
         }
 
-        byte[] node = mRemoveHead.clone();
-        long pageId = mRemoveHeadFirstPageId;
-        IntegerRef.Value nodeOffsetRef = new IntegerRef.Value();
-        nodeOffsetRef.value = mRemoveHeadOffset;
+        /*P*/ byte[] node = p_clone(mRemoveHead);
+        try {
+            long pageId = mRemoveHeadFirstPageId;
+            IntegerRef.Value nodeOffsetRef = new IntegerRef.Value();
+            nodeOffsetRef.value = mRemoveHeadOffset;
 
-        while (true) {
-            /*
-            if (mManager.isPageOutOfBounds(pageId)) {
-                throw new CorruptDatabaseException("Invalid page id in free list: " + pageId);
-            }
-            */
+            while (true) {
+                /*
+                  if (mManager.isPageOutOfBounds(pageId)) {
+                  throw new CorruptDatabaseException("Invalid page id in free list: " + pageId);
+                  }
+                */
 
-            count++;
-            clearPageBit(pages, pageId);
+                count++;
+                clearPageBit(pages, pageId);
 
-            if (nodeOffsetRef.value < node.length) {
-                long delta = decodeUnsignedVarLong(node, nodeOffsetRef);
-                if (delta > 0) {
-                    pageId += delta;
-                    continue;
+                if (nodeOffsetRef.value < p_length(node)) {
+                    long delta = p_ulongGetVar(node, nodeOffsetRef);
+                    if (delta > 0) {
+                        pageId += delta;
+                        continue;
+                    }
                 }
+
+                // Indicate free list node itself as free and move to the next node
+                // in the free list.
+
+                count++;
+                clearPageBit(pages, nodeId);
+
+                nodeId = p_longGetBE(node, I_NEXT_NODE_ID);
+                if (nodeId == mAppendHeadId || nodeId == mAppendTailId) {
+                    break;
+                }
+
+                mManager.pageArray().readPage(nodeId, node);
+                pageId = p_longGetBE(node, I_FIRST_PAGE_ID);
+                nodeOffsetRef.value = I_NODE_START;
             }
-
-            // Indicate free list node itself as free and move to the next node
-            // in the free list.
-
-            count++;
-            clearPageBit(pages, nodeId);
-
-            nodeId = decodeLongBE(node, I_NEXT_NODE_ID);
-            if (nodeId == mAppendHeadId || nodeId == mAppendTailId) {
-                break;
-            }
-
-            mManager.pageArray().readPage(nodeId, node);
-            pageId = decodeLongBE(node, I_FIRST_PAGE_ID);
-            nodeOffsetRef.value = I_NODE_START;
+        } finally {
+            p_delete(node);
         }
 
         return count;

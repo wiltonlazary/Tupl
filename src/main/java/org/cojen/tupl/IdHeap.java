@@ -123,17 +123,17 @@ final class IdHeap {
      *
      * @return new offset
      */
-    public int drain(long prevId, byte[] buffer, int offset, int length) {
+    public int drain(long prevId, /*P*/ byte[] buffer, int offset, int length) {
         int end = offset + length;
         while (mSize > 0 && offset < end) {
             if (offset > (end - 9)) {
                 long id = mIds[0];
-                if (offset + Utils.calcUnsignedVarLongLength(id - prevId) > end) {
+                if (offset + PageOps.p_ulongVarSize(id - prevId) > end) {
                     break;
                 }
             }
             long id = remove();
-            offset = Utils.encodeUnsignedVarLong(buffer, offset, id - prevId);
+            offset = PageOps.p_ulongPutVar(buffer, offset, id - prevId);
             prevId = id;
         }
         return offset;

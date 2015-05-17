@@ -58,23 +58,44 @@ final class CryptoPageArray extends PageArray {
     }
 
     @Override
-    public void readPage(long index, byte[] buf, int offset) throws IOException {
+    public void readPage(long index, /*P*/ byte[] buf) throws IOException {
         try {
-            mSource.readPage(index, buf, offset);
-            mCrypto.decryptPage(index, pageSize(), buf, offset);
+            mSource.readPage(index, buf);
+            mCrypto.decryptPage(index, pageSize(), buf, 0);
         } catch (GeneralSecurityException e) {
             throw new DatabaseException(e);
         }
     }
 
     @Override
-    public void writePage(long index, byte[] buf, int offset) throws IOException {
+    public void readPage(long index, /*P*/ byte[] buf, int offset, int length) throws IOException {
+        int pageSize = pageSize();
+        if (offset == 0 && length == pageSize) {
+            readPage(index, buf);
+            return;
+        }
+
+        /*P*/ byte[] page = PageOps.p_alloc(pageSize);
+        try {
+            readPage(index, page);
+            PageOps.p_copy(page, 0, buf, offset, length);
+        } finally {
+            PageOps.p_delete(page);
+        }
+    }
+
+    @Override
+    public void writePage(long index, /*P*/ byte[] buf, int offset) throws IOException {
         try {
             int pageSize = pageSize();
             // Unknown if buf contents can be destroyed, so create a new one.
-            byte[] encrypted = new byte[pageSize];
-            mCrypto.encryptPage(index, pageSize, buf, offset, encrypted, 0);
-            mSource.writePage(index, encrypted, 0);
+            /*P*/ byte[] encrypted = PageOps.p_alloc(pageSize);
+            try {
+                mCrypto.encryptPage(index, pageSize, buf, offset, encrypted, 0);
+                mSource.writePage(index, encrypted, 0);
+            } finally {
+                PageOps.p_delete(encrypted);
+            }
         } catch (GeneralSecurityException e) {
             throw new DatabaseException(e);
         }
