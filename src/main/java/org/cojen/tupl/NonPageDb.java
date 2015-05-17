@@ -21,6 +21,8 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.BitSet;
 
+import static org.cojen.tupl.PageOps.*;
+
 /**
  * PageDb implementation which doesn't actually work. Used for non-durable
  * databases.
@@ -41,6 +43,10 @@ final class NonPageDb extends PageDb {
         mCache = cache;
         // Next assigned id is 2, the first legal identifier.
         mAllocId = 1;
+    }
+
+    @Override
+    void delete() {
     }
 
     @Override
@@ -88,24 +94,14 @@ final class NonPageDb extends PageDb {
     }
 
     @Override
-    public void readPage(long id, byte[] buf) throws IOException {
+    public void readPage(long id, /*P*/ byte[] buf) throws IOException {
         readPage(id, buf, 0);
     }
 
     @Override
-    public void readPage(long id, byte[] buf, int offset) throws IOException {
+    public void readPage(long id, /*P*/ byte[] buf, int offset) throws IOException {
         PageCache cache = mCache;
-        if (cache == null || !cache.remove(id, buf, offset, buf.length)) {
-            fail(false);
-        }
-    }
-
-    @Override
-    public void readPartial(long id, int start, byte[] buf, int offset, int length)
-        throws IOException
-    {
-        PageCache cache = mCache;
-        if (cache == null || !cache.copy(id, start, buf, offset, length)) {
+        if (cache == null || !cache.remove(id, buf, offset, p_length(buf))) {
             fail(false);
         }
     }
@@ -123,27 +119,27 @@ final class NonPageDb extends PageDb {
     }
 
     @Override
-    public void writePage(long id, byte[] buf) throws IOException {
+    public void writePage(long id, /*P*/ byte[] buf) throws IOException {
         writePage(id, buf, 0);
     }
 
     @Override
-    public void writePage(long id, byte[] buf, int offset) throws IOException {
+    public void writePage(long id, /*P*/ byte[] buf, int offset) throws IOException {
         PageCache cache = mCache;
-        if (cache == null || !cache.add(id, buf, offset, buf.length, false)) {
+        if (cache == null || !cache.add(id, buf, offset, p_length(buf), false)) {
             fail(true);
         }
     }
 
     @Override
-    public void cachePage(long id, byte[] buf) throws IOException {
+    public void cachePage(long id, /*P*/ byte[] buf) throws IOException {
         cachePage(id, buf, 0);
     }
 
     @Override
-    public void cachePage(long id, byte[] buf, int offset) throws IOException {
+    public void cachePage(long id, /*P*/ byte[] buf, int offset) throws IOException {
         PageCache cache = mCache;
-        if (cache != null && !cache.add(id, buf, offset, buf.length, false)) {
+        if (cache != null && !cache.add(id, buf, offset, p_length(buf), false)) {
             fail(false);
         }
     }
@@ -152,7 +148,7 @@ final class NonPageDb extends PageDb {
     public void uncachePage(long id) throws IOException {
         PageCache cache = mCache;
         if (cache != null) {
-            cache.remove(id, null, 0, 0);
+            cache.remove(id, p_null(), 0, 0);
         }
     }
 
@@ -203,7 +199,9 @@ final class NonPageDb extends PageDb {
     }
 
     @Override
-    public void commit(boolean resume, byte[] header, CommitCallback callback) throws IOException {
+    public void commit(boolean resume, /*P*/ byte[] header, CommitCallback callback)
+        throws IOException
+    {
         // This is more of an assertion failure.
         throw new DatabaseException("Cannot commit to a non-durable database");
     }

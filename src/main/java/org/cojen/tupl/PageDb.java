@@ -45,6 +45,11 @@ abstract class PageDb implements CauseCloseable {
         mCommitLock = new ReentrantReadWriteLock(false);
     }
 
+    /**
+     * Must be called when object is no longer referenced.
+     */
+    abstract void delete();
+
     public abstract boolean isDurable();
 
     /**
@@ -91,7 +96,7 @@ abstract class PageDb implements CauseCloseable {
      * @param id page id to read
      * @param buf receives read data
      */
-    public abstract void readPage(long id, byte[] buf) throws IOException;
+    public abstract void readPage(long id, /*P*/ byte[] buf) throws IOException;
 
     /**
      * Reads a page without locking. Caller must ensure that a deleted page
@@ -101,20 +106,7 @@ abstract class PageDb implements CauseCloseable {
      * @param buf receives read data
      * @param offset offset into data buffer
      */
-    public abstract void readPage(long id, byte[] buf, int offset) throws IOException;
-
-    /**
-     * Reads a part of a page without locking. Caller must ensure that a
-     * deleted page is not read during or after a commit.
-     *
-     * @param id page id to read
-     * @param start start of page to read
-     * @param buf receives read data
-     * @param offset offset into data buffer
-     * @param length length to read
-     */
-    public abstract void readPartial(long id, int start, byte[] buf, int offset, int length)
-        throws IOException;
+    public abstract void readPage(long id, /*P*/ byte[] buf, int offset) throws IOException;
 
     /**
      * Allocates a page to be written to.
@@ -131,7 +123,7 @@ abstract class PageDb implements CauseCloseable {
      * @param id previously allocated page id
      * @param buf data to write
      */
-    public abstract void writePage(long id, byte[] buf) throws IOException;
+    public abstract void writePage(long id, /*P*/ byte[] buf) throws IOException;
 
     /**
      * Writes to an allocated page, but doesn't commit it. A written page is
@@ -142,7 +134,7 @@ abstract class PageDb implements CauseCloseable {
      * @param buf data to write
      * @param offset offset into data buffer
      */
-    public abstract void writePage(long id, byte[] buf, int offset) throws IOException;
+    public abstract void writePage(long id, /*P*/ byte[] buf, int offset) throws IOException;
 
     /**
      * If supported, copies a page into the cache, but does not write it. Cached copy is
@@ -150,7 +142,7 @@ abstract class PageDb implements CauseCloseable {
      *
      * @param id previously allocated page id
      */
-    public abstract void cachePage(long id, byte[] buf) throws IOException;
+    public abstract void cachePage(long id, /*P*/ byte[] buf) throws IOException;
 
     /**
      * If supported, copies a page into the cache, but does not write it. Cached copy is
@@ -158,7 +150,7 @@ abstract class PageDb implements CauseCloseable {
      *
      * @param id previously allocated page id
      */
-    public abstract void cachePage(long id, byte[] buf, int offset) throws IOException;
+    public abstract void cachePage(long id, /*P*/ byte[] buf, int offset) throws IOException;
 
     /**
      * If supported, removes a page from the cache.
@@ -258,7 +250,7 @@ abstract class PageDb implements CauseCloseable {
      * @param header must be page size
      * @param callback optional callback to run during commit
      */
-    public abstract void commit(boolean resume, byte[] header, CommitCallback callback)
+    public abstract void commit(boolean resume, /*P*/ byte[] header, CommitCallback callback)
         throws IOException;
 
     public static interface CommitCallback {
@@ -269,7 +261,7 @@ abstract class PageDb implements CauseCloseable {
          * @param resume true if resuming an aborted commit
          * @param header header to write extra data into, up to 256 bytes
          */
-        public void prepare(boolean resume, byte[] header) throws IOException;
+        public void prepare(boolean resume, /*P*/ byte[] header) throws IOException;
     }
 
     /**

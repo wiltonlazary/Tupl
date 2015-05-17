@@ -76,45 +76,15 @@ public class FilePageArray extends PageArray {
     }
 
     @Override
-    public void readPage(long index, byte[] buf, int offset) throws IOException {
+    public void readPage(long index, /*P*/ byte[] buf, int offset, int length) throws IOException {
         if (index < 0) {
             throw new IndexOutOfBoundsException(String.valueOf(index));
         }
-        int pageSize = mPageSize;
-        mFio.read(index * pageSize, buf, offset, pageSize);
+        mFio.read(index * mPageSize, buf, offset, length);
     }
 
     @Override
-    public int readPartial(long index, int start, byte[] buf, int offset, int length)
-        throws IOException
-    {
-        if (index < 0) {
-            throw new IndexOutOfBoundsException(String.valueOf(index));
-        }
-        int pageSize = mPageSize;
-        int remaining = pageSize - start;
-        length = remaining <= 0 ? 0 : Math.min(remaining, length);
-        mFio.read(index * pageSize + start, buf, offset, length);
-        return length;
-    }
-
-    /*
-    @Override
-    public int readCluster(long index, byte[] buf, int offset, int count)
-        throws IOException
-    {
-        if (index < 0) {
-            throw new IndexOutOfBoundsException(String.valueOf(index));
-        }
-        int pageSize = mPageSize;
-        int len = pageSize * count;
-        mFio.read(index * pageSize, buf, offset, len);
-        return len;
-    }
-    */
-
-    @Override
-    public void writePage(long index, byte[] buf, int offset) throws IOException {
+    public void writePage(long index, /*P*/ byte[] buf, int offset) throws IOException {
         int pageSize = mPageSize;
         mFio.write(index * pageSize, buf, offset, pageSize);
     }

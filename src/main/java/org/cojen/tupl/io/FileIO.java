@@ -58,6 +58,10 @@ public abstract class FileIO implements CauseCloseable {
      */
     public abstract void read(long pos, byte[] buf, int offset, int length) throws IOException;
 
+    public void read(long pos, long ptr, int offset, int length) throws IOException {
+        throw new UnsupportedOperationException();
+    }
+
     /**
      * @param pos zero-based position in file
      * @param buf data to write
@@ -66,6 +70,10 @@ public abstract class FileIO implements CauseCloseable {
      * @throws IllegalArgumentException
      */
     public abstract void write(long pos, byte[] buf, int offset, int length) throws IOException;
+
+    public void write(long pos, long ptr, int offset, int length) throws IOException {
+        throw new UnsupportedOperationException();
+    }
 
     /**
      * Maps or remaps the file into main memory, up to the current file length.

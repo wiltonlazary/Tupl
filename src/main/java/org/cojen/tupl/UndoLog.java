@@ -25,7 +25,10 @@ import java.util.concurrent.locks.Lock;
 
 import static java.lang.System.arraycopy;
 
+import static org.cojen.tupl.PageOps.*;
 import static org.cojen.tupl.Utils.*;
+
+import org.cojen.tupl.ext.UndoHandler;
 
 /**
  * Specialized stack used by UndoLog.
@@ -111,6 +114,9 @@ final class UndoLog implements DatabaseAccess {
     // Payload is Node-encoded key and trash id, to undo a fragmented value delete.
     static final byte OP_UNDELETE_FRAGMENTED = (byte) 22;
 
+    // Payload is custom message.
+    static final byte OP_CUSTOM = (byte) 24;
+
     private final Database mDatabase;
     private final long mTxnId;
 
@@ -152,15 +158,15 @@ final class UndoLog implements DatabaseAccess {
         if (buffer == null) {
             mNode = node = allocUnevictableNode(0);
             // Set pointer to top entry (none at the moment).
-            node.mGarbage = node.mPage.length;
+            node.mGarbage = p_length(node.mPage);
             node.releaseExclusive();
         } else {
             mNode = node = allocUnevictableNode(0);
             int pos = mBufferPos;
             int size = buffer.length - pos;
-            byte[] page = node.mPage;
-            int newPos = page.length - size;
-            arraycopy(buffer, pos, page, newPos, size);
+            /*P*/ byte[] page = node.mPage;
+            int newPos = p_length(page) - size;
+            p_copyFromArray(buffer, pos, page, newPos, size);
             // Set pointer to top entry.
             node.mGarbage = newPos;
             mBuffer = null;
@@ -226,6 +232,11 @@ final class UndoLog implements DatabaseAccess {
         doPush(OP_COMMIT);
     }
 
+    void pushCustom(byte[] message) throws IOException {
+        int len = message.length;
+        doPush(OP_CUSTOM, message, 0, len, calcUnsignedVarIntLength(len));
+    }
+
     /**
      * Caller must hold db commit lock.
      */
@@ -268,8 +279,7 @@ final class UndoLog implements DatabaseAccess {
                 pos = mBufferPos;
                 if (pos < encodedLen) {
                     final int size = buffer.length - pos;
-                    int newCap = Math.max
-                        (buffer.length << 1, roundUpPower2(encodedLen + size));
+                    int newCap = Math.max(buffer.length << 1, roundUpPower2(encodedLen + size));
                     if (newCap <= (mDatabase.pageSize() >> 1)) {
                         byte[] newBuf = new byte[newCap];
                         int newPos = newCap - size;
@@ -279,9 +289,9 @@ final class UndoLog implements DatabaseAccess {
                     } else {
                         // Required capacity is large, so just use a node.
                         mNode = node = allocUnevictableNode(0);
-                        byte[] page = node.mPage;
-                        int newPos = page.length - size;
-                        arraycopy(buffer, pos, page, newPos, size);
+                        /*P*/ byte[] page = node.mPage;
+                        int newPos = p_length(page) - size;
+                        p_copyFromArray(buffer, pos, page, newPos, size);
                         // Set pointer to top entry.
                         node.mGarbage = newPos;
                         mBuffer = null;
@@ -291,7 +301,7 @@ final class UndoLog implements DatabaseAccess {
                 }
             }
 
-            writeEntry(buffer, pos -= encodedLen, op, payload, off, len);
+            writeBufferEntry(buffer, pos -= encodedLen, op, payload, off, len);
             mBufferPos = pos;
             mLength += encodedLen;
             return;
@@ -301,7 +311,7 @@ final class UndoLog implements DatabaseAccess {
         int pos = node.mGarbage;
         int available = pos - HEADER_SIZE;
         if (available >= encodedLen) {
-            writeEntry(node.mPage, pos -= encodedLen, op, payload, off, len);
+            writePageEntry(node.mPage, pos -= encodedLen, op, payload, off, len);
             node.mGarbage = pos;
             node.releaseExclusive();
             mLength += encodedLen;
@@ -317,15 +327,15 @@ final class UndoLog implements DatabaseAccess {
             pos -= amt;
             available -= amt;
             remaining -= amt;
-            byte[] page = node.mPage;
-            arraycopy(payload, off + remaining, page, pos, amt);
+            /*P*/ byte[] page = node.mPage;
+            p_copyFromArray(payload, off + remaining, page, pos, amt);
             node.mGarbage = pos;
 
             if (remaining <= 0 && available >= (1 + varIntLen)) {
                 if (varIntLen > 0) {
-                    encodeUnsignedVarInt(page, pos -= varIntLen, len);
+                    p_uintPutVar(page, pos -= varIntLen, len);
                 }
-                page[--pos] = op;
+                p_bytePut(page, --pos, op);
                 node.mGarbage = pos;
                 node.releaseExclusive();
                 break;
@@ -346,7 +356,7 @@ final class UndoLog implements DatabaseAccess {
                 }
 
                 newNode.mNodeChainNext = node;
-                newNode.mGarbage = pos = page.length;
+                newNode.mGarbage = pos = p_length(page);
                 available = pos - HEADER_SIZE;
             }
 
@@ -436,10 +446,10 @@ final class UndoLog implements DatabaseAccess {
                             // by the next checkpoint.
                             mDatabase.prepareToDelete(node);
                             mDatabase.redirty(node);
-                            byte[] page = node.mPage;
-                            int end = page.length - 1;
+                            /*P*/ byte[] page = node.mPage;
+                            int end = p_length(page) - 1;
                             node.mGarbage = end;
-                            page[end] = OP_COMMIT_TRUNCATE;
+                            p_bytePut(page, end, OP_COMMIT_TRUNCATE);
                         }
                         // Release and re-acquire, to unblock any threads waiting for
                         // checkpoint to begin.
@@ -521,6 +531,7 @@ final class UndoLog implements DatabaseAccess {
             case OP_COMMIT_TRUNCATE:
             case OP_UNINSERT:
             case OP_UNUPDATE:
+            case OP_CUSTOM:
                 // Ignore.
                 break;
 
@@ -534,7 +545,14 @@ final class UndoLog implements DatabaseAccess {
                 // Since transaction was committed, don't insert an entry
                 // to undo a delete, but instead delete the ghost.
                 while ((activeIndex = findIndex(activeIndex)) != null) {
-                    byte[] key = Node.retrieveKeyAtLoc(this, entry, 0);
+                    byte[] key;
+                    /*P*/ byte[] pentry = p_transfer(entry);
+                    try {
+                        key = Node.retrieveKeyAtLoc(this, pentry, 0);
+                    } finally {
+                        p_delete(pentry);
+                    }
+
                     TreeCursor cursor = new TreeCursor((Tree) activeIndex, null);
                     try {
                         cursor.deleteGhost(key);
@@ -587,7 +605,14 @@ final class UndoLog implements DatabaseAccess {
 
         case OP_UNUPDATE:
         case OP_UNDELETE: {
-            byte[][] pair = Node.retrieveKeyValueAtLoc(this, entry, 0);
+            byte[][] pair;
+            /*P*/ byte[] pentry = p_transfer(entry);
+            try {
+                pair = Node.retrieveKeyValueAtLoc(this, pentry, 0);
+            } finally {
+                p_delete(pentry);
+            }
+
             while ((activeIndex = findIndex(activeIndex)) != null) {
                 try {
                     activeIndex.store(Transaction.BOGUS, pair[0], pair[1]);
@@ -610,6 +635,15 @@ final class UndoLog implements DatabaseAccess {
                     activeIndex = null;
                 }
             }
+            break;
+
+        case OP_CUSTOM:
+            Database db = mDatabase;
+            UndoHandler handler = db.mCustomUndoHandler;
+            if (handler == null) {
+                throw new DatabaseException("Custom undo handler is not installed");
+            }
+            handler.undo(db, entry);
             break;
         }
 
@@ -638,10 +672,10 @@ final class UndoLog implements DatabaseAccess {
 
         node.acquireExclusive();
         while (true) {
-            byte[] page = node.mPage;
+            /*P*/ byte[] page = node.mPage;
             int pos = node.mGarbage;
-            if (pos < page.length) {
-                byte op = page[pos];
+            if (pos < p_length(page)) {
+                byte op = p_byteGet(page, pos);
                 node.releaseExclusive();
                 return op;
             }
@@ -689,12 +723,12 @@ final class UndoLog implements DatabaseAccess {
         }
 
         node.acquireExclusive();
-        byte[] page;
+        /*P*/ byte[] page;
         int pos;
         while (true) {
             page = node.mPage;
             pos = node.mGarbage;
-            if (pos < page.length) {
+            if (pos < p_length(page)) {
                 break;
             }
             if ((node = popNode(node, delete)) == null) {
@@ -703,10 +737,10 @@ final class UndoLog implements DatabaseAccess {
             }
         }
 
-        if ((opRef[0] = page[pos++]) < PAYLOAD_OP) {
+        if ((opRef[0] = p_byteGet(page, pos++)) < PAYLOAD_OP) {
             mLength -= 1;
             node.mGarbage = pos;
-            if (pos >= page.length) {
+            if (pos >= p_length(page)) {
                 node = popNode(node, delete);
             }
             if (node != null) {
@@ -717,8 +751,8 @@ final class UndoLog implements DatabaseAccess {
 
         int payloadLen;
         {
-            payloadLen = decodeUnsignedVarInt(page, pos);
-            int varIntLen = calcUnsignedVarIntLength(payloadLen);
+            payloadLen = p_uintGetVar(page, pos);
+            int varIntLen = p_uintVarSize(payloadLen);
             pos += varIntLen;
             mLength -= 1 + varIntLen + payloadLen;
         }
@@ -727,13 +761,13 @@ final class UndoLog implements DatabaseAccess {
         int entryPos = 0;
 
         while (true) {
-            int avail = Math.min(payloadLen, page.length - pos);
-            arraycopy(page, pos, entry, entryPos, avail);
+            int avail = Math.min(payloadLen, p_length(page) - pos);
+            p_copyToArray(page, pos, entry, entryPos, avail);
             payloadLen -= avail;
             pos += avail;
             node.mGarbage = pos;
 
-            if (pos >= page.length) {
+            if (pos >= p_length(page)) {
                 node = popNode(node, delete);
             }
 
@@ -779,13 +813,14 @@ final class UndoLog implements DatabaseAccess {
      * @return null if none
      */
     private Node latchLowerNode(Node parent) throws IOException {
-        long lowerNodeId = decodeLongLE(parent.mPage, I_LOWER_NODE_ID);
+        long lowerNodeId = p_longGetLE(parent.mPage, I_LOWER_NODE_ID);
         if (lowerNodeId == 0) {
             return null;
         }
 
         Node lowerNode = parent.mNodeChainNext;
         if (lowerNode != null) {
+            parent.mNodeChainNext = null;
             lowerNode.acquireExclusive();
             if (lowerNodeId == lowerNode.mId) {
                 lowerNode.makeUnevictable();
@@ -798,13 +833,23 @@ final class UndoLog implements DatabaseAccess {
         return readUndoLogNode(mDatabase, lowerNodeId);
     }
 
-    private static void writeEntry(byte[] dest, int destPos,
-                                   byte op, byte[] payload, int off, int len)
+    private static void writeBufferEntry(byte[] dest, int destPos,
+                                         byte op, byte[] payload, int off, int len)
     {
         dest[destPos] = op;
         if (op >= PAYLOAD_OP) {
             int payloadPos = encodeUnsignedVarInt(dest, destPos + 1, len);
             arraycopy(payload, off, dest, payloadPos, len);
+        }
+    }
+
+    private static void writePageEntry(/*P*/ byte[] page, int pagePos,
+                                       byte op, byte[] payload, int off, int len)
+    {
+        p_bytePut(page, pagePos, op);
+        if (op >= PAYLOAD_OP) {
+            int payloadPos = p_uintPutVar(page, pagePos + 1, len);
+            p_copyFromArray(payload, off, page, payloadPos, len);
         }
     }
 
@@ -814,7 +859,7 @@ final class UndoLog implements DatabaseAccess {
     private Node allocUnevictableNode(long lowerNodeId) throws IOException {
         Node node = mDatabase.allocDirtyNode(NodeUsageList.MODE_UNEVICTABLE);
         node.mType = Node.TYPE_UNDO_LOG;
-        encodeLongLE(node.mPage, I_LOWER_NODE_ID, lowerNodeId);
+        p_longPutLE(node.mPage, I_LOWER_NODE_ID, lowerNodeId);
         return node;
     }
 
@@ -958,10 +1003,19 @@ final class UndoLog implements DatabaseAccess {
             case OP_UNDELETE:
             case OP_UNDELETE_FRAGMENTED:
                 if (lockMode != LockMode.UNSAFE) {
-                    scope.addLock(mActiveIndexId, Node.retrieveKeyAtLoc(this, entry, 0))
+                    byte[] key;
+                    /*P*/ byte[] pentry = p_transfer(entry);
+                    try {
+                        key = Node.retrieveKeyAtLoc(this, pentry, 0);
+                    } finally {
+                        p_delete(pentry);
+                    }
+                    
+                    scope.addLock(mActiveIndexId, key)
                         // Indicate that a ghost must be deleted if transaction is committed.
                         .mSharedLockOwnersObj = mDatabase.anyIndexById(mActiveIndexId);
                 }
+            case OP_CUSTOM:
                 break;
             }
         }

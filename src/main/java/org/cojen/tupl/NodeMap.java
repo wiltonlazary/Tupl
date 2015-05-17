@@ -110,6 +110,19 @@ final class NodeMap {
 
         final Node[] table = mTable;
         final int index = hash & (table.length - 1);
+        Node e = table[index];
+        while (e != null) {
+            if (e == node) {
+                latch.releaseExclusive();
+                return;
+            }
+            if (e.mId == node.mId) {
+                latch.releaseExclusive();
+                throw new AssertionError();
+            }
+            e = e.mNodeChainNext;
+        }
+
         node.mNodeChainNext = table[index];
         table[index] = node;
 
@@ -140,7 +153,10 @@ final class NodeMap {
         latch.releaseExclusive();
     }
 
-    void clear() {
+    /**
+     * Remove and delete nodes from map, as part of close sequence.
+     */
+    void delete() {
         for (Latch latch : mLatches) {
             latch.acquireExclusive();
         }
@@ -148,6 +164,7 @@ final class NodeMap {
         for (int i=mTable.length; --i>=0; ) {
             Node e = mTable[i];
             if (e != null) {
+                e.delete();
                 Node next;
                 while ((next = e.mNodeChainNext) != null) {
                     e.mNodeChainNext = null;

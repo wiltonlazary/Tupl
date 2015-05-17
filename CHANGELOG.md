@@ -1,9 +1,18 @@
 Changelog
 =========
 
+v1.2.3 (2015-05-16)
+------
+* Fix snapshot deadlock when reading from the cache.
+* Add support for custom transaction operations.
+* Improved key hash function used by lock manager.
+* Expose the WrappedCursor class.
+* Added experimental direct page implementation which relies on Unsafe features. Modify
+  the source using PageAccessTransformer and then recompile.
+
 v1.2.2 (2015-04-12)
 ------
-* Fix root node deletion after an deleting index.
+* Fix root node deletion when deleting an index.
 * Fix memory leak when closing an index.
 * Fix to ensure that undo log recovery tracks ghosted values.
 * Index drop uses same code as index delete, eliminating complex duplicate code and

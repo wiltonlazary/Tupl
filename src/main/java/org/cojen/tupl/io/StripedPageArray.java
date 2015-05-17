@@ -101,55 +101,14 @@ public class StripedPageArray extends PageArray {
     }
 
     @Override
-    public void readPage(long index, byte[] buf, int offset) throws IOException {
+    public void readPage(long index, /*P*/ byte[] buf, int offset, int length) throws IOException {
         PageArray[] arrays = mArrays;
         int stripes = arrays.length;
-        arrays[(int) (index % stripes)].readPage(index / stripes, buf, offset);
+        arrays[(int) (index % stripes)].readPage(index / stripes, buf, offset, length);
     }
 
     @Override
-    public int readPartial(long index, int start, byte[] buf, int offset, int length)
-        throws IOException
-    {
-        PageArray[] arrays = mArrays;
-        int stripes = arrays.length;
-        return arrays[(int) (index % stripes)]
-            .readPartial(index / stripes, start, buf, offset, length);
-    }
-
-    /*
-    @Override
-    public int readCluster(long index, byte[] buf, int offset, int count)
-        throws IOException
-    {
-        if (count <= 0) {
-            return 0;
-        }
-
-        int pageSize = pageSize();
-        PageArray[] arrays = mArrays;
-        int stripes = arrays.length;
-        int stripe = (int) (index % stripes);
-        index /= stripes;
-
-        while (true) {
-            arrays[stripe].readPage(index, buf, offset);
-            if (--count < 0) {
-                break;
-            }
-            offset += pageSize;
-            if (++stripe == stripes) {
-                stripe = 0;
-                index++;
-            }
-        }
-
-        return pageSize * count;
-    }
-    */
-
-    @Override
-    public void writePage(long index, byte[] buf, int offset) throws IOException {
+    public void writePage(long index, /*P*/ byte[] buf, int offset) throws IOException {
         PageArray[] arrays = mArrays;
         int stripes = arrays.length;
         arrays[(int) (index % stripes)].writePage(index / stripes, buf, offset);

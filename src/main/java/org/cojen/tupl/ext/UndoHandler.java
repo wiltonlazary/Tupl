@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2015 Brian S O'Neill
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -14,22 +14,26 @@
  *  limitations under the License.
  */
 
-package org.cojen.tupl;
+package org.cojen.tupl.ext;
 
 import java.io.IOException;
 
+import org.cojen.tupl.Database;
+import org.cojen.tupl.DatabaseConfig;
+import org.cojen.tupl.Transaction;
+
 /**
- * Returned by {@link UnmodifiableView}.
+ * Handler for custom transactional undo operations, which are applied to roll back
+ * transactions.
  *
  * @author Brian S O'Neill
+ * @see DatabaseConfig#customUndoHandler
  */
-final class UnmodifiableCursor extends WrappedCursor<Cursor> {
-    UnmodifiableCursor(Cursor source) {
-        super(source);
-    }
-
-    @Override
-    public Cursor copy() {
-        return new UnmodifiableCursor(source.copy());
-    }
+public interface UndoHandler {
+    /**
+     * Non-transactionally apply an idempotent undo operation.
+     *
+     * @param message message originally provided to {@link Transaction#customUndo}
+     */
+    void undo(Database db, byte[] message) throws IOException;
 }
