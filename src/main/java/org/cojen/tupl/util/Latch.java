@@ -270,10 +270,13 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
         // thread might now be dequeuing nodes.
 
         for (Node node = first(); node != null; node = node.get()) {
-            if (node instanceof Shared) {
-                LockSupport.unpark(node.mWaiter); // if waiter is null, unpark does nothing
-            } else {
-                break;
+            Thread waiter = node.mWaiter;
+            if (waiter != null) {
+                if (node instanceof Shared) {
+                    LockSupport.unpark(waiter);
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -314,14 +317,10 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
                         return;
                     }
 
-                    int state = first.mState;
-                    if (state < Node.DENIED) {
+                    if (!first.mDenied) {
                         // Unpark the waiter, but allow another thread to barge in.
                         mLatchState = 0;
-                        if (state == Node.READY) {
-                            first.mState = Node.UNPARKED;
-                            LockSupport.unpark(waiter);
-                        }
+                        LockSupport.unpark(waiter);
                         return;
                     }
                 }
@@ -459,8 +458,8 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
         while (true) {
             if (state < 0) {
                 // An exclusive latch is waiting in the queue.
-                if (cStateUpdater.compareAndSet(this, state, state - 1)) {
-                    if (state == (EXCLUSIVE + 1)) {
+                if (cStateUpdater.compareAndSet(this, state, --state)) {
+                    if (state == EXCLUSIVE) {
                         // This thread just released the last shared latch, and now it owns the
                         // exclusive latch. Release it for the next in the queue.
                         releaseExclusive();
@@ -471,15 +470,13 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
                 Node last = mLatchLast;
                 if (last == null) {
                     // No waiters, so release the latch.
-                    if (cStateUpdater.compareAndSet(this, state, state - 1)) {
-                        if (state == 1) {
+                    if (cStateUpdater.compareAndSet(this, state, --state)) {
+                        if (state == 0) {
                             // Need to check if any waiters again, due to race with enqueue. If
                             // cannot immediately re-acquire the latch, then let the new owner
                             // (which barged in) unpark the waiters when it releases the latch.
                             last = mLatchLast;
-                            if (last != null &&
-                                (cStateUpdater.compareAndSet(this, 1, EXCLUSIVE) || tryUpgrade()))
-                            {
+                            if (last != null && cStateUpdater.compareAndSet(this, 0, EXCLUSIVE)) {
                                 releaseExclusive();
                             }
                         }
@@ -492,7 +489,7 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
                         releaseExclusive();
                         return;
                     }
-                } else if (cStateUpdater.compareAndSet(this, state, state - 1)) {
+                } else if (cStateUpdater.compareAndSet(this, state, --state)) {
                     return;
                 }
             }
@@ -553,7 +550,7 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
                 }
 
                 // Lost the race. Request fair handoff.
-                node.mState = Node.DENIED;
+                node.mDenied = true;
             }
         }
 
@@ -774,10 +771,8 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
      * Atomic reference is to the next node in the chain.
      */
     static class Node extends AtomicReference<Node> {
-        static final int READY = 0, UNPARKED = 1, DENIED = 2;
-
         volatile Thread mWaiter;
-        volatile int mState;
+        volatile boolean mDenied;
 
         // Only set if node was deleted and must be bypassed when a new node is enqueued.
         volatile Node mPrev;
@@ -822,7 +817,7 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
             StringBuilder b = new StringBuilder();
             appendMiniString(b, this);
             b.append(" {waiter=").append(mWaiter);
-            b.append(", state=").append(mState);
+            b.append(", denied=").append(mDenied);
             b.append(", next="); appendMiniString(b, get());
             return b.append('}').toString();
         }
@@ -876,7 +871,8 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
                         if (!cStateUpdater.compareAndSet(latch, state + 1, state)) {
                             cStateUpdater.decrementAndGet(latch);
                         }
-                        state--;
+                        // Already removed from the queue.
+                        return 1;
                     }
 
                     // Only remove node if this thread is the first shared latch owner. This
