@@ -28,7 +28,7 @@ import java.util.concurrent.locks.LockSupport;
 
 /**
  * A latch is a lightweight non-reentrant mutex, supporting shared and exclusive modes. Latch
- * acquisition is typically unfair, but performs fair handoff as necessary to prevent
+ * acquisition is typically unfair, but fair handoff is performed as necessary to prevent
  * starvation.
  *
  * @author Brian S O'Neill
