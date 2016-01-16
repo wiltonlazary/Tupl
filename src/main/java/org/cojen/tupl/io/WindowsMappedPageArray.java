@@ -47,6 +47,8 @@ class WindowsMappedPageArray extends MappedPageArray {
     private final WinNT.HANDLE mFileHandle;
     private final WinNT.HANDLE mMappingHandle;
 
+    private final boolean mNonDurable;
+
     private volatile boolean mEmpty;
 
     WindowsMappedPageArray(int pageSize, long pageCount,
@@ -56,6 +58,7 @@ class WindowsMappedPageArray extends MappedPageArray {
         super(pageSize, pageCount, options);
 
         mEmpty = file.length() == 0;
+        mNonDurable = options.contains(OpenOption.NON_DURABLE);
 
         int access = WinNT.GENERIC_READ;
 
@@ -65,7 +68,12 @@ class WindowsMappedPageArray extends MappedPageArray {
 
         int create = options.contains(OpenOption.CREATE) ? WinNT.OPEN_ALWAYS : WinNT.OPEN_EXISTING;
 
-        int flags = WinNT.FILE_ATTRIBUTE_NORMAL;
+        int flags;
+        if (mNonDurable) {
+            flags = WinNT.FILE_ATTRIBUTE_TEMPORARY;
+        } else {
+            flags = WinNT.FILE_ATTRIBUTE_NORMAL;
+        }
 
         WinNT.HANDLE hFile = cKernel.CreateFile
             (file.getPath(),
@@ -77,7 +85,7 @@ class WindowsMappedPageArray extends MappedPageArray {
              null // template file
              );
 
-        if (hFile == WinNT.INVALID_HANDLE_VALUE) {
+        if (hFile == null || hFile == WinNT.INVALID_HANDLE_VALUE) {
             int error = cKernel.GetLastError();
             throw new FileNotFoundException(Kernel32Util.formatMessage(error));
         }
@@ -93,7 +101,7 @@ class WindowsMappedPageArray extends MappedPageArray {
              null // no name
              );
 
-        if (hMapping == WinNT.INVALID_HANDLE_VALUE) {
+        if (hMapping == null || hMapping == WinNT.INVALID_HANDLE_VALUE) {
             int error = cKernel.GetLastError();
             closeHandle(hFile);
             throw toException(error);
@@ -134,18 +142,22 @@ class WindowsMappedPageArray extends MappedPageArray {
     }
 
     void doSync(long mappingPtr, boolean metadata) throws IOException {
-        if (!cKernel.FlushViewOfFile(mappingPtr, super.getPageCount() * pageSize())) {
-           throw toException(cKernel.GetLastError());
+        if (!mNonDurable) {
+            if (!cKernel.FlushViewOfFile(mappingPtr, super.getPageCount() * pageSize())) {
+                throw toException(cKernel.GetLastError());
+            }
+            fsync();
         }
-        fsync();
     }
 
     void doSyncPage(long mappingPtr, long index) throws IOException {
-        int pageSize = pageSize();
-        if (!cKernel.FlushViewOfFile(mappingPtr + index * pageSize, pageSize)) {
-           throw toException(cKernel.GetLastError());
+        if (!mNonDurable) {
+            int pageSize = pageSize();
+            if (!cKernel.FlushViewOfFile(mappingPtr + index * pageSize, pageSize)) {
+                throw toException(cKernel.GetLastError());
+            }
+            fsync();
         }
-        fsync();
     }
 
     void doClose(long mappingPtr) throws IOException {
