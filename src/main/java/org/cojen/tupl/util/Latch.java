@@ -150,133 +150,59 @@ public class Latch /*extends AbstractOwnableSynchronizer*/ {
      * releaseShared instead of releaseExclusive.
      */
     public final void downgrade() {
-        fairHandoff: {
-            Node last = mLatchLast;
-            if (last == null) {
-                // No waiters, so release the latch.
-                mLatchState = 1;
+        mLatchState = 1;
 
-                // Need to check if any waiters again, due to race with enqueue. If cannot
-                // immediately re-acquire the latch, then let the new owner (which barged in)
-                // unpark the waiters when it releases the latch.
-                last = mLatchLast;
-                if (last == null) {
-                    return;
-                }
-
-                if (!cStateUpdater.compareAndSet(this, 1, EXCLUSIVE) && !tryUpgrade()) {
-                    // Without the latch, fair handoff is not possible. Fair handoff must
-                    // dequeue nodes, but only the exclusive latch owner or lone shared latch
-                    // owner can do that.
-                    break fairHandoff;
-                }
-            }
-
-            // Sweep through the queue, finding a contiguous run of shared waiters.
-            Node first;
-            int trials = 0;
-            while (true) {
-                // Although the last waiter has been observed to exist, the first waiter field
-                // might not be set yet.
-                first = mLatchFirst;
-                if (first != null) {
-                    break;
-                }
-                trials = spin(trials);
-            }
-
-            // The first pass determines the maximum number of waiters to fairly unpark. Scan
-            // the queue to find the last one.
-            int newState = 1;
-            Node tail = null;
-            {
-                Node node = first;
-                while (true) {
-                    Thread waiter = node.mWaiter;
-                    if (waiter != null) {
-                        if (node instanceof Shared) {
-                            newState++;
-                            tail = node;
-                        } else {
-                            // An exclusive waiter is in the queue, so disallow new shared
-                            // latches. This is indicated by setting the exclusive bit, along
-                            // with a non-zero shared latch count.
-                            newState |= EXCLUSIVE;
-                            break;
-                        }
-                    }
-                    if (node == last) {
-                        break;
-                    }
-                    Node next = node.get();
-                    if (next == null) {
-                        break;
-                    }
-                    node = next;
-                }
-            }
-
-            // Switch the state and fairly unpark the waiters, preventing a thundering herd.
-            mLatchState = newState;
-
-            if (tail != null) {
-                Node node = first;
-                while (true) {
-                    Thread waiter = node.mWaiter;
-                    if (waiter != null && cWaiterUpdater.compareAndSet(node, waiter, null)) {
-                        LockSupport.unpark(waiter);
-                        // Count the actual number of unparks.
-                        newState--;
-                    }
-                    if (node == tail) {
-                        break;
-                    }
-                    node = node.get();
-                }
-
-                int diff = newState & ~EXCLUSIVE;
-                if (diff > 1) {
-                    // Fewer unparks than expected, so fix the state.
-                    cStateUpdater.addAndGet(this, 1 - diff);
-                }
-
-                // Advance the first node along the queue.
-
-                trials = 0;
-                while (true) {
-                    Node next = tail.get();
-                    if (next != null) {
-                        mLatchFirst = next;
-                        break;
-                    } else {
-                        // Queue is now empty, unless an enqueue is in progress.
-                        if (tail == last && cLastUpdater.compareAndSet(this, last, null)) {
-                            cFirstUpdater.compareAndSet(this, first, null);
-                            break;
-                        }
-                    }
-                    trials = spin(trials);
-                }
-            }
-
-            if (newState < 0) {
-                // First in the queue is exclusive, so skip checking for new shared waiters.
+        while (true) {
+            // Sweep through the queue, waking up a contiguous run of shared waiters.
+            final Node first = first();
+            if (first == null) {
                 return;
             }
-        }
 
-        // If any shared waiters were added concurrently, unpark them, but leave them in the
-        // queue. They cannot be fairly unparked, because the latch state was released. Another
-        // thread might now be dequeuing nodes.
+            Node node = first;
+            while (true) {
+                Thread waiter = node.mWaiter;
+                if (waiter != null) {
+                    if (node instanceof Shared) {
+                        cStateUpdater.incrementAndGet(this);
+                        if (cWaiterUpdater.compareAndSet(node, waiter, null)) {
+                            LockSupport.unpark(waiter);
+                        } else {
+                            // Already unparked, so fix the share count.
+                            cStateUpdater.decrementAndGet(this);
+                        }
+                    } else {
+                        // An exclusive waiter is in the queue, so disallow new shared latches.
+                        // This is indicated by setting the exclusive bit, along with a
+                        // non-zero shared latch count.
+                        int state;
+                        do {
+                            state = mLatchState;
+                        } while (state >= 0 &&
+                                 !cStateUpdater.compareAndSet(this, state, state | EXCLUSIVE));
 
-        for (Node node = first(); node != null; node = node.get()) {
-            Thread waiter = node.mWaiter;
-            if (waiter != null) {
-                if (node instanceof Shared) {
-                    LockSupport.unpark(waiter);
-                } else {
+                        if (node != first) {
+                            // Advance the queue.
+                            mLatchFirst = node;
+                        }
+
+                        return;
+                    }
+                }
+
+                Node next = node.get();
+
+                if (next == null) {
+                    // Queue is now empty, unless an enqueue is in progress.
+                    if (cLastUpdater.compareAndSet(this, node, null)) {
+                        cFirstUpdater.compareAndSet(this, first, null);
+                        return;
+                    }
+                    // Sweep from the start again.
                     break;
                 }
+
+                node = next;
             }
         }
     }
