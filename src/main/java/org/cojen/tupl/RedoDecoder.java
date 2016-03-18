@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -42,6 +42,7 @@ abstract class RedoDecoder {
      *
      * @return true if end of stream reached; false if visitor returned false
      */
+    @SuppressWarnings("fallthrough")
     boolean run(RedoVisitor visitor) throws IOException {
         while (true) {
             // Must be called before each operation, for the benefit of subclasses.

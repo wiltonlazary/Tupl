@@ -1,6 +1,72 @@
 Changelog
 =========
 
+v1.3.0
+------
+* Depends on Java 8.
+* Several top-level classes are now interfaces.
+* Tree search operations rely extensively on shared latches instead of exclusive latches,
+  improving concurrency.
+* Fix cursor race condition which allowed split nodes to be modified too soon, leading to
+  database corruption.
+* Fix deadlock when closing database.
+* Fix handling of mapped file shrinkage on Windows.
+* More fixes for random search and add improve safety of frame binding.
+* Added method to analyze index size.
+* Added experimental direct mapped mode when using MappedPageArray and JNA.
+* Added method to evict records from an Index.
+* File sync improvements for Linux and MacOS. Performs directory sync'ng and F_FULLSYNC.
+* Use JNA to access native I/O functions, eliminating extra system calls.
+* Make Latch class a public utility.
+
+v1.2.7.1 (2015-12-22)
+--------
+* Fix defect in cursor skip which might operate against an unlatched node.
+
+v1.2.7 (2015-10-04)
+------
+* Fixed reverse view range handling.
+* Fixed compareKeyTo methods for transformed and trimmed views.
+* Require that bounded views only operate on ordered views.
+* Added method to count entries in a View.
+* Exposed a few more utility methods.
+* When using direct page access mode, page fields are no longer copied to Node instance
+  fields. This reduces overall Java heap memory footprint.
+
+v1.2.6.1 (2015-09-05)
+--------
+* Fix when using mapped files on Linux. Shrinking the database file would cause the process to
+  crash when the file is accessed again.
+
+v1.2.6 (2015-08-30)
+------
+* Counts stored in bottom internal nodes, for speeding up cursor skip operations.
+* Added skip method which accepts a limit key.
+* More failure handling improvements.
+
+v1.2.5 (2015-07-19)
+------
+* Fix non-transactional delete race condition.
+* Fixes for random cursor search, when encountering internal nodes with few entries or when
+  the search range is empty.
+* Bug fix for findNearby acting on a closed index.
+* Improvements for handling temporary write failures.
+* Allow replicas to create no-redo transactions.
+* Added option to change transaction durability mode.
+* Define an evict operation on the page array, for eliminating unnecessary copies.
+* Introduce concurrent cache priming.
+
+v1.2.4 (2015-06-14)
+------
+* Fix node delete race condition which triggered an assertion error.
+* Fix case in which a cursor value was not set if it caused a node merge.
+* Add basic AbstractCursor implementation.
+* Merge custom redo and undo handler interfaces into one.
+* Add checkpoint support to custom transaction handler.
+* Provide access to transaction nesting level.
+* Attempting to write into an unmodifiable transaction should not invalidate it.
+* Introduce combined store and commit operation.
+
 v1.2.3 (2015-05-16)
 ------
 * Fix snapshot deadlock when reading from the cache.

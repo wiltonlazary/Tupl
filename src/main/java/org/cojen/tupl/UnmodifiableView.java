@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2013-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ final class UnmodifiableView implements Index {
     @Override
     public String toString() {
         if (mSource instanceof Index) {
-            return Tree.toString(this);
+            return ViewUtils.toString(this);
         }
         return super.toString();
     }
@@ -74,6 +74,11 @@ final class UnmodifiableView implements Index {
     @Override
     public Cursor newCursor(Transaction txn) {
         return new UnmodifiableCursor(mSource.newCursor(txn));
+    }
+
+    @Override
+    public long count(byte[] lowKey, byte[] highKey) throws IOException {
+        return mSource.count(lowKey, highKey);
     }
 
     @Override
@@ -115,6 +120,14 @@ final class UnmodifiableView implements Index {
 
     @Override
     public boolean remove(Transaction txn, byte[] key, byte[] value) throws IOException {
+        throw new UnmodifiableViewException();
+    }
+
+    @Override
+    public long evict(Transaction txn, byte[] lowKey, byte[] highKey,
+                      Filter evictionFilter, boolean autoload)
+        throws IOException
+    {
         throw new UnmodifiableViewException();
     }
 
@@ -192,6 +205,14 @@ final class UnmodifiableView implements Index {
     @Override
     public boolean isUnmodifiable() {
         return true;
+    }
+
+    @Override
+    public Stats analyze(byte[] lowKey, byte[] highKey) throws IOException {
+        if (mSource instanceof Index) {
+            return ((Index) mSource).analyze(lowKey, highKey);
+        }
+        throw new UnsupportedOperationException();
     }
 
     @Override

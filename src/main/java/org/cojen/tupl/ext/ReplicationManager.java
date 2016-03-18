@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package org.cojen.tupl.ext;
 import java.io.Closeable;
 import java.io.IOException;
 
+import org.cojen.tupl.ConfirmationFailureException;
 import org.cojen.tupl.DatabaseConfig;
 import org.cojen.tupl.DurabilityMode;
 import org.cojen.tupl.EventListener;
@@ -102,16 +103,18 @@ public interface ReplicationManager extends Closeable {
         long position();
 
         /**
-         * Fully writes the given data, returning a confirmation position. When the local
-         * instance loses leadership, all data rolls back to the highest confirmed position.
+         * Fully writes the given data, returning a potential confirmation position. When the
+         * local instance loses leadership, all data rolls back to the highest confirmed
+         * position.
          *
-         * @return confirmation position, or -1 if not leader
+         * @return potential confirmation position, or -1 if not leader
          */
         long write(byte[] b, int off, int len) throws IOException;
 
         /**
          * Blocks until all data up to the given log position is confirmed.
          *
+         * @param position confirmation position as provided by the write method
          * @return false if not leader
          * @throws ConfirmationFailureException
          */
@@ -120,6 +123,7 @@ public interface ReplicationManager extends Closeable {
         /**
          * Blocks until all data up to the given log position is confirmed.
          *
+         * @param position confirmation position as provided by the write method
          * @param timeoutNanos pass -1 for infinite
          * @return false if not leader
          * @throws ConfirmationFailureException

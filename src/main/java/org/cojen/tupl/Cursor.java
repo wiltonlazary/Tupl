@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -104,7 +104,10 @@ public interface Cursor {
      * is less than, equal to, or greater than the rkey.
      * @throws NullPointerException if current key or rkey is null
      */
-    public int compareKeyTo(byte[] rkey);
+    public default int compareKeyTo(byte[] rkey) {
+        byte[] lkey = key();
+        return Utils.compareUnsigned(lkey, 0, lkey.length, rkey, 0, rkey.length);
+    }
 
     /**
      * Compare the current key to the one given.
@@ -116,7 +119,10 @@ public interface Cursor {
      * is less than, equal to, or greater than the rkey.
      * @throws NullPointerException if current key or rkey is null
      */
-    public int compareKeyTo(byte[] rkey, int offset, int length);
+    public default int compareKeyTo(byte[] rkey, int offset, int length) {
+        byte[] lkey = key();
+        return Utils.compareUnsigned(lkey, 0, lkey.length, rkey, offset, length);
+    }
 
     /**
      * Moves the Cursor to find the first available entry. Cursor key and value
@@ -143,8 +149,7 @@ public interface Cursor {
     /**
      * Moves the Cursor by a relative amount of entries. Pass a positive amount
      * to skip forward, and pass a negative amount to skip backwards. If less
-     * than the given amount of entries are available, the Cursor key and value
-     * are set to null, and position will be undefined.
+     * than the given amount of entries are available, the Cursor is reset.
      *
      * <p>Skipping by 1 is equivalent to calling {@link #next next}, and
      * skipping by -1 is equivalent to calling {@link #previous previous}. A
@@ -159,6 +164,33 @@ public interface Cursor {
      * @throws IllegalStateException if position is undefined at invocation time
      */
     public LockResult skip(long amount) throws IOException;
+
+    /**
+     * Moves the Cursor by a relative amount of entries, stopping sooner if the limit key is
+     * reached. Pass a positive amount to skip forward, and pass a negative amount to skip
+     * backwards. If the limit key is reached, or if less than the given amount of entries are
+     * available, the Cursor is reset.
+     *
+     * <p>Skipping by 1 is equivalent to calling {@link #nextLe nextLe}, {@link #nextLt nextLt}
+     * or {@link #next next}, depending on which type of limit was provided. Likewise, skipping
+     * by -1 is equivalent to calling {@link #previousGe previousGe}, {@link #previousGt
+     * previousGt} or {@link #previous previous}. A skip of 0 merely checks and returns the
+     * lock state for the current key. Lock acquisition only applies to the target entry
+     * &mdash; no locks are acquired for entries in between.
+     *
+     * @param limitKey limit key; pass null for no limit
+     * @param inclusive true if limit is inclusive, false for exclusive
+     * @return {@link LockResult#UNOWNED UNOWNED}, {@link LockResult#ACQUIRED
+     * ACQUIRED}, {@link LockResult#OWNED_SHARED OWNED_SHARED}, {@link
+     * LockResult#OWNED_UPGRADABLE OWNED_UPGRADABLE}, or {@link
+     * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
+     * @throws IllegalStateException if position is undefined at invocation time
+     */
+    public default LockResult skip(long amount, byte[] limitKey, boolean inclusive)
+        throws IOException
+    {
+        return ViewUtils.skip(this, amount, limitKey, inclusive);
+    }
 
     /**
      * Moves to the Cursor to the next available entry. Cursor key and value
@@ -372,6 +404,24 @@ public interface Cursor {
      */
     public void store(byte[] value) throws IOException;
 
+    /**
+     * Combined store and commit to the linked transaction. Although similar to storing and
+     * committing explicitly, additional optimizations can be applied. In particular, no undo
+     * log entry is required when committing the outermost transaction scope. This is the same
+     * optimization used by null transactions (auto-commit).
+     *
+     * @param value value to store; pass null to delete
+     * @throws IllegalStateException if position is undefined at invocation time
+     * @throws ViewConstraintException if value is not permitted
+     */
+    public default void commit(byte[] value) throws IOException {
+        store(value);
+        Transaction txn = link();
+        if (txn != null && txn != Transaction.BOGUS) {
+            txn.commit();
+        }
+    }
+
     //public int read(LockResult[] result,int start,byte[] b, int off, int len) throws IOException;
 
     /**
@@ -388,7 +438,9 @@ public interface Cursor {
      * cursor is unpositioned. When using a cursor for opening streams, {@link #autoload
      * autoload} should be disabled.
      */
-    public Stream newStream();
+    public default Stream newStream() {
+        throw new UnsupportedOperationException();
+    }
 
     /**
      * Returns a new independent Cursor, positioned where this one is, and

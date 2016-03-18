@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2013-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -132,6 +132,14 @@ public abstract class WrappedCursor<C extends Cursor> implements Cursor {
      * {@inheritDoc}
      */
     @Override
+    public LockResult skip(long amount, byte[] limitKey, boolean inclusive) throws IOException {
+        return source.skip(amount, limitKey, inclusive);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
     public LockResult next() throws IOException {
         return source.next();
     }
@@ -245,6 +253,14 @@ public abstract class WrappedCursor<C extends Cursor> implements Cursor {
      */
     @Override
     public void store(byte[] value) throws IOException {
+        throw new UnmodifiableViewException();
+    }
+
+    /**
+     * Always throws UnmodifiableViewException by default.
+     */
+    @Override
+    public void commit(byte[] value) throws IOException {
         throw new UnmodifiableViewException();
     }
 

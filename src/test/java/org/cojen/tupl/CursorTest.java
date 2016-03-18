@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -654,6 +654,133 @@ public class CursorTest {
     }
 
     @Test
+    public void bigSkip() throws Exception {
+        View ix = openIndex("skippy");
+
+        for (int i=0; i<1_000_000; i++) {
+            ix.store(Transaction.BOGUS, key(i), value(1));
+        }
+
+        // Force leaf pages to be clean for accumulating counts.
+        mDb.checkpoint();
+
+        Cursor c = ix.newCursor(null);
+
+        // Force counts to be generated.
+        c.first();
+        c.skip(10_000);
+        fastAssertArrayEquals(key(10_000), c.key());
+
+        // Force counts to be persisted.
+        mDb.checkpoint();
+
+        c.first();
+        c.skip(10_000);
+        fastAssertArrayEquals(key(10_000), c.key());
+
+        c.skip(900_000);
+        fastAssertArrayEquals(key(910_000), c.key());
+
+        // Force counts to be persisted.
+        mDb.checkpoint();
+
+        c.last();
+        c.skip(-9_999);
+        fastAssertArrayEquals(key(990_000), c.key());
+
+        c.skip(-980_000);
+        fastAssertArrayEquals(key(10_000), c.key());
+
+        c.skip(Long.MIN_VALUE);
+        assertNull(c.key());
+
+        try {
+            c.skip(Long.MAX_VALUE);
+            fail();
+        } catch (IllegalStateException e) {
+        }
+    }
+
+    @Test
+    public void bigSkipBounded() throws Exception {
+        View ix = openIndex("skippy");
+
+        for (int i=0; i<1_000_000; i++) {
+            ix.store(Transaction.BOGUS, key(i), value(1));
+        }
+
+        Cursor c = ix.newCursor(null);
+
+        c.first();
+        c.skip(100_000, key(50_000), false);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(50_000), true);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(99_999), false);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(99_999), true);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(100_000), false);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(100_000), true);
+        fastAssertArrayEquals(key(100_000), c.key());
+
+        c.first();
+        c.skip(100_000, key(100_001), false);
+        fastAssertArrayEquals(key(100_000), c.key());
+
+        c.first();
+        c.skip(100_000, key(100_001), true);
+        fastAssertArrayEquals(key(100_000), c.key());
+
+        // In reverse.
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 50_000), false);
+        assertNull(c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 50_000), true);
+        assertNull(c.key());
+        
+        c.last();
+        c.skip(-100_000, key(999_999 - 99_999), false);
+        assertNull(c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 99_999), true);
+        assertNull(c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 100_000), false);
+        assertNull(c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 100_000), true);
+        fastAssertArrayEquals(key(999_999 - 100_000), c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 100_001), false);
+        fastAssertArrayEquals(key(999_999 - 100_000), c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 100_001), true);
+        fastAssertArrayEquals(key(999_999 - 100_000), c.key());
+
+        c.reset();
+    }
+
+    @Test
     public void randomLock() throws Exception {
         View ix = openIndex("test");
         ix.store(Transaction.BOGUS, key(0), value(0));
@@ -800,7 +927,7 @@ public class CursorTest {
         assertTrue(verify(ix));
     }
 
-    private void verifyExtremities(View ix) throws Exception {
+    protected void verifyExtremities(View ix) throws Exception {
         TreeCursor extremity = treeCursor(ix.newCursor(Transaction.BOGUS));
         assertTrue(extremity.verifyExtremities(Node.LOW_EXTREMITY));
         assertTrue(extremity.verifyExtremities(Node.HIGH_EXTREMITY));
@@ -916,6 +1043,44 @@ public class CursorTest {
     }
 
     @Test
+    public void randomNonRange() throws Exception {
+        View ix = openIndex("test");
+
+        Cursor c = ix.newCursor(null);
+
+        byte[] low = {10};
+        byte[] high = {20};
+
+        c.random(low, low);
+        assertNull(c.key());
+
+        c.random(high, low);
+        assertNull(c.key());
+
+        ix.store(Transaction.BOGUS, low, low);
+        ix.store(Transaction.BOGUS, high, high);
+
+        c.random(low, low);
+        assertNull(c.key());
+
+        c.random(high, low);
+        assertNull(c.key());
+
+        for (int i=1; i<=20000; i+=2) {
+            ix.store(Transaction.BOGUS, key(i), value(i));
+        }
+
+        c.random(low, low);
+        assertNull(c.key());
+    
+        c.random(new byte[] {0, 0, 0, 2}, new byte[] {0, 0, 0, 3});
+        assertNull(c.key());
+
+        c.random(null, new byte[] {0, 0, 0, 0});
+        assertNull(c.key());
+    }
+
+    @Test
     public void stability() throws Exception {
         // Verifies that cursors are positioned properly after making structural modifications
         // to the tree.
@@ -944,6 +1109,8 @@ public class CursorTest {
         }
 
         assertTrue(verify(ix));
+
+        assertEquals(foundCursors.length + notFoundCursors.length, mDb.stats().cursorCount());
 
         verifyPositions(ix, foundCursors);
         verifyPositions(ix, notFoundCursors);
@@ -1001,7 +1168,7 @@ public class CursorTest {
         verifyPositions(ix, cursors);
     }
 
-    private void verifyPositions(View ix, Cursor[] cursors) throws Exception {
+    protected void verifyPositions(View ix, Cursor[] cursors) throws Exception {
         for (Cursor existing : cursors) {
             Cursor c = ix.newCursor(Transaction.BOGUS);
             byte[] key = existing.key();

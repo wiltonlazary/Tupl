@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2013-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -96,7 +96,7 @@ public class AttributedFileFactory implements FileFactory {
         }
     }
 
-    @SuppressWarnings("unchecked")
+    @SuppressWarnings({"unchecked", "rawtypes"})
     private static FileAttribute<Set<PosixFilePermission>>[] toAttrs(String posixPerms) {
         if (posixPerms == null) {
             return null;

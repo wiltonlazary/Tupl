@@ -1,5 +1,5 @@
 /*
- *  Copyright 2014 Brian S O'Neill
+ *  Copyright 2014-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -49,6 +49,11 @@ final class TransformedView implements View {
     @Override
     public Cursor newCursor(Transaction txn) {
         return new TransformedCursor(mSource.newCursor(txn), mTransformer);
+    }
+
+    @Override
+    public long count(byte[] lowKey, byte[] highKey) throws IOException {
+        return ViewUtils.count(this, mTransformer.requireValue(), lowKey, highKey);
     }
 
     @Override

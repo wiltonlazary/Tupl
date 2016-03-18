@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,10 +18,7 @@ package org.cojen.tupl;
 
 import java.io.EOFException;
 import java.io.File;
-import java.io.InputStream;
 import java.io.IOException;
-
-import java.math.BigInteger;
 
 import java.util.Arrays;
 import java.util.Random;
@@ -53,28 +50,15 @@ class Utils extends org.cojen.tupl.io.Utils {
         return (i | (i >> 16)) + 1;
     }
 
-    static BigInteger valueOfUnsigned(long v) {
-        byte[] temp = new byte[9];
-        encodeLongBE(temp, 1, v);
-        return new BigInteger(temp);
-    }
-
-    private static final Random cRnd = new Random();
-    
-    static Random random() {
-        return cRnd;
-    }
-
-    private static int cSeedMix = cRnd.nextInt();
+    private static int cSeedMix = new Random().nextInt();
 
     /**
      * @return non-zero random number, suitable for Xorshift RNG or object hashcode
      */
     static int randomSeed() {
-        long id = Thread.currentThread().getId();
-        int seed = ((int) id) ^ ((int) (id >>> 32)) ^ cSeedMix;
-        if (seed == 0) {
-            while ((seed = cRnd.nextInt()) == 0);
+        int seed = Long.hashCode(Thread.currentThread().getId()) ^ cSeedMix;
+        while (seed == 0) {
+            seed = new Random().nextInt();
         }
         cSeedMix = nextRandom(seed);
         return seed;
@@ -121,7 +105,8 @@ class Utils extends org.cojen.tupl.io.Utils {
 
         // Invert v *= 21
         //v *= 14933078535860113213u;
-        v = (v * 7466539267930056606L) + (v * 7466539267930056607L);
+        //v = (v * 7466539267930056606L) + (v * 7466539267930056607L);
+        v = ((v * 7466539267930056606L) << 1) + v;
 
         // Invert v = v ^ (v >>> 14)
         tmp = v ^ v >>> 14;
@@ -131,7 +116,8 @@ class Utils extends org.cojen.tupl.io.Utils {
 
         // Invert v *= 265
         //v *= 15244667743933553977u;
-        v = (v * 7622333871966776988L) + (v * 7622333871966776989L);
+        //v = (v * 7622333871966776988L) + (v * 7622333871966776989L);
+        v = ((v * 7622333871966776988L) << 1) + v;
 
         // Invert v = v ^ (v >>> 24)
         tmp = v ^ v >>> 24;
@@ -214,34 +200,6 @@ class Utils extends org.cojen.tupl.io.Utils {
     }
 
     /**
-     * @return negative if 'a' is less, zero if equal, greater than zero if greater
-     */
-    static int compareKeys(byte[] a, byte[] b) {
-        return compareKeys(a, 0, a.length, b, 0, b.length);
-    }
-
-    /**
-     * @param a key 'a'
-     * @param aoff key 'a' offset
-     * @param alen key 'a' length
-     * @param b key 'b'
-     * @param boff key 'b' offset
-     * @param blen key 'b' length
-     * @return negative if 'a' is less, zero if equal, greater than zero if greater
-     */
-    static int compareKeys(byte[] a, int aoff, int alen, byte[] b, int boff, int blen) {
-        int minLen = Math.min(alen, blen);
-        for (int i=0; i<minLen; i++) {
-            byte ab = a[aoff + i];
-            byte bb = b[boff + i];
-            if (ab != bb) {
-                return (ab & 0xff) - (bb & 0xff);
-            }
-        }
-        return alen - blen;
-    }
-
-    /**
      * Returns a new key, midway between the given low and high keys. Returned key is never
      * equal to the low key, but it might be equal to the high key. If high key is not actually
      * higher than the given low key, an ArrayIndexOfBoundException might be thrown.
@@ -277,21 +235,6 @@ class Utils extends org.cojen.tupl.io.Utils {
         byte[] mid = new byte[lowLen + 1];
         System.arraycopy(high, highOff, mid, 0, mid.length);
         return mid;
-    }
-
-    static void readFully(InputStream in, byte[] b, int off, int len) throws IOException {
-        if (len > 0) {
-            while (true) {
-                int amt = in.read(b, off, len);
-                if (amt <= 0) {
-                    throw new EOFException();
-                }
-                if ((len -= amt) <= 0) {
-                    break;
-                }
-                off += amt;
-            }
-        }
     }
 
     /**
@@ -716,46 +659,6 @@ class Utils extends org.cojen.tupl.io.Utils {
     }
 
     /**
-     * Adds one to an unsigned integer, represented as a byte array. If
-     * overflowed, value in byte array is 0x00, 0x00, 0x00...
-     *
-     * @param value unsigned integer to increment
-     * @param start inclusive index
-     * @param end exclusive index
-     * @return false if overflowed
-     */
-    public static boolean increment(byte[] value, final int start, int end) {
-        while (--end >= start) {
-            if (++value[end] != 0) {
-                // No carry bit, so done adding.
-                return true;
-            }
-        }
-        // This point is reached upon overflow.
-        return false;
-    }
-
-    /**
-     * Subtracts one from an unsigned integer, represented as a byte array. If
-     * overflowed, value in byte array is 0xff, 0xff, 0xff...
-     *
-     * @param value unsigned integer to decrement
-     * @param start inclusive index
-     * @param end exclusive index
-     * @return false if overflowed
-     */
-    public static boolean decrement(byte[] value, final int start, int end) {
-        while (--end >= start) {
-            if (--value[end] != -1) {
-                // No borrow bit, so done subtracting.
-                return true;
-            }
-        }
-        // This point is reached upon overflow.
-        return false;
-    }
-
-    /**
      * Subtracts one from the given reverse unsigned variable integer, of any
      * size. A reverse unsigned variable integer is encoded such that all the
      * bits are complemented. When lexicographically sorted, the order is
@@ -787,11 +690,11 @@ class Utils extends org.cojen.tupl.io.Utils {
         return h - g;
     }
 
-    static String toHex(byte[] key) {
+    public static String toHex(byte[] key) {
         return key == null ? "null" : toHex(key, 0, key.length);
     }
 
-    static String toHex(byte[] key, int offset, int length) {
+    public static String toHex(byte[] key, int offset, int length) {
         if (key == null) {
             return "null";
         }
@@ -809,11 +712,11 @@ class Utils extends org.cojen.tupl.io.Utils {
         return (char) ((b < 10) ? ('0' + b) : ('a' + b - 10));
     }
 
-    static String toHexDump(byte[] b) {
+    public static String toHexDump(byte[] b) {
         return toHexDump(b, 0, b.length);
     }
 
-    static String toHexDump(byte[] b, int offset, int length) {
+    public static String toHexDump(byte[] b, int offset, int length) {
         StringBuilder bob = new StringBuilder();
 
         for (int i=0; i<length; i+=16) {

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2015 Brian S O'Neill
+ *  Copyright 2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,13 +24,12 @@ import java.lang.reflect.Method;
 
 import java.nio.ByteBuffer;
 
-import java.security.GeneralSecurityException;
+import java.util.Arrays;
 
 import java.util.zip.CRC32;
 
-import javax.crypto.Cipher;
-
 import org.cojen.tupl.io.DirectAccess;
+import org.cojen.tupl.io.MappedPageArray;
 
 /**
  * 
@@ -39,11 +38,35 @@ import org.cojen.tupl.io.DirectAccess;
  * @see PageOps
  */
 final class DirectPageOps {
+    static final int NODE_OVERHEAD = 100 - 24; // 6 fewer fields
+
     private static final Unsafe UNSAFE = Hasher.getUnsafe();
     private static final long BYTE_ARRAY_OFFSET = UNSAFE.arrayBaseOffset(byte[].class);
-    private static final long EMPTY = p_alloc(0);
+    private static final long CLOSED_TREE_PAGE;
+    private static final long NON_TREE_PAGE;
 
     private static final Method CRC_BUFFER_UPDATE_METHOD;
+
+    static {
+        CLOSED_TREE_PAGE = newEmptyPage();
+        NON_TREE_PAGE = newEmptyPage();
+    }
+
+    private static long newEmptyPage() {
+        long empty = p_calloc(Node.TN_HEADER_SIZE);
+
+        p_bytePut(empty, 0, Node.TYPE_TN_LEAF | Node.LOW_EXTREMITY | Node.HIGH_EXTREMITY);
+
+        // Set fields such that binary search returns ~0 and availableBytes returns 0.
+
+        // Note: Same as Node.clearEntries.
+        p_shortPutLE(empty, 4,  Node.TN_HEADER_SIZE);     // leftSegTail
+        p_shortPutLE(empty, 6,  Node.TN_HEADER_SIZE - 1); // rightSegTail
+        p_shortPutLE(empty, 8,  Node.TN_HEADER_SIZE);     // searchVecStart
+        p_shortPutLE(empty, 10, Node.TN_HEADER_SIZE - 2); // searchVecEnd
+
+        return empty;
+    }
 
     static {
         Method m;
@@ -57,17 +80,19 @@ final class DirectPageOps {
     }
 
     static long p_null() {
-        return 4;
+        return 0;
     }
 
-    static long p_empty() {
-        return EMPTY;
+    static long p_closedTreePage() {
+        return CLOSED_TREE_PAGE;
+    }
+
+    static long p_nonTreePage() {
+        return NON_TREE_PAGE;
     }
 
     static long p_alloc(int size) {
-        long ptr = UNSAFE.allocateMemory(4 + size);
-        UNSAFE.putInt(ptr, size);
-        return ptr + 4;
+        return UNSAFE.allocateMemory(size);
     }
 
     static long p_calloc(int size) {
@@ -81,13 +106,159 @@ final class DirectPageOps {
     }
 
     static void p_delete(long page) {
-        if (page != EMPTY) {
-            UNSAFE.freeMemory(page - 4);
+        // Only delete pages that were allocated from the Unsafe class and aren't globals.
+        if (page != CLOSED_TREE_PAGE && page != NON_TREE_PAGE && !inArena(page)) {
+            UNSAFE.freeMemory(page);
         }
     }
 
-    static long p_clone(long page) {
-        int length = p_length(page);
+    static class Arena implements Comparable<Arena> {
+        private final MappedPageArray mPageArray;
+        private final long mStartPtr;
+        private final long mEndPtr; // exclusive
+
+        private long mNextPtr;
+
+        Arena(int pageSize, long pageCount) throws IOException {
+            mPageArray = MappedPageArray.open(pageSize, pageCount, null, null);
+            mStartPtr = mPageArray.directPagePointer(0);
+            mEndPtr = mStartPtr + (pageSize * pageCount);
+            synchronized (this) {
+                mNextPtr = mStartPtr;
+            }
+        }
+
+        @Override
+        public int compareTo(Arena other) {
+            return Long.compareUnsigned(mStartPtr, other.mStartPtr);
+        }
+
+        synchronized long p_calloc(int size) {
+            int pageSize = mPageArray.pageSize();
+            if (size != pageSize) {
+                throw new IllegalArgumentException();
+            }
+            long ptr = mNextPtr;
+            if (ptr >= mEndPtr) {
+                return p_null();
+            }
+            mNextPtr = ptr + pageSize;
+            return ptr;
+        }
+
+        synchronized void close() throws IOException {
+            mNextPtr = mEndPtr;
+            mPageArray.close();
+        }
+    }
+
+    private static volatile Arena[] cArenas;
+
+    static boolean inArena(long page) {
+        Arena[] arenas = cArenas;
+
+        if (arenas != null) {
+            // Binary search.
+
+            int low = 0;
+            int high = arenas.length - 1;
+
+            while (low <= high) {
+                int mid = (low + high) >>> 1;
+                int cmp = Long.compareUnsigned(arenas[mid].mStartPtr, page);
+                if (cmp < 0) {
+                    low = mid + 1;
+                } else if (cmp > 0) {
+                    high = mid - 1;
+                } else {
+                    return true;
+                }
+            }
+
+            if (low > 0 && Long.compareUnsigned(page, arenas[low - 1].mEndPtr) < 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static synchronized void registerArena(Arena arena) {
+        Arena[] existing = cArenas;
+        if (existing == null) {
+            cArenas = new Arena[] {arena};
+        } else {
+            // Arenas are searchable in a sorted array, and nothing special needs to be done to
+            // handle overlapping ranges. We trust that the operating system doesn't do this.
+            Arena[] arenas = new Arena[existing.length + 1];
+            System.arraycopy(existing, 0, arenas, 0, existing.length);
+            arenas[arenas.length - 1] = arena;
+            Arrays.sort(arenas);
+            cArenas = arenas;
+        }
+    }
+
+    private static synchronized void unregisterArena(Arena arena) {
+        Arena[] existing = cArenas;
+
+        if (existing == null) {
+            return;
+        }
+
+        if (existing.length == 1) {
+            if (existing[0] == arena) {
+                cArenas = null;
+            }
+            return;
+        }
+
+        try {
+            Arena[] arenas = new Arena[existing.length - 1];
+            for (int i=0,j=0; i<existing.length; i++) {
+                Arena a = existing[i];
+                if (a != arena) {
+                    arenas[j++] = a;
+                }
+            }
+            cArenas = arenas;
+        } catch (IndexOutOfBoundsException e) {
+            // Not found.
+        }
+    }
+
+    static Object p_arenaAlloc(int pageSize, long pageCount) throws IOException {
+        Arena arena = new Arena(pageSize, pageCount);
+        registerArena(arena);
+        return arena;
+    }
+
+    static void p_arenaDelete(Object arena) throws IOException {
+        if (arena instanceof Arena) {
+            Arena a = (Arena) arena;
+            // Unregister before closing, in case new allocations are allowed in the recycled
+            // memory range and then deleted. The delete method would erroneously think the page
+            // is still in an arena and do nothing.
+            unregisterArena(a);
+            a.close();
+        } else if (arena != null) {
+            throw new IllegalArgumentException();
+        }
+    }
+
+    static long p_calloc(Object arena, int size) {
+        if (arena instanceof Arena) {
+            long page = ((Arena) arena).p_calloc(size);
+            if (page != p_null()) {
+                return page;
+            }
+        } else if (arena != null) {
+            throw new IllegalArgumentException();
+        }
+
+        return p_calloc(size);
+    }
+
+    static long p_clone(long page, int length) {
         long dst = p_alloc(length);
         UNSAFE.copyMemory(page, dst, length);
         return dst;
@@ -104,10 +275,6 @@ final class DirectPageOps {
         int length = array.length;
         p_copyFromArray(array, 0, page, 0, length);
         return page;
-    }
-
-    static int p_length(long page) {
-        return UNSAFE.getInt(page - 4);
     }
 
     static byte p_byteGet(long page, int index) {
@@ -394,10 +561,6 @@ final class DirectPageOps {
         return Utils.calcUnsignedVarLongLength(v);
     }
 
-    static void p_clear(long page) {
-        UNSAFE.setMemory(page, p_length(page), (byte) 0);
-    }
-
     static void p_clear(long page, int fromIndex, int toIndex) {
         UNSAFE.setMemory(page + fromIndex, toIndex - fromIndex, (byte) 0);
     }
@@ -577,32 +740,5 @@ final class DirectPageOps {
         }
 
         return (int) crc.getValue();
-    }
-
-    static int p_cipherDoFinal(Cipher cipher,
-                               long srcPage, int srcStart, int srcLen,
-                               long dstPage, int dstStart)
-        throws GeneralSecurityException
-    {
-        ByteBuffer src = DirectAccess.ref(srcPage + srcStart, srcLen);
-        try {
-            ByteBuffer dst = DirectAccess.ref2(dstPage + dstStart, srcLen);
-            try {
-                return cipher.doFinal(src, dst);
-            } finally {
-                DirectAccess.unref(dst);
-            }
-        } finally {
-            DirectAccess.unref(src);
-        }
-    }
-
-    static void p_undoPush(UndoLog undo, long indexId, byte op,
-                           long payload, int off, int len)
-        throws IOException
-    {
-        byte[] temp = new byte[len];
-        p_copyToArray(payload, off, temp, 0, len);
-        undo.push(indexId, op, temp, 0, len);
     }
 }

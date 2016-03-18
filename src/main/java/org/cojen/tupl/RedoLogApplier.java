@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
-import org.cojen.tupl.ext.RedoHandler;
+import org.cojen.tupl.ext.TransactionHandler;
 
 /**
  * 
@@ -26,14 +26,15 @@ import org.cojen.tupl.ext.RedoHandler;
  * @author Brian S O'Neill
  * @see RedoLogRecovery
  */
+/*P*/
 final class RedoLogApplier implements RedoVisitor {
-    private final Database mDatabase;
-    private final LHashTable.Obj<Transaction> mTransactions;
+    private final LocalDatabase mDatabase;
+    private final LHashTable.Obj<LocalTransaction> mTransactions;
     private final LHashTable.Obj<Index> mIndexes;
 
     long mHighestTxnId;
 
-    RedoLogApplier(Database db, LHashTable.Obj<Transaction> txns) {
+    RedoLogApplier(LocalDatabase db, LHashTable.Obj<LocalTransaction> txns) {
         mDatabase = db;
         mTransactions = txns;
         mIndexes = new LHashTable.Obj<>(16);
@@ -99,9 +100,9 @@ final class RedoLogApplier implements RedoVisitor {
 
     @Override
     public boolean txnEnter(long txnId) throws IOException {
-        Transaction txn = txn(txnId);
+        LocalTransaction txn = txn(txnId);
         if (txn == null) {
-            txn = new Transaction(mDatabase, txnId, LockMode.UPGRADABLE_READ, 0L);
+            txn = new LocalTransaction(mDatabase, txnId, LockMode.UPGRADABLE_READ, 0L);
             mTransactions.insert(txnId).value = txn;
         } else {
             txn.enter();
@@ -141,7 +142,7 @@ final class RedoLogApplier implements RedoVisitor {
     @Override
     public boolean txnCommitFinal(long txnId) throws IOException {
         checkHighest(txnId);
-        Transaction txn = mTransactions.removeValue(txnId);
+        LocalTransaction txn = mTransactions.removeValue(txnId);
         if (txn != null) {
             txn.commitAll();
         }
@@ -174,10 +175,10 @@ final class RedoLogApplier implements RedoVisitor {
     public boolean txnCustom(long txnId, byte[] message) throws IOException {
         Transaction txn = txn(txnId);
         if (txn != null) {
-            Database db = mDatabase;
-            RedoHandler handler = db.mCustomRedoHandler;
+            LocalDatabase db = mDatabase;
+            TransactionHandler handler = db.mCustomTxnHandler;
             if (handler == null) {
-                throw new DatabaseException("Custom redo handler is not installed");
+                throw new DatabaseException("Custom transaction handler is not installed");
             }
             handler.redo(db, txn, message);
         }
@@ -190,10 +191,10 @@ final class RedoLogApplier implements RedoVisitor {
     {
         Transaction txn = txn(txnId);
         if (txn != null) {
-            Database db = mDatabase;
-            RedoHandler handler = db.mCustomRedoHandler;
+            LocalDatabase db = mDatabase;
+            TransactionHandler handler = db.mCustomTxnHandler;
             if (handler == null) {
-                throw new DatabaseException("Custom redo handler is not installed");
+                throw new DatabaseException("Custom transaction handler is not installed");
             }
             txn.lockExclusive(indexId, key);
             handler.redo(db, txn, message, indexId, key);
@@ -201,7 +202,7 @@ final class RedoLogApplier implements RedoVisitor {
         return true;
     }
 
-    private Transaction txn(long txnId) {
+    private LocalTransaction txn(long txnId) {
         checkHighest(txnId);
         return mTransactions.getValue(txnId);
     }

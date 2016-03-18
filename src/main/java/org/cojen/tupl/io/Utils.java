@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2013-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ package org.cojen.tupl.io;
 import org.cojen.tupl.CorruptDatabaseException;
 
 import java.io.Closeable;
+import java.io.EOFException;
+import java.io.InputStream;
 import java.io.IOException;
 
 import java.lang.reflect.Method;
@@ -35,6 +37,78 @@ import java.util.Map;
  */
 public class Utils {
     protected Utils() {
+    }
+
+    /**
+     * Performs a lexicographical comparison between two unsigned byte arrays.
+     *
+     * @return negative if 'a' is less, zero if equal, greater than zero if greater
+     */
+    public static int compareUnsigned(byte[] a, byte[] b) {
+        return compareUnsigned(a, 0, a.length, b, 0, b.length);
+    }
+
+    /**
+     * Performs a lexicographical comparison between two unsigned byte arrays.
+     *
+     * @param a array 'a'
+     * @param aoff array 'a' offset
+     * @param alen array 'a' length
+     * @param b array 'b'
+     * @param boff array 'b' offset
+     * @param blen array 'b' length
+     * @return negative if 'a' is less, zero if equal, greater than zero if greater
+     */
+    public static int compareUnsigned(byte[] a, int aoff, int alen, byte[] b, int boff, int blen) {
+        int minLen = Math.min(alen, blen);
+        for (int i=0; i<minLen; i++) {
+            byte ab = a[aoff + i];
+            byte bb = b[boff + i];
+            if (ab != bb) {
+                return (ab & 0xff) - (bb & 0xff);
+            }
+        }
+        return alen - blen;
+    }
+
+    /**
+     * Adds one to an unsigned integer, represented as a byte array. If
+     * overflowed, value in byte array is 0x00, 0x00, 0x00...
+     *
+     * @param value unsigned integer to increment
+     * @param start inclusive index
+     * @param end exclusive index
+     * @return false if overflowed
+     */
+    public static boolean increment(byte[] value, final int start, int end) {
+        while (--end >= start) {
+            if (++value[end] != 0) {
+                // No carry bit, so done adding.
+                return true;
+            }
+        }
+        // This point is reached upon overflow.
+        return false;
+    }
+
+    /**
+     * Subtracts one from an unsigned integer, represented as a byte array. If
+     * overflowed, value in byte array is 0xff, 0xff, 0xff...
+     *
+     * @param value unsigned integer to decrement
+     * @param start inclusive index
+     * @param end exclusive index
+     * @return false if overflowed
+     */
+    public static boolean decrement(byte[] value, final int start, int end) {
+        while (--end >= start) {
+            if (--value[end] != -1) {
+                // No borrow bit, so done subtracting.
+                return true;
+            }
+        }
+        // This point is reached upon overflow.
+        return false;
     }
 
     /**
@@ -283,6 +357,25 @@ public class Utils {
                      ((b[offset + 7]       ) << 24))              ) << 32);
     }
 
+    /**
+     * Fully reads the required length of bytes, throwing an EOFException if the end of stream
+     * is reached too soon.
+     */
+    public static void readFully(InputStream in, byte[] b, int off, int len) throws IOException {
+        if (len > 0) {
+            while (true) {
+                int amt = in.read(b, off, len);
+                if (amt <= 0) {
+                    throw new EOFException();
+                }
+                if ((len -= amt) <= 0) {
+                    break;
+                }
+                off += amt;
+            }
+        }
+    }
+
     private static volatile boolean cDeleteUnsupported;
 
     /**
@@ -348,17 +441,15 @@ public class Utils {
                     }
                 }
 
-                closer = new Thread() {
-                    public void run() {
-                        try {
-                            close(resource, cause);
-                        } catch (IOException e2) {
-                            // Ignore.
-                        } finally {
-                            unregister(resource);
-                        }
+                closer = new Thread(() -> {
+                    try {
+                        close(resource, cause);
+                    } catch (IOException e2) {
+                        // Ignore.
+                    } finally {
+                        unregister(resource);
                     }
-                };
+                });
 
                 cCloseThreads.put(resource, closer);
             }

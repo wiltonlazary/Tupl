@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
  */
 
 package org.cojen.tupl;
+
+import java.io.IOException;
 
 import static org.cojen.tupl.Utils.*;
 
@@ -98,6 +100,11 @@ final class BoundedView extends SubView {
     }
 
     @Override
+    public long count(byte[] lowKey, byte[] highKey) throws IOException {
+        return mSource.count(adjustLowKey(lowKey), adjustHighKey(highKey));
+    }
+
+    @Override
     public View viewGe(byte[] key) {
         if (key == null) {
             throw new NullPointerException("Key is null");
@@ -168,15 +175,12 @@ final class BoundedView extends SubView {
     }
 
     /**
+     * @param key must not be null
      * @return <0 if less than start, 0 if equal (in range), >0 if higher (in range)
      */
     int startRangeCompare(byte[] key) {
         byte[] start = mStart;
-        if (start == null) {
-            return 1;
-        }
-        int result = compareKeys(key, 0, key.length, start, 0, start.length);
-        return result != 0 ? result : (mMode & START_EXCLUSIVE);
+        return start == null ? 1 : startRangeCompare(start, key);
     }
 
     /**
@@ -185,20 +189,17 @@ final class BoundedView extends SubView {
      * @return <0 if less than start, 0 if equal (in range), >0 if higher (in range)
      */
     int startRangeCompare(byte[] start, byte[] key) {
-        int result = compareKeys(key, 0, key.length, start, 0, start.length);
+        int result = compareUnsigned(key, 0, key.length, start, 0, start.length);
         return result != 0 ? result : (mMode & START_EXCLUSIVE);
     }
 
     /**
+     * @param key must not be null
      * @return <0 if less than end (in range), 0 if equal (in range), >0 if higher
      */
     int endRangeCompare(byte[] key) {
         byte[] end = mEnd;
-        if (end == null) {
-            return -1;
-        }
-        int result = compareKeys(key, 0, key.length, end, 0, end.length);
-        return result != 0 ? result : (mMode & END_EXCLUSIVE);
+        return end == null ? -1 : endRangeCompare(end, key);
     }
 
     /**
@@ -207,7 +208,31 @@ final class BoundedView extends SubView {
      * @return <0 if less than end (in range), 0 if equal (in range), >0 if higher
      */
     int endRangeCompare(byte[] end, byte[] key) {
-        int result = compareKeys(key, 0, key.length, end, 0, end.length);
+        int result = compareUnsigned(key, 0, key.length, end, 0, end.length);
         return result != 0 ? result : (mMode & END_EXCLUSIVE);
+    }
+
+    byte[] adjustLowKey(byte[] lowKey) {
+        byte[] start = mStart;
+        if (start != null && (lowKey == null || startRangeCompare(start, lowKey) < 0)) {
+            lowKey = start;
+            if ((mMode & START_EXCLUSIVE) != 0) {
+                // Switch to exclusive start behavior.
+                lowKey = ViewUtils.appendZero(lowKey);
+            }
+        }
+        return lowKey;
+    }
+
+    byte[] adjustHighKey(byte[] highKey) {
+        byte[] end = mEnd;
+        if (end != null && (highKey == null || endRangeCompare(end, highKey) > 0)) {
+            highKey = end;
+            if ((mMode & END_EXCLUSIVE) == 0) {
+                // Switch to inclusive end behavior.
+                highKey = ViewUtils.appendZero(highKey);
+            }
+        }
+        return highKey;
     }
 }

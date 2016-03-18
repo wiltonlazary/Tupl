@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,9 +20,8 @@ import java.io.IOException;
 
 import java.util.BitSet;
 
-import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
 
 import org.cojen.tupl.io.PageArray;
 
@@ -56,6 +55,8 @@ final class PageManager {
     // One remove lock for all queues.
     private final ReentrantLock mRemoveLock;
     private long mTotalPageCount;
+    private long mPageLimit;
+    private ThreadLocal<Long> mPageLimitOverride;
 
     private final PageQueue mRegularFreeList;
     private final PageQueue mRecycleFreeList;
@@ -99,6 +100,8 @@ final class PageManager {
         mRemoveLock = new ReentrantLock(false);
         mRegularFreeList = PageQueue.newRegularFreeList(this);
         mRecycleFreeList = PageQueue.newRecycleFreeList(this);
+
+        mPageLimit = -1; // no limit
 
         try {
             if (!restored) {
@@ -208,7 +211,7 @@ final class PageManager {
                     break alloc;
                 }
 
-                final Lock lock = mRemoveLock;
+                final ReentrantLock lock = mRemoveLock;
                 lock.lock();
                 pageId = mRecycleFreeList.tryRemove(lock);
                 if (pageId != 0) {
@@ -238,7 +241,12 @@ final class PageManager {
                         }
                     }
 
-                    pageId = mTotalPageCount++;
+                    try {
+                        pageId = increasePageCount();
+                    } catch (Throwable e) {
+                        lock.unlock();
+                        throw e;
+                    }
                 }
 
                 lock.unlock();
@@ -288,11 +296,80 @@ final class PageManager {
         long pageId;
         mRemoveLock.lock();
         try {
-            pageId = mTotalPageCount++;
+            pageId = increasePageCount();
         } finally {
             mRemoveLock.unlock();
         }
         recyclePage(pageId);
+    }
+
+    /**
+     * Caller must hold mRemoveLock.
+     *
+     * @return newly allocated page id
+     */
+    private long increasePageCount() throws IOException, DatabaseFullException {
+        long total = mTotalPageCount;
+
+        long limit;
+        {
+            ThreadLocal<Long> override = mPageLimitOverride;
+            Long limitObj;
+            if (override == null || (limitObj = override.get()) == null) {
+                limit = mPageLimit;
+            } else {
+                limit = limitObj;
+            }
+
+            long max = mPageArray.getPageCountLimit();
+            if (max > 0 && (limit < 0 || limit > max)) {
+                limit = max;
+            }
+        }
+
+        if (limit >= 0 && total >= limit) {
+            throw new DatabaseFullException
+                ("Capacity limit reached: " + (limit * mPageArray.pageSize()));
+        }
+
+        mTotalPageCount = total + 1;
+        return total;
+    }
+
+    public void pageLimit(long limit) {
+        mRemoveLock.lock();
+        try {
+            mPageLimit = limit;
+        } finally {
+            mRemoveLock.unlock();
+        }
+    }
+
+    public void pageLimitOverride(long limit) {
+        mRemoveLock.lock();
+        try {
+            if (limit == 0) {
+                if (mPageLimitOverride != null) {
+                    mPageLimitOverride.remove();
+                }
+            } else {
+                if (mPageLimitOverride == null) {
+                    mPageLimitOverride = new ThreadLocal<>();
+                }
+                mPageLimitOverride.set(limit);
+            }
+        } finally {
+            mRemoveLock.unlock();
+        }
+    }
+
+    public long pageLimit() {
+        mRemoveLock.lock();
+        try {
+            return mPageLimit;
+        } finally {
+            mRemoveLock.unlock();
+        }
     }
 
     /**
@@ -359,15 +436,15 @@ final class PageManager {
     /**
      * @return false if aborted
      */
-    public boolean compactionScanFreeList(ReentrantReadWriteLock commitLock) throws IOException {
+    public boolean compactionScanFreeList(CommitLock commitLock) throws IOException {
         return compactionScanFreeList(commitLock, mRecycleFreeList)
             && compactionScanFreeList(commitLock, mRegularFreeList);
     }
 
-    private boolean compactionScanFreeList(ReentrantReadWriteLock commitLock, PageQueue list)
+    private boolean compactionScanFreeList(CommitLock commitLock, PageQueue list)
         throws IOException
     {
-        Lock sharedCommitLock = commitLock.readLock();
+        ReadLock sharedCommitLock = commitLock.readLock();
 
         long target;
         mRemoveLock.lock();
@@ -420,7 +497,7 @@ final class PageManager {
     /**
      * @return false if aborted
      */
-    public boolean compactionEnd(ReentrantReadWriteLock commitLock) throws IOException {
+    public boolean compactionEnd(CommitLock commitLock) throws IOException {
         // Default will reclaim everything.
         long upperBound = Long.MAX_VALUE;
 
@@ -429,7 +506,7 @@ final class PageManager {
         // Need exclusive commit lock to prevent delete and recycle from attempting to operate
         // against a null reserve list. A race condition exists otherwise. Acquire full lock
         // too out of paranoia.
-        commitLock.writeLock().lock();
+        commitLock.acquireExclusive();
         fullLock();
 
         if (ready && (ready = mCompacting && (mTotalPageCount > mCompactionTargetPageCount
@@ -451,7 +528,7 @@ final class PageManager {
         mReserveList = null;
 
         fullUnlock();
-        commitLock.writeLock().unlock();
+        commitLock.releaseExclusive();
 
         if (reserve != null) {
             try {
@@ -497,11 +574,31 @@ final class PageManager {
     public void commitStart(/*P*/ byte[] header, int offset) throws IOException {
         fullLock();
         try {
+            // Allow commit to exceed the page limit. Without this, database cannot complete a
+            // checkpoint when the limit is reached.
+            if (mPageLimit > 0) {
+                if (mPageLimitOverride == null) {
+                    mPageLimitOverride = new ThreadLocal<>();
+                }
+                mPageLimitOverride.set(-1L);
+            }
+
             // Pre-commit all first, draining the append heaps.
-            mRegularFreeList.preCommit();
-            mRecycleFreeList.preCommit();
-            if (mReserveList != null) {
-                mReserveList.preCommit();
+            try {
+                mRegularFreeList.preCommit();
+                mRecycleFreeList.preCommit();
+                if (mReserveList != null) {
+                    mReserveList.preCommit();
+                }
+            } catch (DatabaseFullException e) {
+                // Should not happen with page limit override.
+                throw e;
+            } catch (IOException e) {
+                throw new WriteFailureException(e);
+            } finally {
+                if (mPageLimitOverride != null) {
+                    mPageLimitOverride.remove();
+                }
             }
 
             // Total page count is written after append heaps have been

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,20 +29,22 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * @author Brian S O'Neill
  */
+/*P*/
 final class Checkpointer implements Runnable {
     private static int cThreadCounter;
 
     private final AtomicInteger mSuspendCount;
-    private final ReferenceQueue<Database> mRefQueue;
-    private final WeakReference<Database> mDatabaseRef;
+    private final ReferenceQueue<LocalDatabase> mRefQueue;
+    private final WeakReference<LocalDatabase> mDatabaseRef;
     private final long mRateNanos;
     private final long mSizeThreshold;
     private final long mDelayThresholdNanos;
+    private volatile Thread mThread;
     private volatile boolean mClosed;
-    private Hook mShutdownHook;
-    private List<Shutdown> mToShutdown;
+    private Thread mShutdownHook;
+    private List<ShutdownHook> mToShutdown;
 
-    Checkpointer(Database db, DatabaseConfig config) {
+    Checkpointer(LocalDatabase db, DatabaseConfig config) {
         mSuspendCount = new AtomicInteger();
 
         mRateNanos = config.mCheckpointRateNanos;
@@ -67,6 +69,7 @@ final class Checkpointer implements Runnable {
         t.setDaemon(true);
         t.setName("Checkpointer-" + (num & 0xffffffffL));
         t.start();
+        mThread = t;
     }
 
     @Override
@@ -86,7 +89,7 @@ final class Checkpointer implements Runnable {
                     Thread.sleep(delayMillis); 
                 }
 
-                Database db = mDatabaseRef.get();
+                LocalDatabase db = mDatabaseRef.get();
                 if (db == null) {
                     close();
                     return;
@@ -102,6 +105,10 @@ final class Checkpointer implements Runnable {
 
                     lastDurationNanos = endNanos - startNanos;
                 } catch (DatabaseException e) {
+                    EventListener listener = db.mEventListener;
+                    if (listener != null) {
+                        listener.notify(EventType.CHECKPOINT_FAILED, "Checkpoint failed: %1$s", e);
+                    }
                     if (!e.isRecoverable()) {
                         throw e;
                     }
@@ -110,7 +117,7 @@ final class Checkpointer implements Runnable {
             }
         } catch (Throwable e) {
             if (!mClosed) {
-                Database db = mDatabaseRef.get();
+                LocalDatabase db = mDatabaseRef.get();
                 if (db != null && !db.mClosed) {
                     Utils.closeQuietly(null, db, e);
                 }
@@ -127,7 +134,7 @@ final class Checkpointer implements Runnable {
      * @param obj ignored if null
      * @return false if immediately shutdown
      */
-    boolean register(Shutdown obj) {
+    boolean register(ShutdownHook obj) {
         if (obj == null) {
             return false;
         }
@@ -139,7 +146,7 @@ final class Checkpointer implements Runnable {
                 }
 
                 if (mShutdownHook == null) {
-                    Hook hook = new Hook(this);
+                    Thread hook = new Thread(() -> Checkpointer.this.close());
                     try {
                         Runtime.getRuntime().addShutdownHook(hook);
                         mShutdownHook = hook;
@@ -182,12 +189,15 @@ final class Checkpointer implements Runnable {
         }
     }
 
-    void close() {
+    /**
+     * @return thread to interrupt, when no checkpoint is in progress
+     */
+    Thread close() {
         mClosed = true;
         mDatabaseRef.enqueue();
         mDatabaseRef.clear();
 
-        List<Shutdown> toShutdown;
+        List<ShutdownHook> toShutdown;
         synchronized (this) {
             if (mShutdownHook != null) {
                 try {
@@ -206,26 +216,11 @@ final class Checkpointer implements Runnable {
         }
 
         if (toShutdown != null) {
-            for (Shutdown obj : toShutdown) {
+            for (ShutdownHook obj : toShutdown) {
                 obj.shutdown();
             }
         }
-    }
 
-    public static interface Shutdown {
-        void shutdown();
-    }
-
-    static class Hook extends Thread {
-        private final Checkpointer mCheckpointer;
-
-        Hook(Checkpointer c) {
-            mCheckpointer = c;
-        }
-
-        @Override
-        public void run() {
-            mCheckpointer.close();
-        }
+        return mThread;
     }
 }

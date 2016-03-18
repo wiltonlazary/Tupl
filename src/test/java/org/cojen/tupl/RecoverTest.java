@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -339,8 +339,8 @@ public class RecoverTest {
             mDb.checkpoint();
         }
 
-        int count1 = CrudTest.count(ix1);
-        int count2 = CrudTest.count(ix2);
+        long count1 = CrudTest.count(ix1);
+        long count2 = CrudTest.count(ix2);
 
         txn.enter();
         for (int i=0; i<count; i++) {

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,19 +18,22 @@ package org.cojen.tupl;
 
 import java.lang.management.ManagementFactory;
 
+import java.io.BufferedWriter;
 import java.io.File;
+import java.io.InputStream;
 import java.io.IOException;
 import java.io.Serializable;
-import java.io.Writer;
+
+import java.lang.reflect.Method;
 
 import java.util.EnumSet;
-import java.util.Properties;
+import java.util.Map;
+import java.util.TreeMap;
 
 import java.util.concurrent.TimeUnit;
 
-import org.cojen.tupl.ext.RedoHandler;
 import org.cojen.tupl.ext.ReplicationManager;
-import org.cojen.tupl.ext.UndoHandler;
+import org.cojen.tupl.ext.TransactionHandler;
 
 import org.cojen.tupl.io.FileFactory;
 import org.cojen.tupl.io.OpenOption;
@@ -45,6 +48,10 @@ import static org.cojen.tupl.Utils.*;
  */
 public class DatabaseConfig implements Cloneable, Serializable {
     private static final long serialVersionUID = 1L;
+
+    private static volatile Method cDirectOpen;
+    private static volatile Method cDirectDestroy;
+    private static volatile Method cDirectRestore;
 
     File mBaseFile;
     boolean mMkdirs;
@@ -65,12 +72,12 @@ public class DatabaseConfig implements Cloneable, Serializable {
     boolean mFileSync;
     boolean mReadOnly;
     int mPageSize;
+    boolean mDirectPageAccess;
     boolean mCachePriming;
     transient ReplicationManager mReplManager;
     int mMaxReplicaThreads;
     transient Crypto mCrypto;
-    transient RedoHandler mRedoHandler;
-    transient UndoHandler mUndoHandler;
+    transient TransactionHandler mTxnHandler;
 
     // Fields are set as a side-effect of constructing a replicated Database.
     transient long mReplRecoveryStartNanos;
@@ -329,6 +336,15 @@ public class DatabaseConfig implements Cloneable, Serializable {
     }
 
     /**
+     * Set true to allocate all pages off the Java heap, offering increased performance and
+     * reduced garbage collection activity.
+     */
+    public DatabaseConfig directPageAccess(boolean direct) {
+        mDirectPageAccess = direct;
+        return this;
+    }
+
+    /**
      * Enable automatic cache priming, which writes a priming set into a special file when the
      * database is cleanly shutdown. When opened again, the priming set is applied and the file
      * is deleted. Option has no effect if database is non-durable.
@@ -374,18 +390,10 @@ public class DatabaseConfig implements Cloneable, Serializable {
     }
 
     /**
-     * Provide a handler for custom redo operations. An undo handler must also be provided.
+     * Provide a handler for custom transactional operations.
      */
-    public DatabaseConfig customRedoHandler(RedoHandler handler) {
-        mRedoHandler = handler;
-        return this;
-    }
-
-    /**
-     * Provide a handler for custom undo operations. A redo handler must also be provided.
-     */
-    public DatabaseConfig customUndoHandler(UndoHandler handler) {
-        mUndoHandler = handler;
+    public DatabaseConfig customTransactionHandler(TransactionHandler handler) {
+        mTxnHandler = handler;
         return this;
     }
 
@@ -479,7 +487,7 @@ public class DatabaseConfig implements Cloneable, Serializable {
         return options;
     }
 
-    void writeInfo(Writer w) throws IOException {
+    void writeInfo(BufferedWriter w) throws IOException {
         String pid = ManagementFactory.getRuntimeMXBean().getName();
         String user;
         try {
@@ -488,7 +496,7 @@ public class DatabaseConfig implements Cloneable, Serializable {
             user = null;
         }
 
-        Properties props = new Properties();
+        Map<String, String> props = new TreeMap<>();
 
         if (pid != null) {
             set(props, "lastOpenedByProcess", pid);
@@ -514,7 +522,7 @@ public class DatabaseConfig implements Cloneable, Serializable {
                     b.append(mDataFiles[i]);
                 }
                 b.append(']');
-                props.setProperty("dataFiles", b.toString());
+                set(props, "dataFiles", b);
             }
         }
 
@@ -528,18 +536,103 @@ public class DatabaseConfig implements Cloneable, Serializable {
         set(props, "checkpointDelayThresholdNanos", mCheckpointDelayThresholdNanos);
         set(props, "syncWrites", mFileSync);
         set(props, "pageSize", mPageSize);
+        set(props, "directPageAccess", mDirectPageAccess);
         set(props, "cachePriming", mCachePriming);
 
-        props.store(w, Database.class.getName());
+        w.write('#');
+        w.write(Database.class.getName());
+        w.newLine();
+
+        w.write('#');
+        w.write(java.time.ZonedDateTime.now().toString());
+        w.newLine();
+
+        for (Map.Entry<String, String> line : props.entrySet()) {
+            w.write(line.getKey());
+            w.write('=');
+            w.write(line.getValue());
+            w.newLine();
+        }
     }
 
-    private static void set(Properties props, String name, Object value) {
+    private static void set(Map<String, String> props, String name, Object value) {
         if (value != null) {
-            props.setProperty(name, String.valueOf(value));
+            props.put(name, value.toString());
         }
     }
 
     private static File abs(File file) {
         return file.getAbsoluteFile();
+    }
+
+    Class<?> directOpenClass() throws IOException {
+        if (!mDirectPageAccess) {
+            return null;
+        }
+        try {
+            return Class.forName("org.cojen.tupl._LocalDatabase");
+        } catch (Exception e) {
+            throw handleDirectException(e);
+        }
+    }
+
+    Method directOpenMethod() throws IOException {
+        if (!mDirectPageAccess) {
+            return null;
+        }
+        Method m = cDirectOpen;
+        if (m == null) {
+            cDirectOpen = m = findMethod("open", DatabaseConfig.class);
+        }
+        return m;
+    }
+
+    Method directDestroyMethod() throws IOException {
+        if (!mDirectPageAccess) {
+            return null;
+        }
+        Method m = cDirectDestroy;
+        if (m == null) {
+            cDirectDestroy = m = findMethod("destroy", DatabaseConfig.class);
+        }
+        return m;
+    }
+
+    Method directRestoreMethod() throws IOException {
+        if (!mDirectPageAccess) {
+            return null;
+        }
+        Method m = cDirectRestore;
+        if (m == null) {
+            cDirectRestore = m = findMethod
+                ("restoreFromSnapshot", DatabaseConfig.class, InputStream.class);
+        }
+        return m;
+    }
+
+    static RuntimeException handleDirectException(Exception e) throws IOException {
+        if (e instanceof RuntimeException || e instanceof IOException) {
+            throw rethrow(e);
+        }
+        Throwable cause = e.getCause();
+        if (cause == null) {
+            cause = e;
+        }
+        if (cause instanceof RuntimeException || e instanceof IOException) {
+            throw rethrow(cause);
+        }
+        throw new DatabaseException("Unable open with direct page access", cause);
+    }
+
+    private Method findMethod(String name, Class<?>... paramTypes) throws IOException {
+        Class<?> directClass = directOpenClass();
+        if (directClass == null) {
+            return null;
+        }
+        try {
+            return directClass.getDeclaredMethod(name, paramTypes);
+        } catch (Exception e) {
+            throw handleDirectException(e);
+        }
     }
 }

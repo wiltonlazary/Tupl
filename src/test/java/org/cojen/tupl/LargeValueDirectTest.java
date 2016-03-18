@@ -1,5 +1,5 @@
 /*
- *  Copyright 2015 Brian S O'Neill
+ *  Copyright 2016 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -14,26 +14,23 @@
  *  limitations under the License.
  */
 
-package org.cojen.tupl.ext;
+package org.cojen.tupl;
 
-import java.io.IOException;
-
-import org.cojen.tupl.Database;
-import org.cojen.tupl.DatabaseConfig;
-import org.cojen.tupl.Transaction;
+import org.junit.*;
 
 /**
- * Handler for custom transactional undo operations, which are applied to roll back
- * transactions.
+ * 
  *
  * @author Brian S O'Neill
- * @see DatabaseConfig#customUndoHandler
  */
-public interface UndoHandler {
-    /**
-     * Non-transactionally apply an idempotent undo operation.
-     *
-     * @param message message originally provided to {@link Transaction#customUndo}
-     */
-    void undo(Database db, byte[] message) throws IOException;
+public class LargeValueDirectTest extends LargeValueTest {
+    public static void main(String[] args) throws Exception {
+        org.junit.runner.JUnitCore.main(LargeValueDirectTest.class.getName());
+    }
+
+    @Before
+    @Override
+    public void createTempDb() throws Exception {
+        mDb = TestUtils.newTempDatabase(TestUtils.OpenMode.DIRECT);
+    }
 }

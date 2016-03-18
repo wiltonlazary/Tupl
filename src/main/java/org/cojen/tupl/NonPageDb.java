@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -60,7 +60,7 @@ final class NonPageDb extends PageDb {
     }
 
     @Override
-    public Node allocLatchedNode(Database db, int mode) throws IOException {
+    public Node allocLatchedNode(LocalDatabase db, int mode) throws IOException {
         Node node = db.allocLatchedNode(Utils.randomSeed(), mode);
         long nodeId = node.mId;
         if (nodeId < 0) {
@@ -84,6 +84,22 @@ final class NonPageDb extends PageDb {
     }
 
     @Override
+    public void pageLimit(long limit) {
+        // Ignored.
+    }
+
+    @Override
+    public long pageLimit() {
+        // No explicit limit.
+        return -1;
+    }
+
+    @Override
+    public void pageLimitOverride(long limit) {
+        // Ignored.
+    }
+
+    @Override
     public Stats stats() {
         return new Stats();
     }
@@ -94,14 +110,9 @@ final class NonPageDb extends PageDb {
     }
 
     @Override
-    public void readPage(long id, /*P*/ byte[] buf) throws IOException {
-        readPage(id, buf, 0);
-    }
-
-    @Override
-    public void readPage(long id, /*P*/ byte[] buf, int offset) throws IOException {
+    public void readPage(long id, /*P*/ byte[] page) throws IOException {
         PageCache cache = mCache;
-        if (cache == null || !cache.remove(id, buf, offset, p_length(buf))) {
+        if (cache == null || !cache.remove(id, page, 0, pageSize())) {
             fail(false);
         }
     }
@@ -119,27 +130,23 @@ final class NonPageDb extends PageDb {
     }
 
     @Override
-    public void writePage(long id, /*P*/ byte[] buf) throws IOException {
-        writePage(id, buf, 0);
-    }
-
-    @Override
-    public void writePage(long id, /*P*/ byte[] buf, int offset) throws IOException {
+    public void writePage(long id, /*P*/ byte[] page) throws IOException {
         PageCache cache = mCache;
-        if (cache == null || !cache.add(id, buf, offset, p_length(buf), false)) {
+        if (cache == null || !cache.add(id, page, 0, false)) {
             fail(true);
         }
     }
 
     @Override
-    public void cachePage(long id, /*P*/ byte[] buf) throws IOException {
-        cachePage(id, buf, 0);
+    public /*P*/ byte[] evictPage(long id, /*P*/ byte[] page) throws IOException {
+        writePage(id, page);
+        return page;
     }
 
     @Override
-    public void cachePage(long id, /*P*/ byte[] buf, int offset) throws IOException {
+    public void cachePage(long id, /*P*/ byte[] page) throws IOException {
         PageCache cache = mCache;
-        if (cache != null && !cache.add(id, buf, offset, p_length(buf), false)) {
+        if (cache != null && !cache.add(id, page, 0, false)) {
             fail(false);
         }
     }

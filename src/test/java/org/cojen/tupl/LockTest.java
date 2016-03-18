@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -95,12 +95,6 @@ public class LockTest {
 
     @Test
     public void basicShared() throws Exception {
-        try {
-            Locker locker = new Locker(null);
-            fail();
-        } catch (IllegalArgumentException e) {
-        }
-
         Locker locker = new Locker(mManager);
         assertEquals(ACQUIRED, locker.tryLockShared(0, k1, -1));
         assertEquals(1, mManager.numLocksHeld());

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -16,18 +16,22 @@
 
 package org.cojen.tupl;
 
+import org.cojen.tupl.util.Latch;
+import org.cojen.tupl.util.LatchCondition;
+
 /**
  * Pool of spare page buffers not currently in use by nodes.
  *
  * @author Brian S O'Neill
  */
+@SuppressWarnings("serial")
 final class PagePool extends Latch {
-    private final transient WaitQueue mQueue;
+    private final transient LatchCondition mQueue;
     private final /*P*/ byte[][] mPool;
     private int mPos;
 
     PagePool(int pageSize, int poolSize) {
-        mQueue = new WaitQueue();
+        mQueue = new LatchCondition();
         /*P*/ byte[][] pool = PageOps.p_allocArray(poolSize);
         for (int i=0; i<poolSize; i++) {
             pool[i] = PageOps.p_calloc(pageSize);
@@ -44,7 +48,7 @@ final class PagePool extends Latch {
         try {
             int pos;
             while ((pos = mPos) == 0) {
-                mQueue.await(this, new WaitQueue.Node(), -1, 0);
+                mQueue.await(this, -1, 0);
             }
             return mPool[mPos = pos - 1];
         } finally {

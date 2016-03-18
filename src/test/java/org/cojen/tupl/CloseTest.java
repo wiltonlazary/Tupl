@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -355,6 +355,30 @@ public class CloseTest {
         if (stats1.totalPages() < stats1.cachedPages()) {
             assertEquals(0, stats1.freePages());
             assertTrue(60 <= stats2.freePages() && stats2.freePages() <= 70);
+        }
+    }
+
+    @Test
+    public void findNearby() throws Exception {
+        Index ix = mDb.openIndex("test");
+
+        for (int i=0; i<1000; i++) {
+            ix.store(null, ("hello-" + i).getBytes(), ("world-" + i).getBytes());
+        }
+
+        Cursor c = ix.newCursor(null);
+        c.findNearby("hello-2".getBytes());
+        assertTrue(c.value() != null);
+
+        ix.close();
+
+        c.findNearby("hello-3".getBytes());
+        assertTrue(c.value() == null);
+
+        try {
+            c.store("stuff".getBytes());
+            fail();
+        } catch (ClosedIndexException e) {
         }
     }
 }
