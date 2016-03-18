@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2013 Cojen
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ public class CompressedPageArray extends PageArray {
     public static void main(String[] args) throws Exception {
         String base = args[0];
 
-        PageArray cpa = new CompressedPageArray(4096, new File(base));
+        PageArray cpa = new CompressedPageArray(4096, 4096 * 3, new File(base));
 
         Database db = Database.open(new DatabaseConfig()
                                     .baseFilePath(base)
@@ -48,7 +48,10 @@ public class CompressedPageArray extends PageArray {
                                     .minCacheSize(10000000));
 
         Index ix = db.openIndex("foo");
-        for (int i=0; i<100000000; i++) {
+        for (int i=0; i<100_000_000; i++) {
+            if (i % 100_000 == 0) {
+                System.out.println(i);
+            }
             byte[] key = ("key-" + i).getBytes();
             byte[] value = ("value-" + i).getBytes();
             ix.store(null, key, value);
@@ -64,18 +67,20 @@ public class CompressedPageArray extends PageArray {
     private final int mMaxCompressedLength;
     private final LZ4FastDecompressor mDecompressor;
 
-    public CompressedPageArray(int pageSize, File baseFile) throws IOException {
-        this(pageSize, Database.open(new DatabaseConfig()
-                                     .baseFile(new File(baseFile.getPath() + ".data"))
-                                     .pageSize(selectDataPageSize(pageSize))
-                                     .checkpointSizeThreshold(0)
-                                     .checkpointDelayThreshold(0, null)
-                                     .durabilityMode(DurabilityMode.NO_FLUSH)
-                                     .minCacheSize(10000000))); // FIXME: configurable
+    public CompressedPageArray(int physicalPageSize, int logicalPageSize, File baseFile)
+        throws IOException
+    {
+        this(physicalPageSize, Database.open(new DatabaseConfig()
+                                             .baseFile(new File(baseFile.getPath() + ".data"))
+                                             .pageSize(logicalPageSize)
+                                             .checkpointSizeThreshold(0)
+                                             .checkpointDelayThreshold(0, null)
+                                             .durabilityMode(DurabilityMode.NO_FLUSH)
+                                             .minCacheSize(10000000))); // FIXME: configurable
     }
 
-    public CompressedPageArray(int pageSize, Database dataDb) throws IOException {
-        super(pageSize);
+    public CompressedPageArray(int physicalPageSize, Database dataDb) throws IOException {
+        super(physicalPageSize);
 
         mDataDb = dataDb;
         mPages = dataDb.openIndex("pages");
@@ -85,10 +90,6 @@ public class CompressedPageArray extends PageArray {
         mCompressor = factory.fastCompressor();
         mMaxCompressedLength = mCompressor.maxCompressedLength(pageSize());
         mDecompressor = factory.fastDecompressor();
-    }
-
-    private static int selectDataPageSize(int topPageSize) {
-        return topPageSize >= 4096 ? 512 : (topPageSize * 8);
     }
 
     @Override
@@ -125,21 +126,25 @@ public class CompressedPageArray extends PageArray {
     }
 
     @Override
-    public void readPage(long index, byte[] buf, int offset) throws IOException {
+    public void readPage(long index, byte[] dst) throws IOException {
+        readPage(index, dst, 0);
+    }
+
+    public void readPage(long index, byte[] dst, int offset) throws IOException {
         // TODO: Use stream API and buffer pool.
         byte[] value = mPages.load(Transaction.BOGUS, keyFor(index));
-        mDecompressor.decompress(value, 0, buf, offset, pageSize());
+        mDecompressor.decompress(value, 0, dst, offset, mPageSize);
     }
 
     @Override
-    public int readPartial(long index, int start, byte[] buf, int offset, int length)
-        throws IOException
-    {
-        // TODO: Use stream API and buffer pool.
-        byte[] page = new byte[pageSize()];
-        readPage(index, page, 0);
-        System.arraycopy(page, start, buf, offset, length);
-        return length;
+    public void readPage(long index, byte[] dst, int offset, int length) throws IOException {
+        if (length == mPageSize) {
+            readPage(index, dst, offset);
+        } else {
+            byte[] page = new byte[mPageSize];
+            readPage(index, page, 0);
+            System.arraycopy(page, 0, dst, offset, length);
+        }
     }
 
     @Override
