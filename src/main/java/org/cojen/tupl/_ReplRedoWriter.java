@@ -198,6 +198,8 @@ class _ReplRedoWriter extends _RedoWriter {
             }
         }
 
+        mEngine.mController.switchToReplica(mReplWriter, false);
+
         return false;
     }
 
@@ -298,7 +300,7 @@ class _ReplRedoWriter extends _RedoWriter {
             if (writer == null) {
                 throw new UnmodifiableReplicaException();
             }
-            long pos = writer.write(buffer, 0, len);
+            long pos = writer.writeCommit(buffer, 0, len);
             if (pos >= 0) {
                 mLastCommitPos = pos;
                 mLastCommitTxnId = lastTransactionId();

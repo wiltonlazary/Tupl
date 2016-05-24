@@ -46,8 +46,8 @@ import java.util.EnumSet;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
-import java.util.TreeMap;
 
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
 
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -151,13 +151,14 @@ final class _LocalDatabase implements Database {
     // Is either CACHED_DIRTY_0 or CACHED_DIRTY_1. Access is guarded by commit lock.
     private byte mCommitState;
 
+    // State to apply to nodes which have just been read. Is CACHED_DIRTY_0 for empty databases
+    // which have never checkpointed, but is CACHED_CLEAN otherwise.
+    private volatile byte mInitialReadState = CACHED_CLEAN;
+
     // Set during checkpoint after commit state has switched. If checkpoint aborts, next
     // checkpoint will resume with this commit header and master undo log.
     private long mCommitHeader = p_null();
     private _UndoLog mCommitMasterUndoLog;
-
-    // Is false for empty databases which have never checkpointed.
-    private volatile boolean mHasCheckpointed = true;
 
     // Typically opposite of mCommitState, or negative if checkpoint is not in
     // progress. Indicates which nodes are being flushed by the checkpoint.
@@ -179,6 +180,7 @@ final class _LocalDatabase implements Database {
 
     private final Latch mOpenTreesLatch;
     // Maps tree names to open trees.
+    // Must be a concurrent map because we rely on concurrent iteration.
     private final Map<byte[], _TreeRef> mOpenTrees;
     private final LHashTable.Obj<_TreeRef> mOpenTreesById;
     private final ReferenceQueue<_Tree> mOpenTreesRefQueue;
@@ -227,7 +229,7 @@ final class _LocalDatabase implements Database {
     /**
      * Open a database, creating it if necessary.
      */
-    public static _LocalDatabase open(DatabaseConfig config) throws IOException {
+    static _LocalDatabase open(DatabaseConfig config) throws IOException {
         config = config.clone();
         _LocalDatabase db = new _LocalDatabase(config, OPEN_REGULAR);
         db.finishInit(config);
@@ -239,7 +241,7 @@ final class _LocalDatabase implements Database {
      * empty one. When using a raw block device for the data file, this method
      * must be used to format it.
      */
-    public static _LocalDatabase destroy(DatabaseConfig config) throws IOException {
+    static _LocalDatabase destroy(DatabaseConfig config) throws IOException {
         config = config.clone();
         if (config.mReadOnly) {
             throw new IllegalArgumentException("Cannot destroy read-only database");
@@ -261,7 +263,7 @@ final class _LocalDatabase implements Database {
         _LocalDatabase db = new _LocalDatabase(config, OPEN_TEMP);
         tfm.register(file, db);
         db.mCheckpointer = new _Checkpointer(db, config);
-        db.mCheckpointer.start();
+        db.mCheckpointer.start(false);
         return db.mRegistry;
     }
 
@@ -410,6 +412,7 @@ final class _LocalDatabase implements Database {
                 if (dataPageArray == null) {
                     mPageDb = new _NonPageDb(pageSize, cache);
                 } else {
+                    dataPageArray = dataPageArray.open();
                     Crypto crypto = config.mCrypto;
                     mPageDb = _DurablePageDb.open
                         (dataPageArray, cache, crypto, openMode == OPEN_DESTROY);
@@ -432,6 +435,12 @@ final class _LocalDatabase implements Database {
 
             // Actual page size might differ from configured size.
             config.pageSize(pageSize = mPageSize = mPageDb.pageSize());
+
+            /*P*/ // [
+            // config.mDirectPageAccess = false;
+            /*P*/ // |
+            config.mDirectPageAccess = true;
+            /*P*/ // ]
 
             // Write info file of properties, after database has been opened and after page
             // size is truly known.
@@ -569,7 +578,7 @@ final class _LocalDatabase implements Database {
                 mOpenTreesById = new LHashTable.Obj<>(0);
                 mOpenTreesRefQueue = null;
             } else {
-                mOpenTrees = new TreeMap<>(KeyComparator.THE);
+                mOpenTrees = new ConcurrentSkipListMap<>(KeyComparator.THE);
                 mOpenTreesById = new LHashTable.Obj<>(16);
                 mOpenTreesRefQueue = new ReferenceQueue<>();
             }
@@ -768,6 +777,8 @@ final class _LocalDatabase implements Database {
             deletion.start();
         }
 
+        boolean initialCheckpoint = false;
+
         if (mRedoWriter instanceof _ReplRedoController) {
             // Start replication and recovery.
             _ReplRedoController controller = (_ReplRedoController) mRedoWriter;
@@ -778,11 +789,11 @@ final class _LocalDatabase implements Database {
                 closeQuietly(null, this, e);
                 throw e;
             }
-            checkpoint();
             recoveryComplete(config.mReplRecoveryStartNanos);
+            initialCheckpoint = true;
         }
 
-        c.start();
+        c.start(initialCheckpoint);
     }
 
     private void applyCachePrimer(DatabaseConfig config) {
@@ -875,6 +886,10 @@ final class _LocalDatabase implements Database {
 
     @Override
     public Index indexById(long id) throws IOException {
+        return indexById(null, id);
+    }
+
+    Index indexById(Transaction txn, long id) throws IOException {
         if (_Tree.isInternal(id)) {
             throw new IllegalArgumentException("Invalid id: " + id);
         }
@@ -891,14 +906,14 @@ final class _LocalDatabase implements Database {
             idKey[0] = KEY_TYPE_INDEX_ID;
             encodeLongBE(idKey, 1, id);
 
-            byte[] name = mRegistryKeyMap.load(null, idKey);
+            byte[] name = mRegistryKeyMap.load(txn, idKey);
 
             if (name == null) {
                 checkClosed();
                 return null;
             }
 
-            index = openIndex(name, false);
+            index = openIndex(txn, name, false);
         } catch (Throwable e) {
             DatabaseException.rethrowIfRecoverable(e);
             throw closeOnFailure(this, e);
@@ -931,12 +946,19 @@ final class _LocalDatabase implements Database {
      * Allows access to internal indexes which can use the redo log.
      */
     Index anyIndexById(long id) throws IOException {
+        return anyIndexById(null, id);
+    }
+
+    /**
+     * Allows access to internal indexes which can use the redo log.
+     */
+    Index anyIndexById(Transaction txn, long id) throws IOException {
         if (id == _Tree.REGISTRY_KEY_MAP_ID) {
             return mRegistryKeyMap;
         } else if (id == _Tree.FRAGMENTED_TRASH_ID) {
             return fragmentedTrash().mTrash;
         }
-        return indexById(id);
+        return indexById(txn, id);
     }
 
     @Override
@@ -1193,7 +1215,7 @@ final class _LocalDatabase implements Database {
             c.reset();
         }
 
-        long rootId = decodeLongLE(rootIdBytes, 0);
+        long rootId = rootIdBytes.length == 0 ? 0 : decodeLongLE(rootIdBytes, 0);
 
         if ((name[0] & ~0x80) == 0) {
             name = null;
@@ -1358,10 +1380,10 @@ final class _LocalDatabase implements Database {
     }
 
     /**
-     * Caller must hold commit lock. This ensures that highest transaction id
-     * is persisted correctly by checkpoint.
+     * To be called only by transaction instances, and caller must hold commit lock. The commit
+     * lock ensures that highest transaction id is persisted correctly by checkpoint.
      *
-     * @return non-zero transaction id
+     * @return positive non-zero transaction id
      */
     long nextTransactionId() {
         long txnId;
@@ -1380,13 +1402,6 @@ final class _LocalDatabase implements Database {
                     }
                 }
             }
-        }
-
-        _RedoWriter redo = mRedoWriter;
-
-        if (redo != null) {
-            // Replicas set the high bit to ensure no identifier conflict with the leader.
-            txnId = redo.adjustTransactionId(txnId);
         }
 
         return txnId;
@@ -1436,36 +1451,19 @@ final class _LocalDatabase implements Database {
         return 0;
     }
 
-    /**
-     * Set a soft capacity limit for the database, to prevent filling up the storage
-     * device. When the limit is reached, writes might fail with a {@link
-     * DatabaseFullException}. No explicit limit is defined by default, and the option is
-     * ignored by non-durable databases. The limit is checked only when the database attempts
-     * to grow, and so it can be set smaller than the current database size.
-     *
-     * @param bytes maximum capacity, in bytes; pass -1 for no limit
-     */
-    void capacityLimit(long bytes) {
+    @Override
+    public void capacityLimit(long bytes) {
         mPageDb.pageLimit(bytes < 0 ? -1 : (bytes / mPageSize));
     }
 
-    /**
-     * Returns the current capacity limit, rounded down by page size.
-     *
-     * @return maximum capacity, in bytes; is -1 if no limit
-     */
-    long capacityLimit() {
+    @Override
+    public long capacityLimit() {
         long pageLimit = mPageDb.pageLimit();
         return pageLimit < 0 ? -1 : (pageLimit * mPageSize);
     }
 
-    /**
-     * Set capacity limits for the current thread, allowing it to perform tasks which can free
-     * up space. While doing so, it might require additional temporary storage.
-     *
-     * @param bytes maximum capacity, in bytes; pass -1 for no limit; pass 0 to remove override
-     */
-    void capacityLimitOverride(long bytes) {
+    @Override
+    public void capacityLimitOverride(long bytes) {
         mPageDb.pageLimitOverride(bytes < 0 ? -1 : (bytes / mPageSize));
     }
 
@@ -1486,9 +1484,7 @@ final class _LocalDatabase implements Database {
      *
      * @param in snapshot source; does not require extra buffering; auto-closed
      */
-    public static Database restoreFromSnapshot(DatabaseConfig config, InputStream in)
-        throws IOException
-    {
+    static Database restoreFromSnapshot(DatabaseConfig config, InputStream in) throws IOException {
         config = config.clone();
         _PageDb restored;
 
@@ -1500,6 +1496,9 @@ final class _LocalDatabase implements Database {
                 throw new UnsupportedOperationException
                     ("Restore only allowed for durable databases");
             }
+
+            dataPageArray = dataPageArray.open();
+            dataPageArray.setPageCount(0);
 
             // Delete old redo log files.
             deleteNumberedFiles(config.mBaseFile, REDO_FILE_SUFFIX);
@@ -1549,24 +1548,11 @@ final class _LocalDatabase implements Database {
 
         out = ((_DurablePageDb) mPageDb).encrypt(out);
 
-        // Create a clone of the open trees, because concurrent iteration is not supported.
-        _TreeRef[] openTrees;
-        mOpenTreesLatch.acquireShared();
-        try {
-            openTrees = new _TreeRef[mOpenTrees.size()];
-            int i = 0;
-            for (_TreeRef treeRef : mOpenTrees.values()) {
-                openTrees[i++] = treeRef;
-            }
-        } finally {
-            mOpenTreesLatch.releaseShared();
-        }
-
         DataOutputStream dout = new DataOutputStream(out);
 
         dout.writeLong(PRIMER_MAGIC_NUMBER);
 
-        for (_TreeRef treeRef : openTrees) {
+        for (_TreeRef treeRef : mOpenTrees.values()) {
             _Tree tree = treeRef.get();
             if (tree != null && !_Tree.isInternal(tree.mId)) {
                 // Encode name instead of identifier, to support priming set portability
@@ -1628,19 +1614,15 @@ final class _LocalDatabase implements Database {
         mCommitLock.acquireShared();
         try {
             long cursorCount = 0;
-            mOpenTreesLatch.acquireShared();
-            try {
-                stats.openIndexes = mOpenTrees.size();
-                for (_TreeRef treeRef : mOpenTrees.values()) {
-                    _Tree tree = treeRef.get();
-                    if (tree != null) {
-                        cursorCount += tree.mRoot.countCursors(); 
-                    }
+            int openTreesCount = 0;
+            for (_TreeRef treeRef : mOpenTrees.values()) {
+                _Tree tree = treeRef.get();
+                if (tree != null) {
+                    openTreesCount++;
+                    cursorCount += tree.mRoot.countCursors();
                 }
-            } finally {
-                mOpenTreesLatch.releaseShared();
             }
-
+            stats.openIndexes = openTreesCount;
             stats.cursorCount = cursorCount;
 
             _PageDb.Stats pstats = mPageDb.stats();
@@ -1988,20 +1970,34 @@ final class _LocalDatabase implements Database {
         try {
             mCheckpointer = null;
 
+            CommitLock lock = mCommitLock;
+
             if (mOpenTrees != null) {
+                // Clear out open trees with commit lock held, to prevent any trees from being
+                // opened again. Any attempt to open a tree must acquire the commit lock and
+                // then check if the database is closed.
                 final ArrayList<_TreeRef> trees;
-                mOpenTreesLatch.acquireExclusive();
+                if (lock != null) {
+                    lock.acquireExclusive();
+                }
                 try {
-                    trees = new ArrayList<>(mOpenTreesById.size());
+                    mOpenTreesLatch.acquireExclusive();
+                    try {
+                        trees = new ArrayList<>(mOpenTreesById.size());
 
-                    mOpenTreesById.traverse((entry) -> {
-                        trees.add(entry.value);
-                        return true;
-                    });
+                        mOpenTreesById.traverse((entry) -> {
+                            trees.add(entry.value);
+                            return true;
+                        });
 
-                    mOpenTrees.clear();
+                        mOpenTrees.clear();
+                    } finally {
+                        mOpenTreesLatch.releaseExclusive();
+                    }
                 } finally {
-                    mOpenTreesLatch.releaseExclusive();
+                    if (lock != null) {
+                        lock.releaseExclusive();
+                    }
                 }
 
                 for (_TreeRef ref : trees) {
@@ -2012,7 +2008,6 @@ final class _LocalDatabase implements Database {
                 }
             }
 
-            CommitLock lock = mCommitLock;
             if (lock != null) {
                 lock.acquireExclusive();
             }
@@ -2213,7 +2208,17 @@ final class _LocalDatabase implements Database {
 
         try {
             if (rootId == 0) {
-                rootNode.asEmptyRoot();
+                /*P*/ // [
+                // rootNode.asEmptyRoot();
+                /*P*/ // |
+                if (mFullyMapped) {
+                    rootNode.mPage = p_nonTreePage(); // always an empty leaf node
+                    rootNode.mId = 0;
+                    rootNode.mCachedState = CACHED_CLEAN;
+                } else {
+                    rootNode.asEmptyRoot();
+                }
+                /*P*/ // ]
             } else {
                 try {
                     rootNode.read(this, rootId);
@@ -2241,7 +2246,7 @@ final class _LocalDatabase implements Database {
         if (version == 0) {
             rootId = 0;
             // No registry; clearly nothing has been checkpointed.
-            mHasCheckpointed = false;
+            mInitialReadState = CACHED_DIRTY_0;
         } else {
             if (version != ENCODING_VERSION) {
                 throw new CorruptDatabaseException("Unknown encoding version: " + version);
@@ -2310,8 +2315,10 @@ final class _LocalDatabase implements Database {
     }
 
     private Index openIndex(byte[] name, boolean create) throws IOException {
-        checkClosed();
+        return openIndex(null, name, create);
+    }
 
+    private Index openIndex(Transaction lookupTxn, byte[] name, boolean create) throws IOException {
         _Tree tree = quickFindIndex(name);
         if (tree != null) {
             return tree;
@@ -2319,11 +2326,13 @@ final class _LocalDatabase implements Database {
 
         mCommitLock.acquireShared();
         try {
+            checkClosed();
+
             // Cleaup before opening more indexes.
             cleanupUnreferencedTrees();
 
             byte[] nameKey = newKey(KEY_TYPE_INDEX_NAME, name);
-            byte[] treeIdBytes = mRegistryKeyMap.load(null, nameKey);
+            byte[] treeIdBytes = mRegistryKeyMap.load(lookupTxn, nameKey);
             long treeId;
             // Is non-null if index was created.
             byte[] idKey;
@@ -2334,6 +2343,11 @@ final class _LocalDatabase implements Database {
             } else if (!create) {
                 return null;
             } else {
+                // transactional lookup supported only for opens that do not create.
+                if (lookupTxn != null) {
+                    throw new AssertionError();
+                }
+
                 Transaction createTxn = null;
 
                 mOpenTreesLatch.acquireExclusive();
@@ -2714,7 +2728,7 @@ final class _LocalDatabase implements Database {
     }
 
     /**
-     * Returns unconfirmed node if and existing node is found. Caller must latch and confirm
+     * Returns unconfirmed node if an existing node is found. Caller must latch and confirm
      * that node identifier matches, in case an eviction snuck in.
      *
      * @return null if node was inserted, existing node otherwise
@@ -3320,9 +3334,9 @@ final class _LocalDatabase implements Database {
     byte[] fragment(final byte[] value, final long vlength, int max)
         throws IOException
     {
-        int pageSize = mPageSize;
+        final int pageSize = mPageSize;
         long pageCount = vlength / pageSize;
-        int remainder = (int) (vlength % pageSize);
+        final int remainder = (int) (vlength % pageSize);
 
         if (vlength >= 65536) {
             // Subtract header size, full length field size, and size of one pointer.
@@ -3355,10 +3369,10 @@ final class _LocalDatabase implements Database {
             // extra pages will be full. All pointers fit too; encode direct.
 
             // Conveniently, 2 is the header bit and the inline length field size.
-            int inline = remainder == 0 ? 0 : 2;
+            final int inline = remainder == 0 ? 0 : 2;
 
             byte header = (byte) inline;
-            int offset;
+            final int offset;
             if (vlength < (1L << (2 * 8))) {
                 // (2 byte length field)
                 offset = 1 + 2;
@@ -3380,21 +3394,33 @@ final class _LocalDatabase implements Database {
                     // Value is sparse, so just fill with null pointers.
                     fill(newValue, poffset, poffset + ((int) pageCount) * 6, (byte) 0);
                 } else {
-                    int voffset = remainder;
-                    while (true) {
-                        _Node node = allocDirtyFragmentNode();
-                        try {
-                            encodeInt48LE(newValue, poffset, node.mId);
-                            p_copyFromArray(value, voffset, node.mPage, 0, pageSize);
-                            if (pageCount == 1) {
-                                break;
+                    try {
+                        int voffset = remainder;
+                        while (true) {
+                            _Node node = allocDirtyFragmentNode();
+                            try {
+                                encodeInt48LE(newValue, poffset, node.mId);
+                                p_copyFromArray(value, voffset, node.mPage, 0, pageSize);
+                                if (pageCount == 1) {
+                                    break;
+                                }
+                            } finally {
+                                node.releaseExclusive();
                             }
-                        } finally {
-                            node.releaseExclusive();
+                            pageCount--;
+                            poffset += 6;
+                            voffset += pageSize;
                         }
-                        pageCount--;
-                        poffset += 6;
-                        voffset += pageSize;
+                    } catch (DatabaseException e) {
+                        if (!e.isRecoverable()) {
+                            close(e);
+                        } else {
+                            // Clean up the mess.
+                            while ((poffset -= 6) >= (offset + inline + remainder)) {
+                                deleteFragment(decodeUnsignedInt48LE(newValue, poffset));
+                            }
+                        }
+                        throw e;
                     }
                 }
             }
@@ -3412,7 +3438,7 @@ final class _LocalDatabase implements Database {
             pointerSpace += 6;
 
             byte header;
-            int offset;
+            final int offset;
             if (vlength < (1L << (2 * 8))) {
                 header = 0x00; // ff = 0, i=0
                 offset = 1 + 2;
@@ -3435,26 +3461,39 @@ final class _LocalDatabase implements Database {
                         // Value is sparse, so just fill with null pointers.
                         fill(newValue, offset, offset + ((int) pageCount) * 6, (byte) 0);
                     } else {
-                        int voffset = 0;
-                        while (true) {
-                            _Node node = allocDirtyFragmentNode();
-                            try {
-                                encodeInt48LE(newValue, offset, node.mId);
-                                long page = node.mPage;
-                                if (pageCount > 1) {
-                                    p_copyFromArray(value, voffset, page, 0, pageSize);
-                                } else {
-                                    p_copyFromArray(value, voffset, page, 0, remainder);
-                                    // Zero fill the rest, making it easier to extend later.
-                                    p_clear(page, remainder, pageSize(page));
-                                    break;
+                        int poffset = offset;
+                        try {
+                            int voffset = 0;
+                            while (true) {
+                                _Node node = allocDirtyFragmentNode();
+                                try {
+                                    encodeInt48LE(newValue, poffset, node.mId);
+                                    long page = node.mPage;
+                                    if (pageCount > 1) {
+                                        p_copyFromArray(value, voffset, page, 0, pageSize);
+                                    } else {
+                                        p_copyFromArray(value, voffset, page, 0, remainder);
+                                        // Zero fill the rest, making it easier to extend later.
+                                        p_clear(page, remainder, pageSize(page));
+                                        break;
+                                    }
+                                } finally {
+                                    node.releaseExclusive();
                                 }
-                            } finally {
-                                node.releaseExclusive();
+                                pageCount--;
+                                poffset += 6;
+                                voffset += pageSize;
                             }
-                            pageCount--;
-                            offset += 6;
-                            voffset += pageSize;
+                        } catch (DatabaseException e) {
+                            if (!e.isRecoverable()) {
+                                close(e);
+                            } else {
+                                // Clean up the mess.
+                                while ((poffset -= 6) >= offset) {
+                                    deleteFragment(decodeUnsignedInt48LE(newValue, poffset));
+                                }
+                            }
+                            throw e;
                         }
                     }
                 }
@@ -3466,10 +3505,20 @@ final class _LocalDatabase implements Database {
                     // Value is sparse, so just store a null pointer.
                     encodeInt48LE(newValue, offset, 0);
                 } else {
-                    _Node inode = allocDirtyFragmentNode();
-                    encodeInt48LE(newValue, offset, inode.mId);
                     int levels = calculateInodeLevels(vlength);
-                    writeMultilevelFragments(levels, inode, value, 0, vlength);
+                    _Node inode = allocDirtyFragmentNode();
+                    try {
+                        encodeInt48LE(newValue, offset, inode.mId);
+                        writeMultilevelFragments(levels, inode, value, 0, vlength);
+                    } catch (DatabaseException e) {
+                        if (!e.isRecoverable()) {
+                            close(e);
+                        } else {
+                            // Clean up the mess.
+                            deleteMultilevelFragments(levels, inode, vlength);
+                        }
+                        throw e;
+                    }
                 }
             }
 
@@ -3532,31 +3581,32 @@ final class _LocalDatabase implements Database {
             int childNodeCount = (int) ((vlength + (levelCap - 1)) / levelCap);
 
             int poffset = 0;
-            for (int i=0; i<childNodeCount; poffset += 6, i++) {
-                _Node childNode = allocDirtyFragmentNode();
-                p_int48PutLE(page, poffset, childNode.mId);
+            try {
+                for (int i=0; i<childNodeCount; i++) {
+                    _Node childNode = allocDirtyFragmentNode();
+                    p_int48PutLE(page, poffset, childNode.mId);
+                    poffset += 6;
 
-                int len = (int) Math.min(levelCap, vlength);
-                if (level <= 0) {
-                    long childPage = childNode.mPage;
-                    p_copyFromArray(value, voffset, childPage, 0, len);
-                    // Zero fill the rest, making it easier to extend later.
-                    p_clear(childPage, len, pageSize(childPage));
-                    childNode.releaseExclusive();
-                } else {
-                    writeMultilevelFragments(level, childNode, value, voffset, len);
+                    int len = (int) Math.min(levelCap, vlength);
+                    if (level <= 0) {
+                        long childPage = childNode.mPage;
+                        p_copyFromArray(value, voffset, childPage, 0, len);
+                        // Zero fill the rest, making it easier to extend later.
+                        p_clear(childPage, len, pageSize(childPage));
+                        childNode.releaseExclusive();
+                    } else {
+                        writeMultilevelFragments(level, childNode, value, voffset, len);
+                    }
+
+                    vlength -= len;
+                    voffset += len;
                 }
-
-                vlength -= len;
-                voffset += len;
+            } finally {
+                // Zero fill the rest, making it easier to extend later. If an exception was
+                // thrown, this simplies cleanup. All of the allocated pages are referenced,
+                // but the rest are not.
+                p_clear(page, poffset, pageSize(page));
             }
-
-            // Zero fill the rest, making it easier to extend later.
-            p_clear(page, poffset, pageSize(page));
-        } catch (Throwable e) {
-            // Panic.
-            close(e);
-            throw e;
         } finally {
             inode.releaseExclusive();
         }
@@ -3869,7 +3919,7 @@ final class _LocalDatabase implements Database {
             _Node node = nodeMapGetAndRemove(nodeId);
             if (node != null) {
                 deleteNode(node);
-            } else if (!mHasCheckpointed) {
+            } else if (mInitialReadState != CACHED_CLEAN) {
                 // Page was never used if nothing has ever been checkpointed.
                 mPageDb.recyclePage(nodeId);
             } else {
@@ -3964,29 +4014,21 @@ final class _LocalDatabase implements Database {
 
         node.mId = id;
 
-        if (!mHasCheckpointed) {
-            // Read is reloading an evicted node which is known to be dirty.
-            mCommitLock.acquireShared();
-            // Need to check again once full lock has been acquired.
-            node.mCachedState = mHasCheckpointed ? CACHED_CLEAN : mCommitState;
-            mCommitLock.releaseShared();
-        } else {
-            // NOTE: An optimization is possible here, but it's a bit tricky. Too many pages
-            // are allocated when evictions are high, write rate is high, and commits are
-            // bogged down.  Keep some sort of cache of ids known to be dirty. If reloaded
-            // before commit, then they're still dirty.
-            //
-            // A Bloom filter is not appropriate, because of false positives. A random evicting
-            // cache works well -- it has no collision chains. Evict whatever else was there in
-            // the slot. An array of longs should suffice.
-            //
-            // When a child node is loaded with a dirty state, the parent nodes must be updated
-            // as well. This might force them to be evicted, and then the optimization is
-            // lost. A better approach would avoid the optimization if the parent node is clean
-            // or doesn't match the current commit state.
+        // NOTE: If initial state is clean, an optimization is possible, but it's a bit
+        // tricky. Too many pages are allocated when evictions are high, write rate is high,
+        // and commits are bogged down.  Keep some sort of cache of ids known to be dirty. If
+        // reloaded before commit, then they're still dirty.
+        //
+        // A Bloom filter is not appropriate, because of false positives. A random evicting
+        // cache works well -- it has no collision chains. Evict whatever else was there in
+        // the slot. An array of longs should suffice.
+        //
+        // When a child node is loaded with a dirty state, the parent nodes must be updated
+        // as well. This might force them to be evicted, and then the optimization is
+        // lost. A better approach would avoid the optimization if the parent node is clean
+        // or doesn't match the current commit state.
 
-            node.mCachedState = CACHED_CLEAN;
-        }
+        node.mCachedState = mInitialReadState;
     }
 
     void checkpoint(boolean force, long sizeThreshold, long delayThresholdNanos)
@@ -4007,19 +4049,19 @@ final class _LocalDatabase implements Database {
             long nowNanos = System.nanoTime();
 
             if (!force) {
-                check: {
+                thresholdCheck : {
                     if (delayThresholdNanos == 0) {
-                        break check;
+                        break thresholdCheck;
                     }
 
                     if (delayThresholdNanos > 0 &&
                         ((nowNanos - mLastCheckpointNanos) >= delayThresholdNanos))
                     {
-                        break check;
+                        break thresholdCheck;
                     }
 
                     if (mRedoWriter == null || mRedoWriter.shouldCheckpoint(sizeThreshold)) {
-                        break check;
+                        break thresholdCheck;
                     }
 
                     // Thresholds not met for a full checkpoint, but fully sync the redo log
@@ -4029,14 +4071,24 @@ final class _LocalDatabase implements Database {
                     return;
                 }
 
-                root.acquireShared();
-                try {
-                    if (root.mCachedState == CACHED_CLEAN) {
-                        // Root is clean, so nothing to do.
-                        return;
+                // Thresholds for a full checkpoint are met.
+                treeCheck: {
+                    root.acquireShared();
+                    try {
+                        if (root.mCachedState != CACHED_CLEAN) {
+                            // Root is dirty, do a full checkpoint.
+                            break treeCheck;
+                        }
+                    } finally {
+                        root.releaseShared();
                     }
-                } finally {
-                    root.releaseShared();
+
+                    // Root is clean, so no need for full checkpoint,
+                    // but fully sync the redo log for durability.
+                    if (mRedoWriter != null) {
+                        mRedoWriter.flushSync(true);
+                    }
+                    return;
                 }
             }
 
@@ -4179,7 +4231,14 @@ final class _LocalDatabase implements Database {
             if (masterUndoLog != null) {
                 // Delete the master undo log, which won't take effect until
                 // the next checkpoint.
-                masterUndoLog.truncate(false);
+                mCommitLock.acquireShared();
+                try {
+                    if (!mClosed) {
+                        masterUndoLog.doTruncate(mCommitLock, false);
+                    }
+                } finally {
+                    mCommitLock.releaseShared();
+                }
             }
 
             // Note: This step is intended to discard old redo data, but it can
@@ -4219,8 +4278,8 @@ final class _LocalDatabase implements Database {
             }
             stateToFlush ^= 1;
         } else {
-            if (!mHasCheckpointed) {
-                mHasCheckpointed = true; // Must be set before switching commit state.
+            if (mInitialReadState != CACHED_CLEAN) {
+                mInitialReadState = CACHED_CLEAN; // Must be set before switching commit state.
             }
             mCommitState = (byte) (stateToFlush ^ 1);
             mCommitHeader = header;

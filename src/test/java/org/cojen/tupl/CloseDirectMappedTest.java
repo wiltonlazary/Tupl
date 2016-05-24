@@ -16,20 +16,26 @@
 
 package org.cojen.tupl;
 
-import org.junit.Before;
+import org.junit.*;
 
 /**
  * 
  *
  * @author Brian S O'Neill
  */
-public class EnduranceDirectTest extends EnduranceTest {
-    public static void main(String[] args) {
-        org.junit.runner.JUnitCore.main(EnduranceDirectTest.class.getName());
+public class CloseDirectMappedTest extends CloseDirectTest {
+    public static void main(String[] args) throws Exception {
+        org.junit.runner.JUnitCore.main(CloseDirectMappedTest.class.getName());
+    }
+
+    @Before
+    @Override
+    public void createTempDb() throws Exception {
+        mDb = TestUtils.newTempDatabase(100_000_000L, TestUtils.OpenMode.DIRECT_MAPPED);
     }
 
     @Override
-    protected void decorate(DatabaseConfig config) throws Exception {
-        config.directPageAccess(true);
+    protected boolean expectCacheExhausted() {
+        return false;
     }
 }

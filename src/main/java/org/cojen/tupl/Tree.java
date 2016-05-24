@@ -180,6 +180,10 @@ class Tree implements View, Index {
             }
 
             node = node.loadChild(mDatabase, childId, Node.OPTION_PARENT_RELEASE_SHARED);
+
+            if (node.mSplit != null) {
+                node = node.mSplit.selectNode(node, key);
+            }
         }
 
         // Sub search into leaf with shared latch held.
@@ -404,12 +408,14 @@ class Tree implements View, Index {
         return check(txn).lockCheck(mId, key);
     }
 
+    /*
     @Override
     public Stream newStream() {
         TreeCursor cursor = new TreeCursor(this);
         cursor.autoload(false);
         return new TreeValueStream(cursor);
     }
+    */
 
     @Override
     public View viewGe(byte[] key) {
@@ -561,10 +567,10 @@ class Tree implements View, Index {
         try {
             cursor.autoload(false);
 
-            // Find the first entry instead of calling first() to ensure that cursor is
+            // Find the first node instead of calling first() to ensure that cursor is
             // positioned. Otherwise, empty trees would be skipped even when the root node
             // needed to be moved out of the compaction zone.
-            cursor.find(EMPTY_BYTES);
+            cursor.firstAny();
 
             if (!cursor.compact(highestNodeId, observer)) {
                 return false;

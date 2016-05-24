@@ -16,20 +16,31 @@
 
 package org.cojen.tupl;
 
-import org.junit.Before;
-
 /**
- * 
+ * Thrown when acting upon a broken transaction instance.
  *
  * @author Brian S O'Neill
  */
-public class EnduranceDirectTest extends EnduranceTest {
-    public static void main(String[] args) {
-        org.junit.runner.JUnitCore.main(EnduranceDirectTest.class.getName());
+public class InvalidTransactionException extends DatabaseException {
+    private static final long serialVersionUID = 1L;
+
+    public InvalidTransactionException() {
+    }
+
+    public InvalidTransactionException(String message) {
+        super(message);
+    }
+
+    public InvalidTransactionException(Throwable cause) {
+        super(cause);
+    }
+
+    public InvalidTransactionException(String message, Throwable cause) {
+        super(message, cause);
     }
 
     @Override
-    protected void decorate(DatabaseConfig config) throws Exception {
-        config.directPageAccess(true);
+    boolean isRecoverable() {
+        return true;
     }
 }

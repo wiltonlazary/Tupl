@@ -43,6 +43,14 @@ class Locker extends LockOwner {
         mManager = manager;
     }
 
+    private LockManager manager() {
+        LockManager manager = mManager;
+        if (manager == null) {
+            throw new IllegalStateException("Transaction is bogus");
+        }
+        return manager;
+    }
+
     /**
      * Returns true if the current transaction scope is nested.
      */
@@ -69,7 +77,7 @@ class Locker extends LockOwner {
     final LockResult tryLock(int lockType, long indexId, byte[] key, int hash, long nanosTimeout)
         throws DeadlockException
     {
-        LockResult result = mManager.getLockHT(hash)
+        LockResult result = manager().getLockHT(hash)
             .tryLock(lockType, this, indexId, key, hash, nanosTimeout);
         if (result == LockResult.TIMED_OUT_LOCK) {
             detectDeadlock(nanosTimeout);
@@ -83,7 +91,7 @@ class Locker extends LockOwner {
     final LockResult lock(int lockType, long indexId, byte[] key, int hash, long nanosTimeout)
         throws LockFailureException
     {
-        LockResult result = mManager.getLockHT(hash)
+        LockResult result = manager().getLockHT(hash)
             .tryLock(lockType, this, indexId, key, hash, nanosTimeout);
         if (result.isHeld()) {
             return result;
@@ -104,7 +112,7 @@ class Locker extends LockOwner {
     final LockResult lockNT(int lockType, long indexId, byte[] key, int hash, long nanosTimeout)
         throws LockFailureException
     {
-        LockResult result = mManager.getLockHT(hash)
+        LockResult result = manager().getLockHT(hash)
             .tryLock(lockType, this, indexId, key, hash, nanosTimeout);
         if (!result.isHeld()) {
             switch (result) {
@@ -322,7 +330,9 @@ class Locker extends LockOwner {
     }
 
     /**
-     * @param newLock Lock instance to insert, unless another already exists. The mIndexId,
+     * Lock acquisition used by recovery.
+     *
+     * @param lock Lock instance to insert, unless another already exists. The mIndexId,
      * mKey, and mHashCode fields must be set.
      */
     final LockResult lockExclusive(Lock lock, long nanosTimeout) throws LockFailureException {
@@ -354,11 +364,7 @@ class Locker extends LockOwner {
      * @param count current lock count, not zero
      */
     final boolean canAttemptUpgrade(int count) {
-        LockManager manager = mManager;
-        if (manager == null) {
-            return false;
-        }
-        LockUpgradeRule lockUpgradeRule = manager.mDefaultLockUpgradeRule;
+        LockUpgradeRule lockUpgradeRule = mManager.mDefaultLockUpgradeRule;
         return lockUpgradeRule == LockUpgradeRule.UNCHECKED
             | (lockUpgradeRule == LockUpgradeRule.LENIENT & count == 1);
     }
@@ -406,7 +412,7 @@ class Locker extends LockOwner {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      */
     public final LockResult lockCheck(long indexId, byte[] key) {
-        return mManager.check(this, indexId, key, hash(indexId, key));
+        return manager().check(this, indexId, key, hash(indexId, key));
     }
 
     /**
@@ -595,21 +601,22 @@ class Locker extends LockOwner {
     /**
      * Transfers all exclusive locks held by this Locker, for the top scope only. All other
      * locks are released.
-     *
-     * @return null if no exclusive locks were held
      */
     final PendingTxn transferExclusive() {
-        PendingTxn pending = null;
+        PendingTxn pending;
 
         Object tailObj = mTailBlock;
         if (tailObj instanceof Lock) {
-            pending = mManager.transferExclusive(this, (Lock) tailObj, pending);
+            pending = mManager.transferExclusive(this, (Lock) tailObj, null);
+        } else if (tailObj == null) {
+            pending = new PendingTxn(null);
         } else {
+            pending = null;
             Block tail = (Block) tailObj;
-            while (tail != null) {
+            do {
                 pending = tail.transferExclusive(this, pending);
                 tail = tail.pop();
-            }
+            } while (tail != null);
         }
 
         mTailBlock = null;
@@ -633,6 +640,16 @@ class Locker extends LockOwner {
     final void scopeExitAll() {
         mParentScope = null;
         scopeUnlockAll();
+        mTailBlock = null;
+    }
+
+    /**
+     * Discards all the locks held by this Locker, and exits all scopes. Calling this prevents
+     * the locks from ever being released -- they leak. Should only be called in response to
+     * some fatal error.
+     */
+    final void discardAllLocks() {
+        mParentScope = null;
         mTailBlock = null;
     }
 

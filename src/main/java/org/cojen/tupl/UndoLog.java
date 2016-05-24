@@ -454,40 +454,49 @@ final class UndoLog implements DatabaseAccess {
         final CommitLock commitLock = mDatabase.commitLock();
         commitLock.acquireShared();
         try {
-            if (mLength > 0) {
-                Node node = mNode;
-                if (node == null) {
-                    mBufferPos = mBuffer.length;
-                } else {
-                    node.acquireExclusive();
-                    while ((node = popNode(node, true)) != null) {
-                        if (commit) {
-                            // When shared lock is released, log can be checkpointed in an
-                            // incomplete state. Although caller must have already pushed the
-                            // commit op, any of the remaining nodes might be referenced by an
-                            // older master undo log entry. Must call prepareToDelete before
-                            // calling redirty, in case node contains data which has been
-                            // marked to be written out with the active checkpoint. The state
-                            // assigned by redirty is such that the node might be written
-                            // by the next checkpoint.
-                            mDatabase.prepareToDelete(node);
-                            mDatabase.redirty(node);
-                            /*P*/ byte[] page = node.mPage;
-                            int end = pageSize(page) - 1;
-                            node.undoTop(end);
-                            p_bytePut(page, end, OP_COMMIT_TRUNCATE);
-                        }
-                        // Release and re-acquire, to unblock any threads waiting for
-                        // checkpoint to begin.
-                        commitLock.releaseShared();
-                        commitLock.acquireShared();
-                    }
-                }
-                mLength = 0;
-                mActiveIndexId = 0;
-            }
+            doTruncate(commitLock, commit);
         } finally {
             commitLock.releaseShared();
+        }
+    }
+
+    /**
+     * Truncate all log entries. Caller must hold db commit lock.
+     *
+     * @param commit pass true to indicate that top of stack is a commit op
+     */
+    final void doTruncate(CommitLock commitLock, boolean commit) throws IOException {
+        if (mLength > 0) {
+            Node node = mNode;
+            if (node == null) {
+                mBufferPos = mBuffer.length;
+            } else {
+                node.acquireExclusive();
+                while ((node = popNode(node, true)) != null) {
+                    if (commit) {
+                        // When shared lock is released, log can be checkpointed in an
+                        // incomplete state. Although caller must have already pushed the
+                        // commit op, any of the remaining nodes might be referenced by an
+                        // older master undo log entry. Must call prepareToDelete before
+                        // calling redirty, in case node contains data which has been
+                        // marked to be written out with the active checkpoint. The state
+                        // assigned by redirty is such that the node might be written
+                        // by the next checkpoint.
+                        mDatabase.prepareToDelete(node);
+                        mDatabase.redirty(node);
+                        /*P*/ byte[] page = node.mPage;
+                        int end = pageSize(page) - 1;
+                        node.undoTop(end);
+                        p_bytePut(page, end, OP_COMMIT_TRUNCATE);
+                    }
+                    // Release and re-acquire, to unblock any threads waiting for
+                    // checkpoint to begin.
+                    commitLock.releaseShared();
+                    commitLock.acquireShared();
+                }
+            }
+            mLength = 0;
+            mActiveIndexId = 0;
         }
     }
 
@@ -828,7 +837,12 @@ final class UndoLog implements DatabaseAccess {
                 lowerNode.makeUnevictable();
             } else {
                 // Node was evicted, so reload it.
-                lowerNode = readUndoLogNode(mDatabase, lowerNodeId);
+                try {
+                    lowerNode = readUndoLogNode(mDatabase, lowerNodeId);
+                } catch (Throwable e) {
+                    parent.releaseExclusive();
+                    throw e;
+                }
             }
         }
 
@@ -1132,11 +1146,17 @@ final class UndoLog implements DatabaseAccess {
      */
     private static Node readUndoLogNode(LocalDatabase db, long nodeId) throws IOException {
         Node node = db.allocLatchedNode(nodeId, NodeUsageList.MODE_UNEVICTABLE);
-        node.read(db, nodeId);
-        if (node.type() != Node.TYPE_UNDO_LOG) {
-            throw new CorruptDatabaseException
-                ("Not an undo log node type: " + node.type() + ", id: " + nodeId);
+        try {
+            node.read(db, nodeId);
+            if (node.type() != Node.TYPE_UNDO_LOG) {
+                throw new CorruptDatabaseException
+                    ("Not an undo log node type: " + node.type() + ", id: " + nodeId);
+            }
+            return node;
+        } catch (Throwable e) {
+            node.makeEvictableNow();
+            node.releaseExclusive();
+            throw e;
         }
-        return node;
     }
 }

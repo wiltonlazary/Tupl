@@ -36,6 +36,7 @@ public class TestAll {
             CrudBasicFilterTest.class,
             CursorTest.class,
             CursorDirectTest.class,
+            CursorDirectMappedTest.class,
             CursorNonDurableTest.class,
             CursorNonTransformTest.class,
             CursorBasicTransformTest.class,
@@ -44,6 +45,7 @@ public class TestAll {
             LargeKeyDirectTest.class,
             LargeValueTest.class,
             LargeValueDirectTest.class,
+            LargeValueDirectMappedTest.class,
             LargeValueNonDurableTest.class,
             ExtraLargeValueTest.class,
             ExtraLargeValueDirectTest.class,
@@ -69,11 +71,12 @@ public class TestAll {
             ViewDirectTest.class,
             CloseTest.class,
             CloseDirectTest.class,
+            CloseDirectMappedTest.class,
             CloseNonDurableTest.class,
             RenameTest.class,
             RenameDirectTest.class,
-            StreamTest.class,
-            StreamDirectTest.class,
+            //StreamTest.class,
+            //StreamDirectTest.class,
             PageSizeTest.class,
             PageSizeDirectTest.class,
             CompactTest.class,
@@ -93,6 +96,7 @@ public class TestAll {
             ContentionDirectTest.class,
             ContendedLockTest.class,
             DirectPageOpsTest.class,
+            UnreplicatedTest.class,
         };
 
         String[] names = new String[classes.length];
