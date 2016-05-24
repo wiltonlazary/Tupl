@@ -32,7 +32,8 @@ import static org.cojen.tupl.Utils.*;
  * @author Brian S O'Neill
  * @see RedoDecoder
  */
-abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flushable {
+/*P*/
+abstract class RedoWriter implements CauseCloseable, ShutdownHook, Flushable {
     private final byte[] mBuffer;
     private int mBufferPos;
 
@@ -305,9 +306,9 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
         doFlush();
     }
 
-    public void sync() throws IOException {
+    public void flushSync(boolean metadata) throws IOException {
         flush();
-        sync(false);
+        sync(metadata);
     }
 
     @Override

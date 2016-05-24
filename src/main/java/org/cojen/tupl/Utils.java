@@ -56,8 +56,7 @@ class Utils extends org.cojen.tupl.io.Utils {
      * @return non-zero random number, suitable for Xorshift RNG or object hashcode
      */
     static int randomSeed() {
-        long id = Thread.currentThread().getId();
-        int seed = ((int) id) ^ ((int) (id >>> 32)) ^ cSeedMix;
+        int seed = Long.hashCode(Thread.currentThread().getId()) ^ cSeedMix;
         while (seed == 0) {
             seed = new Random().nextInt();
         }
@@ -106,7 +105,8 @@ class Utils extends org.cojen.tupl.io.Utils {
 
         // Invert v *= 21
         //v *= 14933078535860113213u;
-        v = (v * 7466539267930056606L) + (v * 7466539267930056607L);
+        //v = (v * 7466539267930056606L) + (v * 7466539267930056607L);
+        v = ((v * 7466539267930056606L) << 1) + v;
 
         // Invert v = v ^ (v >>> 14)
         tmp = v ^ v >>> 14;
@@ -116,7 +116,8 @@ class Utils extends org.cojen.tupl.io.Utils {
 
         // Invert v *= 265
         //v *= 15244667743933553977u;
-        v = (v * 7622333871966776988L) + (v * 7622333871966776989L);
+        //v = (v * 7622333871966776988L) + (v * 7622333871966776989L);
+        v = ((v * 7622333871966776988L) << 1) + v;
 
         // Invert v = v ^ (v >>> 24)
         tmp = v ^ v >>> 24;

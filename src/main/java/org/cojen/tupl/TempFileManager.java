@@ -31,7 +31,7 @@ import org.cojen.tupl.io.FileFactory;
  *
  * @author Brian S O'Neill
  */
-final class TempFileManager implements CauseCloseable, Checkpointer.Shutdown {
+final class TempFileManager implements CauseCloseable, ShutdownHook {
     private File mBaseFile;
     private final FileFactory mFileFactory;
     private long mCount;

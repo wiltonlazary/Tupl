@@ -25,6 +25,7 @@ import org.cojen.tupl.ext.ReplicationManager;
  *
  * @author Brian S O'Neill
  */
+/*P*/
 class ReplRedoWriter extends RedoWriter {
     final ReplRedoEngine mEngine;
 
@@ -197,6 +198,8 @@ class ReplRedoWriter extends RedoWriter {
             }
         }
 
+        mEngine.mController.switchToReplica(mReplWriter, false);
+
         return false;
     }
 
@@ -297,7 +300,7 @@ class ReplRedoWriter extends RedoWriter {
             if (writer == null) {
                 throw new UnmodifiableReplicaException();
             }
-            long pos = writer.write(buffer, 0, len);
+            long pos = writer.writeCommit(buffer, 0, len);
             if (pos >= 0) {
                 mLastCommitPos = pos;
                 mLastCommitTxnId = lastTransactionId();
@@ -310,7 +313,7 @@ class ReplRedoWriter extends RedoWriter {
     }
 
     @Override
-    final void force(boolean metadata) throws IOException {
+    void force(boolean metadata) throws IOException {
         mEngine.mManager.sync();
     }
 

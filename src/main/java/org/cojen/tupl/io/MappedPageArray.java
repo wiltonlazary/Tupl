@@ -50,6 +50,9 @@ public abstract class MappedPageArray extends PageArray {
     private volatile long mMappingPtr;
     private volatile Throwable mCause;
 
+    /**
+     * @param file file to store pages, or null if anonymous
+     */
     public static MappedPageArray open(int pageSize, long pageCount,
                                        File file, EnumSet<OpenOption> options)
         throws IOException
@@ -209,6 +212,11 @@ public abstract class MappedPageArray extends PageArray {
         }
     }
 
+    @Override
+    public MappedPageArray open() throws IOException {
+        return mMappingPtr == 0 ? doOpen() : this;
+    }
+
     void setMappingPtr(long ptr) throws IOException {
         while (!cMappingPtrUpdater.compareAndSet(this, 0, ptr)) {
             if (mMappingPtr != 0) {
@@ -216,6 +224,8 @@ public abstract class MappedPageArray extends PageArray {
             }
         }
     }
+
+    abstract MappedPageArray doOpen() throws IOException;
 
     abstract void doSync(long mappingPtr, boolean metadata) throws IOException;
 

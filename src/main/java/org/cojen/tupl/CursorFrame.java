@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  *
  * @author Brian S O'Neill
  */
+/*P*/
 // Note: Atomic reference is to the next frame bound to a Node.
 final class CursorFrame extends AtomicReference<CursorFrame> {
     private static final int SPIN_LIMIT = Runtime.getRuntime().availableProcessors();
@@ -300,8 +301,28 @@ final class CursorFrame extends AtomicReference<CursorFrame> {
         while (true) {
             CursorFrame n = this.get(); // get next frame
 
-            if (n == null || this.compareAndSet(n, lock)) {
-                return n;
+            if (n == null) {
+                // Not in the list.
+                return null;
+            }
+
+            if (n == this) {
+                // Locking the last frame.
+                Node node = mNode;
+                if (node != null && node.mLastCursorFrame == this && this.compareAndSet(n, lock)) {
+                    if (node != mNode || node.mLastCursorFrame != this) {
+                        // Frame is now locked, but node has changed due to a concurrent
+                        // rebinding of this frame. Unlock and try again.
+                        this.set(n);
+                    } else {
+                        return n;
+                    }
+                }
+            } else {
+                // Locking an interior or first frame.
+                if (n.mPrevCousin == this && this.compareAndSet(n, lock)) {
+                    return n;
+                }
             }
 
             trials++;
@@ -335,19 +356,6 @@ final class CursorFrame extends AtomicReference<CursorFrame> {
      */
     void unlock(CursorFrame n) {
         this.set(n);
-    }
-
-    /**
-     * Uncleanly unlink this frame, for performing cursor invalidation. Node must be
-     * exclusively held.
-     *
-     * @return previous frame, possibly null
-     */
-    CursorFrame unlink() {
-        this.set(null);
-        CursorFrame prev = mPrevCousin;
-        mPrevCousin = null;
-        return prev;
     }
 
     /**

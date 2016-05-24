@@ -127,6 +127,16 @@ final class PosixFileIO extends AbstractFileIO {
     }
 
     @Override
+    protected void doRead(long pos, ByteBuffer bb) throws IOException {
+        if (bb.isDirect()) {
+            doRead(pos, DirectAccess.getAddress(bb), bb.remaining());
+        } else {
+            doRead(pos, (byte[]) bb.array(), bb.arrayOffset(), bb.remaining());
+        }
+        bb.position(bb.limit());
+    }
+
+    @Override
     protected void doRead(long pos, long ptr, int length) throws IOException {
         mAccessLatch.acquireShared();
         try {
@@ -143,6 +153,16 @@ final class PosixFileIO extends AbstractFileIO {
         bb.position(0);
         bb.put(buf, offset, length);
         doWrite(pos, ref.mPointer, length);
+    }
+
+    @Override
+    protected void doWrite(long pos, ByteBuffer bb) throws IOException {
+        if (bb.isDirect()) {
+            doWrite(pos, DirectAccess.getAddress(bb), bb.remaining());
+        } else {
+            doWrite(pos, (byte[]) bb.array(), bb.arrayOffset(), bb.remaining());
+        }
+        bb.position(bb.limit());
     }
 
     @Override
@@ -278,6 +298,9 @@ final class PosixFileIO extends AbstractFileIO {
             if (options.contains(OpenOption.SYNC_IO)) {
                 flags |= 010000;
             }
+            if (options.contains(OpenOption.DIRECT_IO)) {
+                flags |= 040000;
+            }
             fd = open(file.getPath(), flags);
         }
 
@@ -401,7 +424,25 @@ final class PosixFileIO extends AbstractFileIO {
     }
 
     static IOException lastErrorToException() {
-        return new IOException(strerror_r(Native.getLastError(), null, 0));
+        return new IOException(errorMessage(Native.getLastError()));
+    }
+
+    static String errorMessage(int errnum) {
+        final int bufLen = 200;
+        long bufPtr = Native.malloc(bufLen);
+
+        if (bufPtr != 0) {
+            try {
+                long result = strerror_r(errnum, bufPtr, bufLen);
+                if (result != -1 && result != 22 && result != 34) { // !EINVAL && !ERANGE
+                    return new Pointer(result == 0 ? bufPtr : result).getString(0);
+                }
+            } finally {
+                Native.free(bufPtr);
+            }
+        }
+
+        return "Error " + errnum;
     }
 
     static class BufRef {
@@ -414,7 +455,7 @@ final class PosixFileIO extends AbstractFileIO {
         }
     }
 
-    static native String strerror_r(int errnum, char[] buf, int buflen);
+    static native long strerror_r(int errnum, long bufPtr, int buflen);
 
     static native int open(String path, int oflag);
 

@@ -201,11 +201,14 @@ final class UndoLog implements DatabaseAccess {
     }
 
     /**
-     * Deletes just the top node, as part of database close sequence.
+     * Deletes just the top node, as part of database close sequence. Caller must hold
+     * exclusive db commit lock.
      */
     void delete() {
-        if (mNode != null) {
-            mNode.delete(mDatabase);
+        Node node = mNode;
+        if (node != null) {
+            mNode = null;
+            node.delete(mDatabase);
         }
     }
 
@@ -232,6 +235,15 @@ final class UndoLog implements DatabaseAccess {
         }
 
         doPush(op, payload, off, len, calcUnsignedVarIntLength(len));
+    }
+
+    final void push(final long indexId,
+                    final byte op, final long payloadPtr, final int off, final int len)
+        throws IOException
+    {
+        byte[] temp = new byte[len];
+        DirectPageOps.p_copyToArray(payloadPtr, off, temp, 0, len);
+        push(indexId, op, temp, 0, len);
     }
 
     private void pushIndexId(long indexId) throws IOException {
@@ -442,40 +454,49 @@ final class UndoLog implements DatabaseAccess {
         final CommitLock commitLock = mDatabase.commitLock();
         commitLock.acquireShared();
         try {
-            if (mLength > 0) {
-                Node node = mNode;
-                if (node == null) {
-                    mBufferPos = mBuffer.length;
-                } else {
-                    node.acquireExclusive();
-                    while ((node = popNode(node, true)) != null) {
-                        if (commit) {
-                            // When shared lock is released, log can be checkpointed in an
-                            // incomplete state. Although caller must have already pushed the
-                            // commit op, any of the remaining nodes might be referenced by an
-                            // older master undo log entry. Must call prepareToDelete before
-                            // calling redirty, in case node contains data which has been
-                            // marked to be written out with the active checkpoint. The state
-                            // assigned by redirty is such that the node might be written
-                            // by the next checkpoint.
-                            mDatabase.prepareToDelete(node);
-                            mDatabase.redirty(node);
-                            /*P*/ byte[] page = node.mPage;
-                            int end = pageSize(page) - 1;
-                            node.undoTop(end);
-                            p_bytePut(page, end, OP_COMMIT_TRUNCATE);
-                        }
-                        // Release and re-acquire, to unblock any threads waiting for
-                        // checkpoint to begin.
-                        commitLock.releaseShared();
-                        commitLock.acquireShared();
-                    }
-                }
-                mLength = 0;
-                mActiveIndexId = 0;
-            }
+            doTruncate(commitLock, commit);
         } finally {
             commitLock.releaseShared();
+        }
+    }
+
+    /**
+     * Truncate all log entries. Caller must hold db commit lock.
+     *
+     * @param commit pass true to indicate that top of stack is a commit op
+     */
+    final void doTruncate(CommitLock commitLock, boolean commit) throws IOException {
+        if (mLength > 0) {
+            Node node = mNode;
+            if (node == null) {
+                mBufferPos = mBuffer.length;
+            } else {
+                node.acquireExclusive();
+                while ((node = popNode(node, true)) != null) {
+                    if (commit) {
+                        // When shared lock is released, log can be checkpointed in an
+                        // incomplete state. Although caller must have already pushed the
+                        // commit op, any of the remaining nodes might be referenced by an
+                        // older master undo log entry. Must call prepareToDelete before
+                        // calling redirty, in case node contains data which has been
+                        // marked to be written out with the active checkpoint. The state
+                        // assigned by redirty is such that the node might be written
+                        // by the next checkpoint.
+                        mDatabase.prepareToDelete(node);
+                        mDatabase.redirty(node);
+                        /*P*/ byte[] page = node.mPage;
+                        int end = pageSize(page) - 1;
+                        node.undoTop(end);
+                        p_bytePut(page, end, OP_COMMIT_TRUNCATE);
+                    }
+                    // Release and re-acquire, to unblock any threads waiting for
+                    // checkpoint to begin.
+                    commitLock.releaseShared();
+                    commitLock.acquireShared();
+                }
+            }
+            mLength = 0;
+            mActiveIndexId = 0;
         }
     }
 
@@ -816,7 +837,12 @@ final class UndoLog implements DatabaseAccess {
                 lowerNode.makeUnevictable();
             } else {
                 // Node was evicted, so reload it.
-                lowerNode = readUndoLogNode(mDatabase, lowerNodeId);
+                try {
+                    lowerNode = readUndoLogNode(mDatabase, lowerNodeId);
+                } catch (Throwable e) {
+                    parent.releaseExclusive();
+                    throw e;
+                }
             }
         }
 
@@ -1053,13 +1079,13 @@ final class UndoLog implements DatabaseAccess {
         // Locks are recovered in the opposite order in which they were acquired. Gather them
         // in a stack to reverse the order. Re-use the LockManager collision chain field and
         // form a linked list.
-        org.cojen.tupl.Lock mTopLock;
+        Lock mTopLock;
 
         Scope() {
         }
 
-        org.cojen.tupl.Lock addLock(long indexId, byte[] key) {
-            org.cojen.tupl.Lock lock = new org.cojen.tupl.Lock();
+        Lock addLock(long indexId, byte[] key) {
+            Lock lock = new Lock();
             lock.mIndexId = indexId;
             lock.mKey = key;
             lock.mHashCode = LockManager.hash(indexId, key);
@@ -1069,10 +1095,10 @@ final class UndoLog implements DatabaseAccess {
         }
 
         void acquireLocks(LocalTransaction txn) throws LockFailureException {
-            org.cojen.tupl.Lock lock = mTopLock;
+            Lock lock = mTopLock;
             if (lock != null) while (true) {
                 // Copy next before the field is overwritten.
-                org.cojen.tupl.Lock next = lock.mLockManagerNext;
+                Lock next = lock.mLockManagerNext;
                 txn.lockExclusive(lock);
                 if (next == null) {
                     break;
@@ -1120,11 +1146,17 @@ final class UndoLog implements DatabaseAccess {
      */
     private static Node readUndoLogNode(LocalDatabase db, long nodeId) throws IOException {
         Node node = db.allocLatchedNode(nodeId, NodeUsageList.MODE_UNEVICTABLE);
-        node.read(db, nodeId);
-        if (node.type() != Node.TYPE_UNDO_LOG) {
-            throw new CorruptDatabaseException
-                ("Not an undo log node type: " + node.type() + ", id: " + nodeId);
+        try {
+            node.read(db, nodeId);
+            if (node.type() != Node.TYPE_UNDO_LOG) {
+                throw new CorruptDatabaseException
+                    ("Not an undo log node type: " + node.type() + ", id: " + nodeId);
+            }
+            return node;
+        } catch (Throwable e) {
+            node.makeEvictableNow();
+            node.releaseExclusive();
+            throw e;
         }
-        return node;
     }
 }

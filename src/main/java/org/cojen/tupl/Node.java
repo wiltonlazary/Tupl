@@ -409,148 +409,6 @@ final class Node extends Latch implements DatabaseAccess {
     }
 
     /**
-     * Search for a value, starting from the root node.
-     *
-     * @param node root node
-     * @param key search key
-     * @return copy of value or null if not found
-     */
-    static byte[] search(Node node, Tree tree, byte[] key) throws IOException {
-        node.acquireShared();
-
-        // Note: No need to check if root has split, since root splits are always completed
-        // before releasing the root latch. Also, Node.used is not invoked for the root node,
-        // because it cannot be evicted.
-
-        while (!node.isLeaf()) {
-            int childPos;
-            try {
-                childPos = internalPos(node.binarySearch(key));
-            } catch (Throwable e) {
-                node.releaseShared();
-                throw e;
-            }
-
-            long childId = node.retrieveChildRefId(childPos);
-            Node childNode = tree.mDatabase.nodeMapGet(childId);
-
-            if (childNode != null) {
-                childNode.acquireShared();
-
-                // Need to check again in case evict snuck in.
-                if (childId == childNode.mId) {
-                    node.releaseShared();
-                    node = childNode;
-                    if (node.mSplit != null) {
-                        node = node.mSplit.selectNode(node, key);
-                    }
-                    node.used();
-                    continue;
-                }
-
-                childNode.releaseShared();
-            }
-
-            node = node.loadChild(tree.mDatabase, childId, OPTION_PARENT_RELEASE_SHARED);
-        }
-
-        // Sub search into leaf with shared latch held.
-
-        // Same code as binarySearch, but instead of returning the position, it directly copies
-        // the value if found. This avoids having to decode the found value location twice.
-
-        try {
-            final /*P*/ byte[] page = node.mPage;
-            final int keyLen = key.length;
-            int lowPos = node.searchVecStart();
-            int highPos = node.searchVecEnd();
-
-            int lowMatch = 0;
-            int highMatch = 0;
-
-            outer: while (lowPos <= highPos) {
-                int midPos = ((lowPos + highPos) >> 1) & ~1;
-
-                int compareLoc, compareLen, i;
-                compare: {
-                    compareLoc = p_ushortGetLE(page, midPos);
-                    compareLen = p_byteGet(page, compareLoc++);
-                    if (compareLen >= 0) {
-                        compareLen++;
-                    } else {
-                        int header = compareLen;
-                        compareLen = ((compareLen & 0x3f) << 8) | p_ubyteGet(page, compareLoc++);
-
-                        if ((header & ENTRY_FRAGMENTED) != 0) {
-                            // Note: An optimized version wouldn't need to copy the whole key.
-                            byte[] compareKey = tree.mDatabase.reconstructKey
-                                (page, compareLoc, compareLen);
-
-                            int fullCompareLen = compareKey.length;
-
-                            int minLen = Math.min(fullCompareLen, keyLen);
-                            i = Math.min(lowMatch, highMatch);
-                            for (; i<minLen; i++) {
-                                byte cb = compareKey[i];
-                                byte kb = key[i];
-                                if (cb != kb) {
-                                    if ((cb & 0xff) < (kb & 0xff)) {
-                                        lowPos = midPos + 2;
-                                        lowMatch = i;
-                                    } else {
-                                        highPos = midPos - 2;
-                                        highMatch = i;
-                                    }
-                                    continue outer;
-                                }
-                            }
-
-                            // Update compareLen and compareLoc for use by the code after the
-                            // current scope. The compareLoc is completely bogus at this point,
-                            // but is corrected when the value is retrieved below.
-                            compareLoc += compareLen - fullCompareLen;
-                            compareLen = fullCompareLen;
-
-                            break compare;
-                        }
-                    }
-
-                    int minLen = Math.min(compareLen, keyLen);
-                    i = Math.min(lowMatch, highMatch);
-                    for (; i<minLen; i++) {
-                        byte cb = p_byteGet(page, compareLoc + i);
-                        byte kb = key[i];
-                        if (cb != kb) {
-                            if ((cb & 0xff) < (kb & 0xff)) {
-                                lowPos = midPos + 2;
-                                lowMatch = i;
-                            } else {
-                                highPos = midPos - 2;
-                                highMatch = i;
-                            }
-                            continue outer;
-                        }
-                    }
-                }
-
-                if (compareLen < keyLen) {
-                    lowPos = midPos + 2;
-                    lowMatch = i;
-                } else if (compareLen > keyLen) {
-                    highPos = midPos - 2;
-                    highMatch = i;
-                } else {
-                    return retrieveLeafValueAtLoc(node, page, compareLoc + compareLen);
-                }
-            }
-
-            return null;
-        } finally {
-            node.releaseShared();
-        }
-    }
-
-    /**
      * Options for loadChild. Caller must latch parentas shared or exclusive, which can be
      * retained (default) or released. Child node is latched shared (default) or exclusive.
      */
@@ -565,6 +423,7 @@ final class Node extends Latch implements DatabaseAccess {
      * parent and child latches are always released.
      *
      * @param options descibed described by OPTION_* fields
+     * @return child node, possibly split
      */
     Node loadChild(LocalDatabase db, long childId, int options) throws IOException {
         // Insert a "lock", which is a temporary node latched exclusively. All other threads
@@ -662,23 +521,27 @@ final class Node extends Latch implements DatabaseAccess {
         final LocalDatabase db = getDatabase();
         Node childNode = db.nodeMapGet(childId);
 
-        if (childNode != null) {
-            if (!childNode.tryAcquireExclusive()) {
-                return null;
-            }
-            // Need to check again in case evict snuck in.
-            if (childId != childNode.mId) {
+        latchChild: {
+            if (childNode != null) {
+                if (!childNode.tryAcquireExclusive()) {
+                    return null;
+                }
+                // Need to check again in case evict snuck in.
+                if (childId == childNode.mId) {
+                    break latchChild;
+                }
                 childNode.releaseExclusive();
-            } else if (childNode.mSplit == null) {
-                // Return without updating LRU position. Node contents were not user requested.
-                return childNode;
-            } else {
-                childNode.releaseExclusive();
-                return null;
             }
+            childNode = loadChild(db, childId, OPTION_CHILD_ACQUIRE_EXCLUSIVE);
         }
 
-        return loadChild(db, childId, OPTION_CHILD_ACQUIRE_EXCLUSIVE);
+        if (childNode.mSplit == null) {
+            // Return without updating LRU position. Node contents were not user requested.
+            return childNode;
+        } else {
+            childNode.releaseExclusive();
+            return null;
+        }
     }
 
     /**
@@ -834,7 +697,7 @@ final class Node extends Latch implements DatabaseAccess {
 
         if (p_byteGet(page, 1) != 0) {
             throw new IllegalStateException
-                ("Illegal reserved byte in node: " + p_byteGet(page, 1));
+                ("Illegal reserved byte in node: " + p_byteGet(page, 1) + ", id: " + mId);
         }
     }
 
@@ -936,10 +799,16 @@ final class Node extends Latch implements DatabaseAccess {
     private void invalidateCursors(Node closed) {
         int pos = isLeaf() ? -1 : 0;
 
-        for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
-            frame.mNode = closed;
-            frame.mNodePos = pos;
-            frame = frame.unlink();
+        closed.acquireExclusive();
+        try {
+            for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
+                // Capture previous frame from linked list before changing the links.
+                CursorFrame prev = frame.mPrevCousin;
+                frame.rebind(closed, pos);
+                frame = prev;
+            }
+        } finally {
+            closed.releaseExclusive();
         }
 
         if (!isInternal()) {
@@ -1002,7 +871,7 @@ final class Node extends Latch implements DatabaseAccess {
         /*P*/ // [
         mType = type;
         /*P*/ // |
-        /*P*/ // p_bytePut(mPage, 0, type);
+        /*P*/ // p_shortPutLE(mPage, 0, type & 0xff); // clear reserved byte too
         /*P*/ // ]
     }
 
@@ -1119,7 +988,7 @@ final class Node extends Latch implements DatabaseAccess {
     /**
      * Get the search vector end pointer.
      */
-    private int searchVecEnd() {
+    int searchVecEnd() {
         /*P*/ // [
         return mSearchVecEnd;
         /*P*/ // |
@@ -1278,9 +1147,9 @@ final class Node extends Latch implements DatabaseAccess {
 
     boolean shouldMerge(int availBytes) {
         return mSplit == null
-            & (((type() & (LOW_EXTREMITY | HIGH_EXTREMITY)) == 0
-                 & availBytes >= ((pageSize(mPage) - TN_HEADER_SIZE) >> 1))
-                | !hasKeys());
+            && (((type() & (LOW_EXTREMITY | HIGH_EXTREMITY)) == 0
+                 && availBytes >= ((pageSize(mPage) - TN_HEADER_SIZE) >> 1))
+                || !hasKeys());
     }
 
     /**
@@ -1774,8 +1643,7 @@ final class Node extends Latch implements DatabaseAccess {
         return retrieveLeafValueAtLoc(this, page, loc);
     }
 
-    private static byte[] retrieveLeafValueAtLoc(DatabaseAccess dbAccess,
-                                                 /*P*/ byte[] page, int loc)
+    static byte[] retrieveLeafValueAtLoc(DatabaseAccess dbAccess, /*P*/ byte[] page, int loc)
         throws IOException
     {
         final int header = p_byteGet(page, loc++);
@@ -2530,8 +2398,11 @@ final class Node extends Latch implements DatabaseAccess {
             // search there. Note that tryRebalanceLeafRight has an identical check, after
             // applying De Morgan's law. Because the chosen parent node is not strictly the
             // lowest from the right, a comparison must be made to the actual new parent node.
+            byte[] frameKey;
             if (newPos < 0 |
-                ((newPos == 0 & mask != 0) && compareUnsigned(frame.mNotFoundKey, newKey) < 0))
+                ((newPos == 0 & mask != 0) &&
+                 ((frameKey = frame.mNotFoundKey) != null &&
+                  compareUnsigned(frameKey, newKey) < 0)))
             {
                 frame.rebind(left, (leftEndPos + newPos) ^ mask);
                 frame.adjustParentPosition(-2);
@@ -2732,8 +2603,11 @@ final class Node extends Latch implements DatabaseAccess {
             // tryRebalanceLeafLeft has an identical check, after applying De Morgan's law.
             // Because the chosen parent node is not strictly the lowest from the right, a
             // comparison must be made to the actual new parent node.
+            byte[] frameKey;
             if (newPos >= 0 &
-                ((newPos != 0 | mask == 0) || compareUnsigned(frame.mNotFoundKey, newKey) >= 0))
+                ((newPos != 0 | mask == 0) ||
+                 ((frameKey = frame.mNotFoundKey) != null &&
+                  compareUnsigned(frameKey, newKey) >= 0)))
             {
                 frame.rebind(right, newPos ^ mask);
                 frame.adjustParentPosition(+2);
@@ -2762,8 +2636,8 @@ final class Node extends Latch implements DatabaseAccess {
 
     /**
      * Insert into an internal node following a child node split. This parent node and child
-     * node must have an exclusive latch held. Parent and child latch are always released, even
-     * if an exception is thrown.
+     * node must have an exclusive latch held. Child latch is always released, and an exception
+     * releases the parent latch too.
      *
      * @param frame optional frame which is bound to this node; only used for rebalancing
      * @param keyPos position to insert split key
@@ -4094,12 +3968,8 @@ final class Node extends Latch implements DatabaseAccess {
             throw new AssertionError();
         }
 
-        // ...and now unlock them. Next reference of last frame is always itself.
-        childLastFrame.unlock(childLastFrame);
-        thisLastFrame.unlock(thisLastFrame);
-
-        this.fixFrameBindings(lock);
-        child.fixFrameBindings(lock);
+        this.fixFrameBindings(lock, childLastFrame); // Note: frames were swapped
+        child.fixFrameBindings(lock, thisLastFrame);
 
         child.mPage = oldRootPage;
         child.type(oldRootType);
@@ -4122,15 +3992,30 @@ final class Node extends Latch implements DatabaseAccess {
     }
 
     /**
-     * Bind all the frames of this node, to this node, for use by the rootDelete method.
+     * Bind all the frames of this node, to this node, for use by the rootDelete method. Frame
+     * locks are released as a side-effect.
+     *
+     * @param frame last frame, locked; is unlocked with itself
      */
-    private void fixFrameBindings(CursorFrame lock) {
-        for (CursorFrame f = mLastCursorFrame; f != null; f = f.mPrevCousin) {
-            CursorFrame lockResult = f.tryLock(lock);
-            if (lockResult != null) {
-                f.mNode = this;
-                f.unlock(lockResult);
+    private void fixFrameBindings(final CursorFrame lock, CursorFrame frame) {
+        CursorFrame lockResult = frame;
+        while (true) {
+            Node existing = frame.mNode;
+            if (existing != null) {
+                if (existing == this) {
+                    throw new AssertionError();
+                }
+                frame.mNode = this;
             }
+
+            CursorFrame prev = frame.tryLockPrevious(lock);
+            frame.unlock(lockResult);
+            if (prev == null) {
+                return;
+            }
+
+            lockResult = frame;
+            frame = prev;
         }
     }
 

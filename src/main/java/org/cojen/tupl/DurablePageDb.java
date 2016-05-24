@@ -27,7 +27,7 @@ import java.security.GeneralSecurityException;
 import java.util.BitSet;
 import java.util.EnumSet;
 
-import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
 
 import org.cojen.tupl.io.FileFactory;
 import org.cojen.tupl.io.FilePageArray;
@@ -170,29 +170,6 @@ final class DurablePageDb extends PageDb {
         if (pageSize < MINIMUM_PAGE_SIZE) {
             throw new IllegalArgumentException
                 ("Page size is too small: " + pageSize + " < " + MINIMUM_PAGE_SIZE);
-        }
-    }
-
-    static class WrongPageSize extends Exception {
-        private static final long serialVersionUID = 1L;
-
-        private final int mExpected;
-        private final int mActual;
-
-        WrongPageSize(int expected, int actual) {
-            mExpected = expected;
-            mActual = actual;
-        }
-
-        @Override
-        public Throwable fillInStackTrace() {
-            return this;
-        }
-
-        DatabaseException rethrow() throws DatabaseException {
-            throw new DatabaseException
-                ("Actual page size does not match configured page size: "
-                 + mActual + " != " + mExpected);
         }
     }
 
@@ -492,7 +469,7 @@ final class DurablePageDb extends PageDb {
             return 0;
         }
 
-        final Lock lock = mCommitLock.readLock();
+        final ReadLock lock = mCommitLock.readLock();
 
         for (int i=0; i<pageCount; i++) {
             lock.lock();
@@ -781,6 +758,10 @@ final class DurablePageDb extends PageDb {
                 pa.writePage(index, p_transferTo(buffer, bufferPage));
                 index++;
             }
+
+            // Ensure newly restored snapshot is durable and also ensure that PageArray (if a
+            // MappedPageArray) no longer considers itself to be empty.
+            pa.sync(true);
         } finally {
             p_delete(bufferPage);
             closeQuietly(null, in);

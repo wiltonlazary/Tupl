@@ -23,6 +23,7 @@ import java.io.IOException;
  *
  * @author Brian S O'Neill
  */
+/*P*/
 final class TxnTreeCursor extends TreeCursor {
     TxnTreeCursor(TxnTree tree, Transaction txn) {
         super(tree, txn);
@@ -86,16 +87,6 @@ final class TxnTreeCursor extends TreeCursor {
             }
         } catch (Throwable e) {
             throw handleException(e, false);
-        }
-    }
-
-    private void doCommit(LocalTransaction txn, byte[] key, byte[] value) throws IOException {
-        if (txn.lockMode() == LockMode.UNSAFE) {
-            store(txn, leafExclusive(), value);
-            txn.commit();
-        } else {
-            txn.lockExclusive(mTree.mId, key, keyHash());
-            txn.storeCommit(this, value);
         }
     }
 }

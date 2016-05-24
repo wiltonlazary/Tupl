@@ -20,8 +20,7 @@ import java.io.IOException;
 
 /**
  * Abstract wrapper around another cursor. Subclass must implement the {@link #copy copy}
- * method, and it should also override the {@link #store store} and {@link #newStream
- * newStream} methods.
+ * method, and it should also override the {@link #store store} and method.
  *
  * @author Brian S O'Neill
  */
@@ -267,10 +266,12 @@ public abstract class WrappedCursor<C extends Cursor> implements Cursor {
     /**
      * Returns an unmodifiable stream by default.
      */
+    /*
     @Override
     public Stream newStream() {
         return new UnmodifiableStream(source.newStream());
     }
+    */
 
     /**
      * {@inheritDoc}

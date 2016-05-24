@@ -26,6 +26,7 @@ import org.cojen.tupl.ext.ReplicationManager;
  * @author Brian S O'Neill
  * @see ReplRedoEngine
  */
+/*P*/
 final class ReplRedoController extends ReplRedoWriter {
     private final ReplicationManager mManager;
 
@@ -176,20 +177,45 @@ final class ReplRedoController extends ReplRedoWriter {
         return -txnId;
     }
 
+    @Override
+    void force(boolean metadata) throws IOException {
+        // Interpret metadata option as a durability confirmation request.
+
+        if (metadata) {
+            long pos;
+            {
+                ReplRedoWriter redo = mTxnRedoWriter;
+                if (redo.mReplWriter == null) {
+                    pos = mEngine.mDecodePosition;
+                } else synchronized (redo) {
+                    pos = redo.mLastCommitPos;
+                }
+            }
+
+            try {
+                mEngine.mManager.syncConfirm(pos);
+                return;
+            } catch (IOException e) {
+                // Try regular sync instead, in case leadership just changed.
+            }
+        }
+
+        mEngine.mManager.sync();
+    }
+
     /**
      * Called by ReplRedoEngine when local instance has become the leader.
      */
     synchronized void leaderNotify() throws UnmodifiableReplicaException, IOException {
-        ReplicationManager.Writer writer = mTxnRedoWriter.mReplWriter;
-
-        if (writer != null) {
+        if (mTxnRedoWriter.mReplWriter != null) {
             // Must be in replica mode.
             return;
         }
 
         mManager.flip();
+        ReplicationManager.Writer writer = mManager.writer();
 
-        if ((writer = mManager.writer()) == null) {
+        if (writer == null) {
             // False alarm?
             return;
         }
@@ -203,6 +229,10 @@ final class ReplRedoController extends ReplRedoWriter {
 
             redo.mConfirmedPos = redo.mLastCommitPos = writer.position();
             redo.mConfirmedTxnId = redo.mLastCommitTxnId = 0;
+
+            if (!writer.leaderNotify(() -> switchToReplica(writer, false))) {
+                throw unmodifiable(writer);
+            }
 
             // Clear the log state and write a reset op to signal leader transition.
             redo.clearAndReset();

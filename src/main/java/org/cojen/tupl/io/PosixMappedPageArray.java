@@ -32,6 +32,9 @@ import com.sun.jna.Platform;
  * @author Brian S O'Neill
  */
 class PosixMappedPageArray extends MappedPageArray {
+    private final File mFile;
+    private final EnumSet<OpenOption> mOptions;
+
     private final int mFileDescriptor;
 
     private volatile boolean mEmpty;
@@ -41,6 +44,21 @@ class PosixMappedPageArray extends MappedPageArray {
         throws IOException
     {
         super(pageSize, pageCount, options);
+
+        mFile = file;
+        mOptions = options;
+
+        if (file == null) {
+            int prot = 1 | 2; // PROT_READ | PROT_WRITE
+            int flags = 1 | (Platform.isMac() ? 0x1000 : 0x20); // MAP_SHARED | MAP_ANONYMOUS
+
+            setMappingPtr(PosixFileIO.mmapFd(pageSize * pageCount, prot, flags, -1, 0));
+
+            mFileDescriptor = -1;
+            mEmpty = true;
+
+            return;
+        }
 
         // Create file (if necessary) and get proper length.
 
@@ -121,20 +139,35 @@ class PosixMappedPageArray extends MappedPageArray {
         mEmpty = count == 0;
     }
 
+    @Override
+    MappedPageArray doOpen() throws IOException {
+        boolean empty = mEmpty;
+        PosixMappedPageArray pa = new PosixMappedPageArray
+            (pageSize(), super.getPageCount(), mFile, mOptions);
+        pa.mEmpty = empty;
+        return pa;
+    }
+
     void doSync(long mappingPtr, boolean metadata) throws IOException {
-        PosixFileIO.msyncAddr(mappingPtr, super.getPageCount() * pageSize());
-        if (metadata) {
-            PosixFileIO.fsyncFd(mFileDescriptor);
+        if (mFileDescriptor != -1) {
+            PosixFileIO.msyncAddr(mappingPtr, super.getPageCount() * pageSize());
+            if (metadata) {
+                PosixFileIO.fsyncFd(mFileDescriptor);
+            }
         }
+        mEmpty = false;
     }
 
     void doSyncPage(long mappingPtr, long index) throws IOException {
         int pageSize = pageSize();
         PosixFileIO.msyncAddr(mappingPtr + index * pageSize, pageSize);
+        mEmpty = false;
     }
 
     void doClose(long mappingPtr) throws IOException {
         PosixFileIO.munmap(mappingPtr, super.getPageCount() * pageSize());
-        PosixFileIO.closeFd(mFileDescriptor);
+        if (mFileDescriptor != -1) {
+            PosixFileIO.closeFd(mFileDescriptor);
+        }
     }
 }

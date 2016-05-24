@@ -100,7 +100,7 @@ final class Split {
      * Performs a binary search against the split, returning the position
      * within the original node as if it had not split.
      */
-    final int binarySearch(Node node, byte[] key) throws IOException {
+    final int binarySearchLeaf(Node node, byte[] key) throws IOException {
         Node sibling = latchSibling();
 
         Node left, right;
@@ -131,27 +131,18 @@ final class Split {
     }
 
     /**
-     * Return the left split node, latched shared. Other node is unlatched.
+     * Returns the highest position within the original node as if it had not split.
      */
-    final Node latchLeft(Node node) {
-        if (mSplitRight) {
-            return node;
-        }
+    final int highestPos(Node node) {
+        int pos;
         Node sibling = latchSibling();
-        node.releaseShared();
-        return sibling;
-    }
-
-    /**
-     * Return the right split node, latched shared. Other node is unlatched.
-     */
-    final Node latchRight(Node node) {
-        if (mSplitRight) {
-            Node sibling = latchSibling();
-            node.releaseShared();
-            return sibling;
+        if (node.isLeaf()) {
+            pos = node.highestLeafPos() + 2 + sibling.highestLeafPos();
+        } else {
+            pos = node.highestInternalPos() + 2 + sibling.highestInternalPos();
         }
-        return node;
+        sibling.releaseShared();
+        return pos;
     }
 
     /**
@@ -205,7 +196,7 @@ final class Split {
 
             if (pos == highestPos + 2) {
                 byte[] key = frame.mNotFoundKey;
-                if (compare(key) < 0) {
+                if (key == null || compare(key) < 0) {
                     // Nothing to do.
                     return;
                 }
@@ -233,6 +224,9 @@ final class Split {
 
             if (pos == highestPos + 2) {
                 byte[] key = frame.mNotFoundKey;
+                if (key == null) {
+                    return;
+                }
                 if (compare(key) < 0) {
                     frame.rebind(sibling, ~pos);
                     return;

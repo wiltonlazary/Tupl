@@ -69,6 +69,29 @@ public class DirectAccess {
         cLocalBuffer2 = local2;
     }
 
+    private final ThreadLocal<ByteBuffer> mLocalBuffer;
+
+    /**
+     * @throws UnsupportedOperationException if not supported
+     */
+    public DirectAccess() {
+        if (!isSupported()) {
+            throw new UnsupportedOperationException();
+        }
+        mLocalBuffer = new ThreadLocal<>();
+    }
+
+    /**
+     * Returns an instance-specific thread-local ByteBuffer which references any memory
+     * address. The position is set to zero, the limit and capacity are set to the given
+     * length.
+     *
+     * @throws UnsupportedOperationException if not supported
+     */
+    public ByteBuffer prepare(long ptr, int length) {
+        return ref(mLocalBuffer, ptr, length);
+    }
+
     public static boolean isSupported() {
         return cDirectCtor != null;
     }
@@ -90,6 +113,17 @@ public class DirectAccess {
      */
     public static ByteBuffer ref2(long ptr, int length) {
         return ref(cLocalBuffer2, ptr, length);
+    }
+
+    public static long getAddress(Buffer buf) {
+        if (!buf.isDirect()) {
+            throw new IllegalArgumentException("Not a direct buffer");
+        }
+        try {
+            return cDirectAddress.getLong(buf);
+        } catch (Exception e) {
+            throw new UnsupportedOperationException(e);
+        }
     }
 
     private static ByteBuffer ref(ThreadLocal<ByteBuffer> local, long ptr, int length) {
