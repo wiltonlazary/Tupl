@@ -19,20 +19,18 @@ package org.cojen.tupl;
 import java.io.IOException;
 
 /**
- * Maintains a logical position in a {@link View}. Cursor instances can only be
- * safely used by one thread at a time, and they must be {@link #reset reset}
- * when no longer needed. Instances can be exchanged by threads, as long as a
- * happens-before relationship is established. Without proper exclusion,
- * multiple threads interacting with a Cursor instance may cause database
- * corruption.
+ * Maintains a logical position in a {@link View}, which can be repositioned anywhere.  Cursor
+ * instances can only be safely used by one thread at a time, and they must be {@link #reset
+ * reset} when no longer needed. Instances can be exchanged by threads, as long as a
+ * happens-before relationship is established. Without proper exclusion, multiple threads
+ * interacting with a Cursor instance may cause database corruption.
  *
- * <p>Methods which return {@link LockResult} might acquire a lock to access
- * the requested entry. The return type indicates if the lock is still {@link
- * LockResult#isHeld held}, and in what fashion. Except where indicated, a
- * {@link LockTimeoutException} is thrown when a lock cannot be acquired in
- * time. When cursor is {@link #link linked} to a transaction, it defines the
- * locking behavior and timeout. Otherwise, a lock is always acquired, with the
- * {@link DatabaseConfig#lockTimeout default} timeout.
+ * <p>Methods which return {@link LockResult} might acquire a lock to access the requested
+ * entry. The return type indicates if the lock is still {@link LockResult#isHeld held}, and in
+ * what fashion. Except where indicated, a {@link LockTimeoutException} is thrown when a lock
+ * cannot be acquired in time. When cursor is {@link #link linked} to a transaction, it defines
+ * the locking behavior and timeout. Otherwise, a lock is always acquired, with the {@link
+ * DatabaseConfig#lockTimeout default} timeout.
  *
  * <p>If a {@link LockFailureException} is thrown from any method, the Cursor
  * is positioned at the desired key, but the value is {@link #NOT_LOADED}.
@@ -40,12 +38,12 @@ import java.io.IOException;
  * @author Brian S O'Neill
  * @see View#newCursor View.newCursor
  */
-public interface Cursor {
+public interface Cursor extends Scanner {
     /**
      * Empty marker which indicates that value exists but has not been {@link
      * #load loaded}.
      */
-    public static final byte[] NOT_LOADED = new byte[0];
+    public static final byte[] NOT_LOADED = Scanner.NOT_LOADED;
 
     /**
      * Returns the key ordering for this cursor.
@@ -62,23 +60,27 @@ public interface Cursor {
      * @return prior linked transaction
      * @throws IllegalArgumentException if transaction belongs to another database instance
      */
+    @Override
     public Transaction link(Transaction txn);
 
     /**
      * Returns the transaction the cursor is currently linked to.
      */
+    @Override
     public Transaction link();
 
     /**
      * Returns an uncopied reference to the current key, or null if Cursor is
      * unpositioned. Array contents must not be modified.
      */
+    @Override
     public byte[] key();
 
     /**
      * Returns an uncopied reference to the current value, which might be null
      * or {@link #NOT_LOADED}. Array contents can be safely modified.
      */
+    @Override
     public byte[] value();
 
     /**
@@ -89,11 +91,13 @@ public interface Cursor {
      * @param mode false to disable
      * @return prior autoload mode
      */
+    @Override
     public boolean autoload(boolean mode);
 
     /**
      * Returns the current autoload mode.
      */
+    @Override
     public boolean autoload();
 
     /**
@@ -163,6 +167,7 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws IllegalStateException if position is undefined at invocation time
      */
+    @Override
     public LockResult skip(long amount) throws IOException;
 
     /**
@@ -202,6 +207,7 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws IllegalStateException if position is undefined at invocation time
      */
+    @Override
     public LockResult next() throws IOException;
 
     /**
@@ -389,6 +395,7 @@ public interface Cursor {
      * LockResult#OWNED_UPGRADABLE OWNED_UPGRADABLE}, or {@link
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      */
+    @Override
     public LockResult load() throws IOException;
 
     /**
@@ -402,6 +409,7 @@ public interface Cursor {
      * @throws IllegalStateException if position is undefined at invocation time
      * @throws ViewConstraintException if value is not permitted
      */
+    @Override
     public void store(byte[] value) throws IOException;
 
     /**
@@ -414,13 +422,8 @@ public interface Cursor {
      * @throws IllegalStateException if position is undefined at invocation time
      * @throws ViewConstraintException if value is not permitted
      */
-    public default void commit(byte[] value) throws IOException {
-        store(value);
-        Transaction txn = link();
-        if (txn != null && txn != Transaction.BOGUS) {
-            txn.commit();
-        }
-    }
+    @Override
+    public void commit(byte[] value) throws IOException;
 
     //public int read(LockResult[] result,int start,byte[] b, int off, int len) throws IOException;
 
@@ -455,5 +458,6 @@ public interface Cursor {
      * Resets Cursor and moves it to an undefined position. The key and value references are
      * also cleared.
      */
+    @Override
     public void reset();
 }

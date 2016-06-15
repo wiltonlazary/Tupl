@@ -39,6 +39,17 @@ public interface View {
     public Cursor newCursor(Transaction txn);
 
     /**
+     * @param txn optional transaction for Scanner to {@link Scanner#link link} to
+     * @return a new scanner positioned at the first entry
+     * @throws IllegalArgumentException if transaction belongs to another database instance
+     */
+    public default Scanner newScanner(Transaction txn) throws IOException {
+        Cursor c = newCursor(txn);
+        c.first();
+        return c;
+    }
+
+    /**
      * Non-transactionally counts the number of entries within the given range. Implementations
      * of this method typically scan over the entries, and so it shouldn't be expected to run
      * in constant time.
