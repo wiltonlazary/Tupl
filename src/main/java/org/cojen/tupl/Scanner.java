@@ -19,7 +19,7 @@ package org.cojen.tupl;
 import java.io.IOException;
 
 /**
- * Supports accessing all entries within a {@link View}, in same fashion as an {@link
+ * Supports accessing all entries within a {@link View}, in the same fashion as an {@link
  * java.util.Iterator Iterator}. Scanner instances can only be safely used by one thread at a
  * time, and they must be {@link #reset reset} when no longer needed. Instances can be
  * exchanged by threads, as long as a happens-before relationship is established. Without
