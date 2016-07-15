@@ -158,6 +158,27 @@ class ViewUtils {
         }
     }
 
+    static void move(Cursor from, Cursor target) throws IOException {
+        Transaction txn = target.link();
+        if (txn == null || txn != from.link()) {
+            throw new IllegalArgumentException();
+        }
+
+        txn.enter();
+        try {
+            byte[] value = from.value();
+            if (value == Cursor.NOT_LOADED) {
+                from.load();
+                value = from.value();
+            }
+            // Store first, in case from and target positions are identical.
+            from.store(null);
+            target.commit(value);
+        } finally {
+            txn.exit();
+        }
+    }
+
     static final String toString(Index ix) {
         StringBuilder b = new StringBuilder(ix.getClass().getName());
         b.append('@').append(Integer.toHexString(ix.hashCode()));

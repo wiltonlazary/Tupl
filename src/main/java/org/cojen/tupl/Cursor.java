@@ -422,6 +422,20 @@ public interface Cursor {
         }
     }
 
+    /**
+     * Moves the current entry to another position, in this or another view. If the target
+     * already has an entry, the move operation replaces it. Large values can be moved
+     * efficiently by not performing a full copy, but only when autoload is disabled.
+     *
+     * @throws NullPointerException if target is null
+     * @throws IllegalArgumentException if transaction linkage doesn't match or is null
+     * @throws IllegalStateException if either cursor position is undefined at invocation time
+     * @throws ViewConstraintException if value is not permitted in the target view
+     */
+    public default void moveTo(Cursor target) throws IOException {
+        ViewUtils.move(this, target);
+    }
+
     //public int read(LockResult[] result,int start,byte[] b, int off, int len) throws IOException;
 
     /**

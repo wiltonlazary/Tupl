@@ -481,6 +481,18 @@ final class TransformedCursor implements Cursor {
         mValue = tvalue;
     }
 
+    @Override
+    public void moveTo(Cursor target) throws IOException {
+        byte[] value = mValue;
+        if ((value != null && value != NOT_LOADED) || mTransformer.requireValue()) {
+            ViewUtils.move(this, target);
+        } else {
+            ViewUtils.positionCheck(mKey);
+            mSource.moveTo(target);
+            mValue = null;
+        }
+    }
+
     /*
     @Override
     public Stream newStream() {

@@ -215,6 +215,11 @@ final class TrimmedCursor implements Cursor {
         mSource.commit(value);
     }
 
+    @Override
+    public void moveTo(Cursor target) throws IOException {
+        mSource.moveTo(target);
+    }
+
     /*
     @Override
     public Stream newStream() {

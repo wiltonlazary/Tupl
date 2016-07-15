@@ -2588,6 +2588,10 @@ class TreeCursor implements CauseCloseable, Cursor {
         txn.commit();
     }
 
+    // FIXME: moveTo
+    //@Override
+    //public void moveTo(Cursor target) throws IOException {
+
     /**
      * Atomic find and store operation. Cursor must be in a reset state when called, and cursor
      * is also reset as a side-effect.
