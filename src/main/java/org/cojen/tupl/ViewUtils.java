@@ -158,7 +158,7 @@ class ViewUtils {
         }
     }
 
-    static void move(Cursor from, Cursor target) throws IOException {
+    static void transfer(Cursor from, Cursor target) throws IOException {
         Transaction txn = target.link();
         if (txn == null || txn != from.link()) {
             throw new IllegalArgumentException();

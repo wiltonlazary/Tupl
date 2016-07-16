@@ -482,13 +482,13 @@ final class TransformedCursor implements Cursor {
     }
 
     @Override
-    public void moveTo(Cursor target) throws IOException {
+    public void transferTo(Cursor target) throws IOException {
         byte[] value = mValue;
         if ((value != null && value != NOT_LOADED) || mTransformer.requireValue()) {
-            ViewUtils.move(this, target);
+            ViewUtils.transfer(this, target);
         } else {
             ViewUtils.positionCheck(mKey);
-            mSource.moveTo(target);
+            mSource.transferTo(target);
             mValue = null;
         }
     }

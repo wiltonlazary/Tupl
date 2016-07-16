@@ -216,8 +216,8 @@ final class TrimmedCursor implements Cursor {
     }
 
     @Override
-    public void moveTo(Cursor target) throws IOException {
-        mSource.moveTo(target);
+    public void transferTo(Cursor target) throws IOException {
+        mSource.transferTo(target);
     }
 
     /*

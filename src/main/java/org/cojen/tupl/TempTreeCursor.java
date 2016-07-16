@@ -97,7 +97,7 @@ final class TempTreeCursor extends TreeCursor {
     }
 
     @Override
-    public void moveTo(Cursor target) throws IOException {
+    public void transferTo(Cursor target) throws IOException {
         Transaction txn = target.link();
         if (txn == null || txn != mTxn) {
             throw new IllegalArgumentException();
@@ -105,11 +105,11 @@ final class TempTreeCursor extends TreeCursor {
 
         final DurabilityMode dmode = txn.durabilityMode();
         if (dmode == DurabilityMode.NO_REDO) {
-            super.moveTo(target);
+            super.transferTo(target);
         } else {
             txn.durabilityMode(DurabilityMode.NO_REDO);
             try {
-                super.moveTo(target);
+                super.transferTo(target);
             } finally {
                 txn.durabilityMode(dmode);
             }
