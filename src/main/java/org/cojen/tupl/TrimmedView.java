@@ -92,6 +92,13 @@ final class TrimmedView implements View {
     }
 
     @Override
+    public LockResult tryLockShared(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        return mSource.tryLockShared(txn, applyPrefix(key), nanosTimeout);
+    }
+
+    @Override
     public final LockResult lockShared(Transaction txn, byte[] key)
         throws LockFailureException, ViewConstraintException
     {
@@ -99,10 +106,24 @@ final class TrimmedView implements View {
     }
 
     @Override
+    public LockResult tryLockUpgradable(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        return mSource.tryLockUpgradable(txn, applyPrefix(key), nanosTimeout);
+    }
+
+    @Override
     public final LockResult lockUpgradable(Transaction txn, byte[] key)
         throws LockFailureException, ViewConstraintException
     {
         return mSource.lockUpgradable(txn, applyPrefix(key));
+    }
+
+    @Override
+    public LockResult tryLockExclusive(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        return mSource.tryLockExclusive(txn, applyPrefix(key), nanosTimeout);
     }
 
     @Override
@@ -175,9 +196,7 @@ final class TrimmedView implements View {
     }
 
     byte[] applyPrefix(byte[] key, int offset, int length) {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        Utils.keyCheck(key);
         byte[] prefix = mPrefix;
         byte[] full = new byte[prefix.length + length];
         System.arraycopy(prefix, 0, full, 0, prefix.length);

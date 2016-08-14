@@ -204,7 +204,7 @@ final class _LocalTransaction extends _Locker implements Transaction {
                     // aborted. Recovery would erroneously rollback committed
                     // transactions.
                     final CommitLock commitLock = mDatabase.commitLock();
-                    commitLock.acquireShared();
+                    commitLock.lock();
                     long commitPos;
                     try {
                         if ((commitPos = (mHasState & HAS_COMMIT)) != 0) {
@@ -216,7 +216,7 @@ final class _LocalTransaction extends _Locker implements Transaction {
                         // be released safely. See recoveryCleanup.
                         undo.pushCommit();
                     } finally {
-                        commitLock.releaseShared();
+                        commitLock.unlock();
                     }
 
                     if (commitPos != 0) {
@@ -305,13 +305,13 @@ final class _LocalTransaction extends _Locker implements Transaction {
         long txnId = mTxnId;
 
         final CommitLock commitLock = mDatabase.commitLock();
-        commitLock.acquireShared();
+        commitLock.lock();
         try {
             if (txnId == 0) {
                 txnId = assignTransactionId(redo);
             }
         } catch (Throwable e) {
-            commitLock.releaseShared();
+            commitLock.unlock();
             throw e;
         }
 
@@ -339,7 +339,7 @@ final class _LocalTransaction extends _Locker implements Transaction {
 
                     cursor.store(_LocalTransaction.BOGUS, cursor.leafExclusive(), value);
                 } catch (Throwable e) {
-                    commitLock.releaseShared();
+                    commitLock.unlock();
                     throw e;
                 }
 
@@ -347,7 +347,7 @@ final class _LocalTransaction extends _Locker implements Transaction {
 
                 _UndoLog undo = mUndoLog;
                 if (undo == null) {
-                    commitLock.releaseShared();
+                    commitLock.unlock();
                     if (commitPos != 0) {
                         if (mDurabilityMode == DurabilityMode.SYNC) {
                             redo.txnCommitSync(this, commitPos);
@@ -361,7 +361,7 @@ final class _LocalTransaction extends _Locker implements Transaction {
                     try {
                         undo.pushCommit();
                     } finally {
-                        commitLock.releaseShared();
+                        commitLock.unlock();
                     }
 
                     if (commitPos != 0) {
@@ -412,7 +412,7 @@ final class _LocalTransaction extends _Locker implements Transaction {
                         mDurabilityMode = original;
                     }
                 } finally {
-                    commitLock.releaseShared();
+                    commitLock.unlock();
                 }
 
                 mHasState = hasState & ~(HAS_SCOPE | HAS_COMMIT);
@@ -658,11 +658,11 @@ final class _LocalTransaction extends _Locker implements Transaction {
 
             if (txnId == 0) {
                 final CommitLock commitLock = mDatabase.commitLock();
-                commitLock.acquireShared();
+                commitLock.lock();
                 try {
                     txnId = assignTransactionId(redo);
                 } finally {
-                    commitLock.releaseShared();
+                    commitLock.unlock();
                 }
             }
 
@@ -697,11 +697,11 @@ final class _LocalTransaction extends _Locker implements Transaction {
         check();
 
         final CommitLock commitLock = mDatabase.commitLock();
-        commitLock.acquireShared();
+        commitLock.lock();
         try {
             undoLog().pushCustom(message);
         } finally {
-            commitLock.releaseShared();
+            commitLock.unlock();
         }
     }
 
@@ -801,7 +801,7 @@ final class _LocalTransaction extends _Locker implements Transaction {
     /**
      * Caller must hold commit lock if transaction id has not been assigned yet.
      */
-    final long txnId() throws IOException {
+    final long txnId() {
         long txnId = mTxnId;
         if (txnId == 0) {
             txnId = mDatabase.nextTransactionId();
@@ -885,10 +885,9 @@ final class _LocalTransaction extends _Locker implements Transaction {
         if (undo == null) {
             undo = new _UndoLog(mDatabase, txnId());
 
-            // TODO: Optimize into one scopeEnter(n) call.
             ParentScope parentScope = mParentScope;
             while (parentScope != null) {
-                undo.scopeEnter();
+                undo.doScopeEnter();
                 parentScope = parentScope.mParentScope;
             }
 
@@ -913,7 +912,7 @@ final class _LocalTransaction extends _Locker implements Transaction {
 
         if (mBorked == null) {
             if (mDatabase.mClosed) {
-                initCause(borked, mDatabase.mClosedCause);
+                Utils.initCause(borked, mDatabase.mClosedCause);
                 mBorked = borked;
             } else if (rollback) {
                 // Attempt to rollback the mess and release the locks.
@@ -943,8 +942,8 @@ final class _LocalTransaction extends _Locker implements Transaction {
                     // even if the application later calls reset.
                     discardAllLocks();
 
-                    initCause(borked, mDatabase.mClosedCause);
-                    initCause(undoFailed, borked);
+                    Utils.initCause(borked, mDatabase.mClosedCause);
+                    Utils.initCause(undoFailed, borked);
                     borked = undoFailed;
                 }
 
@@ -958,14 +957,5 @@ final class _LocalTransaction extends _Locker implements Transaction {
         }
 
         return Utils.rethrow(borked);
-    }
-
-    private static void initCause(Throwable e, Throwable cause) {
-        if (e != null && cause != null) {
-            try {
-                e.initCause(cause);
-            } catch (Throwable e2) {
-            }
-        }
     }
 }

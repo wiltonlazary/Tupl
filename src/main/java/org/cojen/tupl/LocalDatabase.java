@@ -191,6 +191,8 @@ final class LocalDatabase extends AbstractDatabase {
     private final Node[] mNodeMapTable;
     private final Latch[] mNodeMapLatches;
 
+    final int mMaxKeySize;
+    final int mMaxEntrySize;
     final int mMaxFragmentedEntrySize;
 
     // Fragmented values which are transactionally deleted go here.
@@ -326,7 +328,7 @@ final class LocalDatabase extends AbstractDatabase {
 
         mDurabilityMode = config.mDurabilityMode;
         mDefaultLockTimeoutNanos = config.mLockTimeoutNanos;
-        mLockManager = new LockManager(config.mLockUpgradeRule, mDefaultLockTimeoutNanos);
+        mLockManager = new LockManager(this, config.mLockUpgradeRule, mDefaultLockTimeoutNanos);
 
         // Initialize NodeMap, the primary cache of Nodes.
         {
@@ -606,6 +608,13 @@ final class LocalDatabase extends AbstractDatabase {
                 }
             }
 
+            // Key size is limited to ensure that internal nodes can hold at least two keys.
+            // Absolute maximum is dictated by key encoding, as described in Node class.
+            mMaxKeySize = Math.min(16383, (pageSize >> 1) - 22);
+
+            // Limit maximum non-fragmented entry size to 0.75 of usable node size.
+            mMaxEntrySize = ((pageSize - Node.TN_HEADER_SIZE) * 3) >> 2;
+
             // Limit maximum fragmented entry size to guarantee that 2 entries fit. Each also
             // requires 2 bytes for pointer and up to 3 bytes for value length field.
             mMaxFragmentedEntrySize = (pageSize - Node.TN_HEADER_SIZE - (2 + 3 + 2 + 3)) >> 1;
@@ -640,7 +649,7 @@ final class LocalDatabase extends AbstractDatabase {
                     // Although handler shouldn't access the database yet, be safe and call
                     // this method at the point that the database is mostly functional. All
                     // other custom methods will be called soon as well.
-                    mCustomTxnHandler.setCheckpointLock(this, mCommitLock.readLock());
+                    mCustomTxnHandler.setCheckpointLock(this, mCommitLock);
                 }
 
                 ReplicationManager rm = config.mReplManager;
@@ -876,12 +885,12 @@ final class LocalDatabase extends AbstractDatabase {
 
     @Override
     public Index findIndex(byte[] name) throws IOException {
-        return openIndex(name.clone(), false);
+        return openTree(name.clone(), false);
     }
 
     @Override
     public Index openIndex(byte[] name) throws IOException {
-        return openIndex(name.clone(), true);
+        return openTree(name.clone(), true);
     }
 
     @Override
@@ -896,7 +905,7 @@ final class LocalDatabase extends AbstractDatabase {
 
         Index index;
 
-        mCommitLock.acquireShared();
+        mCommitLock.lock();
         try {
             if ((index = lookupIndexById(id)) != null) {
                 return index;
@@ -913,12 +922,12 @@ final class LocalDatabase extends AbstractDatabase {
                 return null;
             }
 
-            index = openIndex(txn, name, false);
+            index = openTree(txn, name, false);
         } catch (Throwable e) {
             DatabaseException.rethrowIfRecoverable(e);
             throw closeOnFailure(this, e);
         } finally {
-            mCommitLock.releaseShared();
+            mCommitLock.unlock();
         }
 
         if (index == null) {
@@ -999,6 +1008,11 @@ final class LocalDatabase extends AbstractDatabase {
             }
 
             oldName = tree.mName;
+
+            if (oldName == null) {
+                throw new IllegalStateException("Cannot rename a temporary index");
+            }
+
             if (Arrays.equals(oldName, newName)) {
                 return;
             }
@@ -1054,12 +1068,12 @@ final class LocalDatabase extends AbstractDatabase {
             if (redoTxnId == 0 && (redo = txnRedoWriter()) != null) {
                 long commitPos;
 
-                mCommitLock.acquireShared();
+                mCommitLock.lock();
                 try {
                     commitPos = redo.renameIndex
                         (txn.txnId(), tree.mId, newName, mDurabilityMode.alwaysRedo());
                 } finally {
-                    mCommitLock.releaseShared();
+                    mCommitLock.unlock();
                 }
 
                 if (commitPos != 0) {
@@ -1128,9 +1142,10 @@ final class LocalDatabase extends AbstractDatabase {
      * Called by Tree.drop with root node latch held exclusively.
      */
     Runnable deleteTree(Tree tree) throws IOException {
-        Node root = moveToTrash(tree, true);
-
-        if (root == null) {
+        Node root;
+        if ((!(tree instanceof TempTree) && !moveToTrash(tree.mId, tree.mIdBytes))
+            || (root = tree.close(true, true)) == null)
+        {
             // Handle concurrent delete attempt.
             throw new ClosedIndexException();
         }
@@ -1217,7 +1232,7 @@ final class LocalDatabase extends AbstractDatabase {
 
         long rootId = rootIdBytes.length == 0 ? 0 : decodeLongLE(rootIdBytes, 0);
 
-        if ((name[0] & ~0x80) == 0) {
+        if ((name[0] & 0x7f) == 0) {
             name = null;
         } else {
             // Trim off the tag byte.
@@ -1299,6 +1314,11 @@ final class LocalDatabase extends AbstractDatabase {
                 }
             }
         }
+    }
+
+    @Override
+    public Index newTemporaryIndex() throws IOException {
+        return openTree(null, true);
     }
 
     @Override
@@ -1596,9 +1616,9 @@ final class LocalDatabase extends AbstractDatabase {
             }
             byte[] name = new byte[len];
             din.readFully(name);
-            Index ix = openIndex(name, false);
-            if (ix instanceof Tree) {
-                ((Tree) ix).applyCachePrimer(din);
+            Tree tree = openTree(name, false);
+            if (tree != null) {
+                tree.applyCachePrimer(din);
             } else {
                 Tree.skipCachePrimer(din);
             }
@@ -1611,7 +1631,7 @@ final class LocalDatabase extends AbstractDatabase {
 
         stats.pageSize = mPageSize;
 
-        mCommitLock.acquireShared();
+        mCommitLock.lock();
         try {
             long cursorCount = 0;
             int openTreesCount = 0;
@@ -1636,15 +1656,11 @@ final class LocalDatabase extends AbstractDatabase {
                 stats.txnsCreated = mTxnId;
             }
         } finally {
-            mCommitLock.releaseShared();
+            mCommitLock.unlock();
         }
 
         for (NodeUsageList usageList : mUsageLists) {
             stats.cachedPages += usageList.size();
-        }
-
-        if (!mPageDb.isDurable() && stats.totalPages == 0) {
-            stats.totalPages = stats.cachedPages;
         }
 
         return stats;
@@ -1744,37 +1760,31 @@ final class LocalDatabase extends AbstractDatabase {
             mCheckpointLock.unlock();
         }
 
-        if (!mPageDb.compactionScanFreeList()) {
-            mCheckpointLock.lock();
-            try {
-                mPageDb.compactionEnd();
-            } finally {
-                mCheckpointLock.unlock();
+        boolean completed = mPageDb.compactionScanFreeList();
+
+        if (completed) {
+            // Issue a checkpoint to ensure all dirty nodes are flushed out. This ensures that
+            // nodes can be moved out of the compaction zone by simply marking them dirty. If
+            // already dirty, they'll not be in the compaction zone unless compaction aborted.
+            checkpoint();
+
+            if (observer == null) {
+                observer = new CompactionObserver();
             }
-            return false;
-        }
 
-        // Issue a checkpoint to ensure all dirty nodes are flushed out. This ensures that
-        // nodes can be moved out of the compaction zone by simply marking them dirty. If
-        // already dirty, they'll not be in the compaction zone unless compaction aborted.
-        checkpoint();
+            final long highestNodeId = targetPageCount - 1;
+            final CompactionObserver fobserver = observer;
 
-        if (observer == null) {
-            observer = new CompactionObserver();
-        }
+            completed = scanAllIndexes((tree) -> {
+                return tree.compactTree(tree.observableView(), highestNodeId, fobserver);
+            });
 
-        final long highestNodeId = targetPageCount - 1;
-        final CompactionObserver fobserver = observer;
+            checkpoint(true, 0, 0);
 
-        boolean completed = scanAllIndexes((tree) -> {
-            return tree.compactTree(tree.observableView(), highestNodeId, fobserver);
-        });
-
-        checkpoint(true, 0, 0);
-
-        if (completed && mPageDb.compactionScanFreeList()) {
-            if (!mPageDb.compactionVerify() && mPageDb.compactionScanFreeList()) {
-                checkpoint(true, 0, 0);
+            if (completed && mPageDb.compactionScanFreeList()) {
+                if (!mPageDb.compactionVerify() && mPageDb.compactionScanFreeList()) {
+                    checkpoint(true, 0, 0);
+                }
             }
         }
 
@@ -1782,8 +1792,10 @@ final class LocalDatabase extends AbstractDatabase {
         try {
             completed &= mPageDb.compactionEnd();
 
-            // If completed, then this allows file to shrink. Otherwise, it allows reclaimed
-            // reserved pages to be immediately usable.
+            // Reclaim reserved pages, but only after a checkpoint has been performed.
+            checkpoint(true, 0, 0);
+            mPageDb.compactionReclaim();
+            // Checkpoint again in order for reclaimed pages to be immediately available.
             checkpoint(true, 0, 0);
 
             if (completed) {
@@ -1853,23 +1865,9 @@ final class LocalDatabase extends AbstractDatabase {
             for (all.first(); all.key() != null; all.next()) {
                 long id = decodeLongBE(all.value(), 0);
 
-                Tree index = lookupIndexById(id);
-                if (index != null) {
-                    if (!visitor.apply(index)) {
-                        return false;
-                    }
-                } else {
-                    // Open the index.
-                    index = (Tree) indexById(id);
-                    boolean keepGoing = visitor.apply(index);
-                    try {
-                        index.close();
-                    } catch (IllegalStateException e) {
-                        // Leave open if in use now.
-                    }
-                    if (!keepGoing) {
-                        return false;
-                    }
+                Index index = indexById(id);
+                if (index instanceof Tree && !visitor.apply((Tree) index)) {
+                    return false;
                 }
             }
         } finally {
@@ -2089,7 +2087,9 @@ final class LocalDatabase extends AbstractDatabase {
             TreeRef ref = mOpenTreesById.getValue(tree.mId);
             if (ref != null && ref.get() == tree) {
                 ref.clear();
-                mOpenTrees.remove(tree.mName);
+                if (tree.mName != null) {
+                    mOpenTrees.remove(tree.mName);
+                }
                 mOpenTreesById.remove(tree.mId);
             }
         } finally {
@@ -2098,18 +2098,18 @@ final class LocalDatabase extends AbstractDatabase {
     }
 
     /**
-     * @return root node of deleted tree; null if closed or already in the trash
+     * @return false if already in the trash
      */
-    private Node moveToTrash(final Tree tree, final boolean rootLatched) throws IOException {
-        final byte[] idKey = newKey(KEY_TYPE_INDEX_ID, tree.mIdBytes);
-        final byte[] trashIdKey = newKey(KEY_TYPE_TRASH_ID, tree.mIdBytes);
+    private boolean moveToTrash(long treeId, byte[] treeIdBytes) throws IOException {
+        final byte[] idKey = newKey(KEY_TYPE_INDEX_ID, treeIdBytes);
+        final byte[] trashIdKey = newKey(KEY_TYPE_TRASH_ID, treeIdBytes);
 
         final LocalTransaction txn = newAlwaysRedoTransaction();
 
         try {
             if (mRegistryKeyMap.load(txn, trashIdKey) != null) {
                 // Already in the trash.
-                return null;
+                return false;
             }
 
             byte[] treeName = mRegistryKeyMap.exchange(txn, idKey, null);
@@ -2119,7 +2119,7 @@ final class LocalDatabase extends AbstractDatabase {
                 mRegistryKeyMap.store(txn, trashIdKey, new byte[1]);
             } else {
                 byte[] nameKey = newKey(KEY_TYPE_INDEX_NAME, treeName);
-                mRegistryKeyMap.remove(txn, nameKey, tree.mIdBytes);
+                mRegistryKeyMap.remove(txn, nameKey, treeIdBytes);
                 // Tag the trash entry to indicate that name is non-null. Note that nameKey
                 // instance is modified directly.
                 nameKey[0] = 1;
@@ -2135,12 +2135,12 @@ final class LocalDatabase extends AbstractDatabase {
                 // for the deletion task to be started immediately. The redo log still contains
                 // a commit operation, which is redundant and harmless.
 
-                mCommitLock.acquireShared();
+                mCommitLock.lock();
                 try {
                     commitPos = redo.deleteIndex
-                        (txn.txnId(), tree.mId, mDurabilityMode.alwaysRedo());
+                        (txn.txnId(), treeId, mDurabilityMode.alwaysRedo());
                 } finally {
-                    mCommitLock.releaseShared();
+                    mCommitLock.unlock();
                 }
 
                 if (commitPos != 0) {
@@ -2159,7 +2159,7 @@ final class LocalDatabase extends AbstractDatabase {
             txn.reset();
         }
 
-        return tree.close(true, rootLatched);
+        return true;
     }
 
     /**
@@ -2168,7 +2168,7 @@ final class LocalDatabase extends AbstractDatabase {
     void removeFromTrash(Tree tree, Node root) throws IOException {
         byte[] trashIdKey = newKey(KEY_TYPE_TRASH_ID, tree.mIdBytes);
 
-        mCommitLock.acquireShared();
+        mCommitLock.lock();
         try {
             if (root != null) {
                 root.acquireExclusive();
@@ -2179,7 +2179,7 @@ final class LocalDatabase extends AbstractDatabase {
         } catch (Throwable e) {
             throw closeOnFailure(this, e);
         } finally {
-            mCommitLock.releaseShared();
+            mCommitLock.unlock();
         }
     }
 
@@ -2286,7 +2286,7 @@ final class LocalDatabase extends AbstractDatabase {
     private Tree openInternalTree(long treeId, boolean create, DatabaseConfig config)
         throws IOException
     {
-        mCommitLock.acquireShared();
+        mCommitLock.lock();
         try {
             byte[] treeIdBytes = new byte[8];
             encodeLongBE(treeIdBytes, 0, treeId);
@@ -2310,172 +2310,206 @@ final class LocalDatabase extends AbstractDatabase {
 
             return newTreeInstance(treeId, treeIdBytes, null, root);
         } finally {
-            mCommitLock.releaseShared();
+            mCommitLock.unlock();
         }
     }
 
-    private Index openIndex(byte[] name, boolean create) throws IOException {
-        return openIndex(null, name, create);
+    private Tree openTree(byte[] name, boolean create) throws IOException {
+        return openTree(null, name, create);
     }
 
-    private Index openIndex(Transaction lookupTxn, byte[] name, boolean create) throws IOException {
+    private Tree openTree(Transaction findTxn, byte[] name, boolean create) throws IOException {
         Tree tree = quickFindIndex(name);
-        if (tree != null) {
-            return tree;
+        if (tree == null) {
+            mCommitLock.lock();
+            try {
+                tree = doOpenTree(findTxn, name, create);
+            } finally {
+                mCommitLock.unlock();
+            }
+        }
+        return tree;
+    }
+
+    /**
+     * Caller must hold commit lock.
+     */
+    private Tree doOpenTree(Transaction findTxn, byte[] name, boolean create) throws IOException {
+        checkClosed();
+
+        // Cleaup before opening more trees.
+        cleanupUnreferencedTrees();
+
+        byte[] nameKey = null, treeIdBytes = null;
+        if (name != null) {
+            nameKey = newKey(KEY_TYPE_INDEX_NAME, name);
+            treeIdBytes = mRegistryKeyMap.load(findTxn, nameKey);
         }
 
-        mCommitLock.acquireShared();
-        try {
-            checkClosed();
+        long treeId;
+        // Is non-null if tree was created.
+        byte[] idKey;
 
-            // Cleaup before opening more indexes.
-            cleanupUnreferencedTrees();
+        if (treeIdBytes != null) {
+            // Tree already exists.
+            idKey = null;
+            treeId = decodeLongBE(treeIdBytes, 0);
+        } else if (!create) {
+            return null;
+        } else create: {
+            // Transactional find supported only for opens that do not create.
+            if (findTxn != null) {
+                throw new AssertionError();
+            }
 
-            byte[] nameKey = newKey(KEY_TYPE_INDEX_NAME, name);
-            byte[] treeIdBytes = mRegistryKeyMap.load(lookupTxn, nameKey);
-            long treeId;
-            // Is non-null if index was created.
-            byte[] idKey;
+            Transaction createTxn = null;
 
-            if (treeIdBytes != null) {
-                idKey = null;
-                treeId = decodeLongBE(treeIdBytes, 0);
-            } else if (!create) {
-                return null;
-            } else {
-                // transactional lookup supported only for opens that do not create.
-                if (lookupTxn != null) {
-                    throw new AssertionError();
-                }
-
-                Transaction createTxn = null;
-
-                mOpenTreesLatch.acquireExclusive();
-                try {
+            mOpenTreesLatch.acquireExclusive();
+            try {
+                if (nameKey != null) {
                     treeIdBytes = mRegistryKeyMap.load(null, nameKey);
                     if (treeIdBytes != null) {
+                        // Another thread created it.
                         idKey = null;
                         treeId = decodeLongBE(treeIdBytes, 0);
-                    } else {
-                        treeIdBytes = new byte[8];
-
-                        // Non-transactional operations are critical, in that
-                        // any failure is treated as non-recoverable.
-                        boolean critical = true;
-                        try {
-                            do {
-                                critical = false;
-                                treeId = nextTreeId();
-                                encodeLongBE(treeIdBytes, 0, treeId);
-                                critical = true;
-                            } while (!mRegistry.insert
-                                     (Transaction.BOGUS, treeIdBytes, EMPTY_BYTES));
-
-                            critical = false;
-
-                            try {
-                                idKey = newKey(KEY_TYPE_INDEX_ID, treeIdBytes);
-
-                                if (mRedoWriter instanceof ReplRedoController) {
-                                    // Confirmation is required when replicated.
-                                    createTxn = newTransaction(DurabilityMode.SYNC);
-                                } else {
-                                    createTxn = newAlwaysRedoTransaction();
-                                }
-
-                                if (!mRegistryKeyMap.insert(createTxn, idKey, name)) {
-                                    throw new DatabaseException("Unable to insert index id");
-                                }
-                                if (!mRegistryKeyMap.insert(createTxn, nameKey, treeIdBytes)) {
-                                    throw new DatabaseException("Unable to insert index name");
-                                }
-                            } catch (Throwable e) {
-                                critical = true;
-                                try {
-                                    if (createTxn != null) {
-                                        createTxn.reset();
-                                    }
-                                    mRegistry.delete(Transaction.BOGUS, treeIdBytes);
-                                    critical = false;
-                                } catch (Throwable e2) {
-                                    e.addSuppressed(e2);
-                                }
-                                throw e;
-                            }
-                        } catch (Throwable e) {
-                            if (!critical) {
-                                DatabaseException.rethrowIfRecoverable(e);
-                            }
-                            throw closeOnFailure(this, e);
-                        }
+                        break create;
                     }
-                } finally {
-                    // Release to allow opening other indexes while blocked on commit.
-                    mOpenTreesLatch.releaseExclusive();
                 }
 
-                if (createTxn != null) {
+                treeIdBytes = new byte[8];
+
+                // Non-transactional operations are critical, in that any failure is treated as
+                // non-recoverable.
+                boolean critical = true;
+                try {
+                    do {
+                        critical = false;
+                        treeId = nextTreeId(name == null);
+                        encodeLongBE(treeIdBytes, 0, treeId);
+                        critical = true;
+                    } while (!mRegistry.insert(Transaction.BOGUS, treeIdBytes, EMPTY_BYTES));
+
+                    critical = false;
+
                     try {
-                        createTxn.commit();
+                        idKey = newKey(KEY_TYPE_INDEX_ID, treeIdBytes);
+
+                        if (name == null) {
+                            // Register temporary index as trash, unreplicated.
+                            createTxn = newNoRedoTransaction();
+                            byte[] trashIdKey = newKey(KEY_TYPE_TRASH_ID, treeIdBytes);
+                            if (!mRegistryKeyMap.insert(createTxn, trashIdKey, new byte[1])) {
+                                throw new DatabaseException("Unable to register temporary index");
+                            }
+                        } else {
+                            if (mRedoWriter instanceof ReplRedoController) {
+                                // Confirmation is required when replicated.
+                                createTxn = newTransaction(DurabilityMode.SYNC);
+                            } else {
+                                createTxn = newAlwaysRedoTransaction();
+                            }
+
+                            if (!mRegistryKeyMap.insert(createTxn, idKey, name)) {
+                                throw new DatabaseException("Unable to insert index id");
+                            }
+                            if (!mRegistryKeyMap.insert(createTxn, nameKey, treeIdBytes)) {
+                                throw new DatabaseException("Unable to insert index name");
+                            }
+                        }
                     } catch (Throwable e) {
+                        critical = true;
                         try {
-                            createTxn.reset();
+                            if (createTxn != null) {
+                                createTxn.reset();
+                            }
                             mRegistry.delete(Transaction.BOGUS, treeIdBytes);
+                            critical = false;
                         } catch (Throwable e2) {
                             e.addSuppressed(e2);
-                            throw closeOnFailure(this, e);
                         }
-                        DatabaseException.rethrowIfRecoverable(e);
-                        throw closeOnFailure(this, e);
+                        throw e;
                     }
+                } catch (Throwable e) {
+                    if (!critical) {
+                        DatabaseException.rethrowIfRecoverable(e);
+                    }
+                    throw closeOnFailure(this, e);
                 }
+            } finally {
+                // Release to allow opening other indexes while blocked on commit.
+                mOpenTreesLatch.releaseExclusive();
             }
 
-            // Use a transaction to ensure that only one thread loads the
-            // requested index. Nothing is written into it.
-            Transaction txn = newNoRedoTransaction();
-            try {
-                // Pass the transaction to acquire the lock.
-                byte[] rootIdBytes = mRegistry.load(txn, treeIdBytes);
-
-                tree = quickFindIndex(name);
-                if (tree != null) {
-                    // Another thread got the lock first and loaded the index.
-                    return tree;
-                }
-
-                long rootId = (rootIdBytes == null || rootIdBytes.length == 0) ? 0
-                    : decodeLongLE(rootIdBytes, 0);
-                tree = newTreeInstance(treeId, treeIdBytes, name, loadTreeRoot(rootId));
-
-                TreeRef treeRef = new TreeRef(tree, mOpenTreesRefQueue);
-
-                mOpenTreesLatch.acquireExclusive();
+            if (createTxn != null) {
                 try {
-                    mOpenTrees.put(name, treeRef);
-                    mOpenTreesById.insert(treeId).value = treeRef;
-                } finally {
-                    mOpenTreesLatch.releaseExclusive();
-                }
-
-                return tree;
-            } catch (Throwable e) {
-                if (idKey != null) {
-                    // Rollback create of new index.
+                    createTxn.commit();
+                } catch (Throwable e) {
                     try {
-                        mRegistryKeyMap.delete(null, idKey);
-                        mRegistryKeyMap.delete(null, nameKey);
+                        createTxn.reset();
                         mRegistry.delete(Transaction.BOGUS, treeIdBytes);
                     } catch (Throwable e2) {
-                        // Ignore.
+                        e.addSuppressed(e2);
+                        throw closeOnFailure(this, e);
                     }
+                    DatabaseException.rethrowIfRecoverable(e);
+                    throw closeOnFailure(this, e);
                 }
-                throw e;
-            } finally {
-                txn.reset();
             }
+        }
+
+        // Use a transaction to ensure that only one thread loads the requested tree. Nothing
+        // is written into it.
+        Transaction txn = newNoRedoTransaction();
+        try {
+            // Pass the transaction to acquire the lock.
+            byte[] rootIdBytes = mRegistry.load(txn, treeIdBytes);
+
+            Tree tree = quickFindIndex(name);
+            if (tree != null) {
+                // Another thread got the lock first and loaded the tree.
+                return tree;
+            }
+
+            long rootId = (rootIdBytes == null || rootIdBytes.length == 0) ? 0
+                : decodeLongLE(rootIdBytes, 0);
+
+            Node root = loadTreeRoot(rootId);
+
+            if (name == null) {
+                tree = new TempTree(this, treeId, treeIdBytes, name, root);
+            } else {
+                tree = newTreeInstance(treeId, treeIdBytes, name, root);
+            }
+
+            TreeRef treeRef = new TreeRef(tree, mOpenTreesRefQueue);
+
+            mOpenTreesLatch.acquireExclusive();
+            try {
+                if (name != null) {
+                    mOpenTrees.put(name, treeRef);
+                }
+                mOpenTreesById.insert(treeId).value = treeRef;
+            } finally {
+                mOpenTreesLatch.releaseExclusive();
+            }
+
+            return tree;
+        } catch (Throwable e) {
+            if (idKey != null) {
+                // Rollback create of new tree.
+                try {
+                    mRegistryKeyMap.delete(null, idKey);
+                    if (nameKey != null) {
+                        mRegistryKeyMap.delete(null, nameKey);
+                    }
+                    mRegistry.delete(Transaction.BOGUS, treeIdBytes);
+                } catch (Throwable e2) {
+                    // Ignore.
+                }
+            }
+            throw e;
         } finally {
-            mCommitLock.releaseShared();
+            txn.reset();
         }
     }
 
@@ -2489,11 +2523,17 @@ final class LocalDatabase extends AbstractDatabase {
         }
     }
 
-    private long nextTreeId() throws IOException {
+    private long nextTreeId(boolean temporary) throws IOException {
         // By generating identifiers from a 64-bit sequence, it's effectively
         // impossible for them to get re-used after trees are deleted.
 
-        Transaction txn = newAlwaysRedoTransaction();
+        Transaction txn;
+        if (temporary) {
+            txn = newNoRedoTransaction();
+        } else {
+            txn = newAlwaysRedoTransaction();
+        }
+
         try {
             // Tree id mask, to make the identifiers less predictable and
             // non-compatible with other database instances.
@@ -2519,6 +2559,11 @@ final class LocalDatabase extends AbstractDatabase {
             }
             long nextTreeId = decodeLongLE(nextTreeIdBytes, 0);
 
+            if (temporary) {
+                // Apply negative sequence, avoiding collisions.
+                treeIdMask = ~treeIdMask;
+            }
+
             long treeId;
             do {
                 treeId = scramble((nextTreeId++) ^ treeIdMask);
@@ -2538,6 +2583,10 @@ final class LocalDatabase extends AbstractDatabase {
      * @return null if not found
      */
     private Tree quickFindIndex(byte[] name) throws IOException {
+        if (name == null) {
+            return null;
+        }
+
         TreeRef treeRef;
         mOpenTreesLatch.acquireShared();
         try {
@@ -2597,7 +2646,9 @@ final class LocalDatabase extends AbstractDatabase {
                 if (entry == null || entry.value != ref) {
                     return;
                 }
-                mOpenTrees.remove(ref.mName);
+                if (ref.mName != null) {
+                    mOpenTrees.remove(ref.mName);
+                }
                 mOpenTreesById.remove(ref.mId);
                 root.makeEvictableNow();
                 if (root.mId != 0) {
@@ -2979,12 +3030,12 @@ final class LocalDatabase extends AbstractDatabase {
 
             checkClosed();
 
-            mCommitLock.acquireShared();
+            mCommitLock.lock();
             try {
                 // Try to free up nodes from unreferenced trees.
                 cleanupUnreferencedTrees();
             } finally {
-                mCommitLock.releaseShared();
+                mCommitLock.unlock();
             }
         }
 
@@ -3267,10 +3318,14 @@ final class LocalDatabase extends AbstractDatabase {
             nodeMapRemove(node, Long.hashCode(id));
 
             try {
-                if (canRecycle) {
-                    deletePage(id, node.mCachedState);
-                } else if (id != 0) {
-                    mPageDb.deletePage(id);
+                if (id != 0) {
+                    if (canRecycle && node.mCachedState == mCommitState) {
+                        // Newly reserved page was never used, so recycle it.
+                        mPageDb.recyclePage(id);
+                    } else {
+                        // Old data must survive until after checkpoint.
+                        mPageDb.deletePage(id);
+                    }
                 }
             } catch (Throwable e) {
                 // Try to undo things.
@@ -3298,19 +3353,8 @@ final class LocalDatabase extends AbstractDatabase {
         node.unused();
     }
 
-    /**
-     * Caller must hold commit lock.
-     */
-    void deletePage(long id, int cachedState) throws IOException {
-        if (id != 0) {
-            if (cachedState == mCommitState) {
-                // Newly reserved page was never used, so recycle it.
-                mPageDb.recyclePage(id);
-            } else {
-                // Old data must survive until after checkpoint.
-                mPageDb.deletePage(id);
-            }
-        }
+    final byte[] fragmentKey(byte[] key) throws IOException {
+        return fragment(key, key.length, mMaxKeySize);
     }
 
     /**
@@ -4237,13 +4281,13 @@ final class LocalDatabase extends AbstractDatabase {
             if (masterUndoLog != null) {
                 // Delete the master undo log, which won't take effect until
                 // the next checkpoint.
-                mCommitLock.acquireShared();
+                mCommitLock.lock();
                 try {
                     if (!mClosed) {
                         masterUndoLog.doTruncate(mCommitLock, false);
                     }
                 } finally {
-                    mCommitLock.releaseShared();
+                    mCommitLock.unlock();
                 }
             }
 

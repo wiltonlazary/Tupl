@@ -1,6 +1,28 @@
 Changelog
 =========
 
+v1.3.3.2
+--------
+* Fix NullPointerException when too many nodes are unevictable. A CacheExhaustedException
+  should be thrown instead.
+
+v1.3.3.1 (2016-08-02)
+--------
+* Fix subtraction error when load encounters a split node, causing wrong value to be loaded.
+
+v1.3.3 (2016-07-30)
+------
+* Fixed transaction race condition which allowed shared locks to be prematurely released.
+* Fixed load race conditions which caused an incorrect value to be returned.
+* Fix for performing database compaction while old indexes are concurrently deleted. Some
+  pages would get lost, preventing compaction from ever working again.
+* Support temporary indexes.
+* Don't close in-use indexes during verification.
+* Redo decoder should be lenient if EOF is reached in the middle of an operation.
+* Rewrite CommitLock to stripe shared lock requests, improving concurrency.
+* Use Java 9 vectorized comparison method if available.
+* Add full stats support for non-durable databases.
+
 v1.3.2 (2016-06-04)
 ------
 * Fix storage leak when database capacity is reached during fragmented value allocation.

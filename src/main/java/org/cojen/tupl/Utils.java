@@ -200,15 +200,12 @@ class Utils extends org.cojen.tupl.io.Utils {
     }
 
     /**
-     * Returns a new key, midway between the given low and high keys. Returned key is never
-     * equal to the low key, but it might be equal to the high key. If high key is not actually
-     * higher than the given low key, an ArrayIndexOfBoundException might be thrown.
-     *
-     * <p>Method is used for internal node suffix compression. To disable, simply return a copy
-     * of the high key.
+     * @throws NullPointerException if key is null
      */
-    static byte[] midKey(byte[] low, byte[] high) {
-        return midKey(low, 0, low.length, high, 0, high.length);
+    static void keyCheck(byte[] key) {
+        if (key == null) {
+            throw new NullPointerException("Key is null");
+        }
     }
 
     /**
@@ -219,9 +216,19 @@ class Utils extends org.cojen.tupl.io.Utils {
      * <p>Method is used for internal node suffix compression. To disable, simply return a copy
      * of the high key.
      */
-    static byte[] midKey(byte[] low, int lowOff, int lowLen,
-                         byte[] high, int highOff, int highLen)
-    {
+    static byte[] midKey(byte[] low, byte[] high) {
+        return midKey(low, 0, low.length, high, 0);
+    }
+
+    /**
+     * Returns a new key, midway between the given low and high keys. Returned key is never
+     * equal to the low key, but it might be equal to the high key. If high key is not actually
+     * higher than the given low key, an ArrayIndexOfBoundException might be thrown.
+     *
+     * <p>Method is used for internal node suffix compression. To disable, simply return a copy
+     * of the high key.
+     */
+    static byte[] midKey(byte[] low, int lowOff, int lowLen, byte[] high, int highOff) {
         for (int i=0; i<lowLen; i++) {
             byte lo = low[lowOff + i];
             byte hi = high[highOff + i];
@@ -797,5 +804,28 @@ class Utils extends org.cojen.tupl.io.Utils {
                 }
             }
         }
+    }
+
+    static void initCause(Throwable e, Throwable cause) {
+        if (e != null && cause != null && !cycleCheck(e, cause) && !cycleCheck(cause, e)) {
+            try {
+                e.initCause(cause);
+            } catch (Throwable e2) {
+            }
+        }
+    }
+
+    private static boolean cycleCheck(Throwable e, Throwable cause) {
+        for (int i=0; i<100; i++) {
+            if (e == cause) {
+                return true;
+            }
+            e = e.getCause();
+            if (e == null) {
+                return false;
+            }
+        }
+        // Cause chain is quite long, and so it probably has a cycle.
+        return true;
     }
 }

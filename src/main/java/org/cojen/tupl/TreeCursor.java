@@ -185,9 +185,6 @@ class TreeCursor implements CauseCloseable, Cursor {
      * Non-transactionally moves the cursor to the first leaf node, which might be empty or
      * full of ghosts. Leaf frame remains latched when method returns normally. Key and value
      * are not loaded.
-     *
-     * @param node latched node; can have no keys
-     * @param frame frame to bind node to
      */
     final void firstAny() throws IOException {
         reset();
@@ -366,9 +363,7 @@ class TreeCursor implements CauseCloseable, Cursor {
     }
 
     private LockResult nextCmp(byte[] limitKey, int limitMode) throws IOException {
-        if (limitKey == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(limitKey);
         return nextCmp(limitKey, limitMode, leafSharedNotSplit());
     }
 
@@ -761,7 +756,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                                     parentNode.releaseShared();
                                 } else {
                                     CommitLock commitLock = mTree.mDatabase.commitLock();
-                                    if (commitLock.tryAcquireShared()) try {
+                                    if (commitLock.tryLock()) try {
                                         try {
                                             parentNode = notSplitDirty(parentFrame);
                                         } catch (Throwable e) {
@@ -777,7 +772,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                                             continue;
                                         }
                                     } finally {
-                                        commitLock.releaseShared();
+                                        commitLock.unlock();
                                     }
                                     parentNode.releaseExclusive();
                                 }
@@ -981,7 +976,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                                     parentNode.releaseShared();
                                 } else {
                                     CommitLock commitLock = mTree.mDatabase.commitLock();
-                                    if (commitLock.tryAcquireShared()) try {
+                                    if (commitLock.tryLock()) try {
                                         try {
                                             parentNode = notSplitDirty(parentFrame);
                                         } catch (Throwable e) {
@@ -995,7 +990,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                                         parentNode.downgrade();
                                         continue;
                                     } finally {
-                                        commitLock.releaseShared();
+                                        commitLock.unlock();
                                     }
                                     parentNode.releaseExclusive();
                                 }
@@ -1057,9 +1052,7 @@ class TreeCursor implements CauseCloseable, Cursor {
     }
 
     private LockResult previousCmp(byte[] limitKey, int limitMode) throws IOException {
-        if (limitKey == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(limitKey);
         return previousCmp(limitKey, limitMode, leafSharedNotSplit());
     }
 
@@ -1411,7 +1404,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                                     parentNode.releaseShared();
                                 } else {
                                     CommitLock commitLock = mTree.mDatabase.commitLock();
-                                    if (commitLock.tryAcquireShared()) try {
+                                    if (commitLock.tryLock()) try {
                                         try {
                                             parentNode = notSplitDirty(parentFrame);
                                         } catch (Throwable e) {
@@ -1427,7 +1420,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                                             continue;
                                         }
                                     } finally {
-                                        commitLock.releaseShared();
+                                        commitLock.unlock();
                                     }
                                     parentNode.releaseExclusive();
                                 }
@@ -1699,9 +1692,7 @@ class TreeCursor implements CauseCloseable, Cursor {
      * transaction.
      */
     private LocalTransaction prepareFind(byte[] key) {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         LocalTransaction txn = mTxn;
         int hash;
         selectHash: {
@@ -1786,9 +1777,7 @@ class TreeCursor implements CauseCloseable, Cursor {
 
     private void findNoLock(byte[] key) throws IOException {
         reset();
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         // Never lock the requested key.
         find(null, key, VARIANT_CHECK, latchRootNode(), new CursorFrame());
     }
@@ -2484,9 +2473,7 @@ class TreeCursor implements CauseCloseable, Cursor {
         throws IOException
     {
         byte[] key = mKey;
-        if (key == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(key);
 
         LockResult result;
         Locker locker;
@@ -2542,9 +2529,7 @@ class TreeCursor implements CauseCloseable, Cursor {
     @Override
     public void store(byte[] value) throws IOException {
         byte[] key = mKey;
-        if (key == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(key);
 
         try {
             final LocalTransaction txn = mTxn;
@@ -2569,9 +2554,7 @@ class TreeCursor implements CauseCloseable, Cursor {
     @Override
     public void commit(byte[] value) throws IOException {
         byte[] key = mKey;
-        if (key == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(key);
 
         try {
             final LocalTransaction txn = mTxn;
@@ -2845,15 +2828,15 @@ class TreeCursor implements CauseCloseable, Cursor {
 
             final CommitLock commitLock = mTree.mDatabase.commitLock();
 
-            if (!commitLock.tryAcquireShared()) {
+            if (!commitLock.tryLock()) {
                 leaf.mNode.releaseExclusive();
-                commitLock.acquireShared();
+                commitLock.lock();
                 leaf.acquireExclusive();
 
                 // Need to check if exists again.
                 if (leaf.mNodePos < 0) {
                     node = leaf.mNode;
-                    commitLock.releaseShared();
+                    commitLock.unlock();
                     break doDelete;
                 }
             }
@@ -2917,7 +2900,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                     node = null;
                 }
             } finally {
-                commitLock.releaseShared();
+                commitLock.unlock();
             }
         } else {
             final CommitLock commitLock = commitLock(leaf);
@@ -2983,7 +2966,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                     node = postInsert(leaf, node, key);
                 }
             } finally {
-                commitLock.releaseShared();
+                commitLock.unlock();
             }
         }
 
@@ -3057,9 +3040,7 @@ class TreeCursor implements CauseCloseable, Cursor {
      * NOT_LOADED as a side-effect.
      */
     final void storeFragmented(byte[] value) throws IOException {
-        if (mKey == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(mKey);
         if (value == null) {
             throw new IllegalArgumentException("Value is null");
         }
@@ -3101,7 +3082,7 @@ class TreeCursor implements CauseCloseable, Cursor {
         } catch (Throwable e) {
             throw handleException(e, false);
         } finally {
-            commitLock.releaseShared();
+            commitLock.unlock();
         }
     }
 
@@ -3135,11 +3116,19 @@ class TreeCursor implements CauseCloseable, Cursor {
         autoload(false);
         firstAny();
 
-        final CommitLock commitLock = mTree.mDatabase.commitLock();
+        final LocalDatabase db = mTree.mDatabase;
+        final CommitLock commitLock = db.commitLock();
 
         while (true) {
-            commitLock.acquireShared();
+            commitLock.lock();
             try {
+                // Close check is required because this method is called by the trashed tree
+                // deletion task. The tree isn't registered as an open tree, and so closing the
+                // database doesn't close the tree before deleting the node instances.
+                if (db.mClosed) {
+                    break;
+                }
+
                 mLeaf.acquireExclusive();
 
                 // Releases latch if an exception is thrown.
@@ -3162,7 +3151,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                     return;
                 }
             } finally {
-                commitLock.releaseShared();
+                commitLock.unlock();
             }
         }
     }
@@ -3312,9 +3301,9 @@ class TreeCursor implements CauseCloseable, Cursor {
      */
     final CommitLock commitLock(final CursorFrame leaf) {
         CommitLock commitLock = mTree.mDatabase.commitLock();
-        if (!commitLock.tryAcquireShared()) {
+        if (!commitLock.tryLock()) {
             leaf.mNode.releaseExclusive();
-            commitLock.acquireShared();
+            commitLock.lock();
             leaf.acquireExclusive();
         }
         return commitLock;
@@ -3593,7 +3582,7 @@ class TreeCursor implements CauseCloseable, Cursor {
         if (id > highestNodeId) {
             LocalDatabase db = mTree.mDatabase;
             CommitLock commitLock = db.commitLock();
-            commitLock.acquireShared();
+            commitLock.lock();
             try {
                 node = frame.acquireExclusive();
                 id = node.mId;
@@ -3605,7 +3594,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                 }
                 node.releaseExclusive();
             } finally {
-                commitLock.releaseShared();
+                commitLock.unlock();
             }
         }
 
@@ -3845,9 +3834,7 @@ class TreeCursor implements CauseCloseable, Cursor {
      */
     private CursorFrame leaf() {
         CursorFrame leaf = mLeaf;
-        if (leaf == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(leaf);
         return leaf;
     }
 

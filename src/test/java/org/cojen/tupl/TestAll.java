@@ -26,6 +26,7 @@ public class TestAll {
     public static void main(String[] args) throws Exception {
         Class[] classes = {
             AAA_PageAccessTransformerTest.class,
+            CommitLockTest.class,
             ConfigTest.class,
             CrudTest.class,
             CrudDirectTest.class,
@@ -98,6 +99,7 @@ public class TestAll {
             ContendedLockTest.class,
             DirectPageOpsTest.class,
             UnreplicatedTest.class,
+            TempIndexTest.class,
         };
 
         String[] names = new String[classes.length];
