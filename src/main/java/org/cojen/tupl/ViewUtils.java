@@ -18,6 +18,8 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * 
  *
@@ -176,6 +178,43 @@ class ViewUtils {
             target.commit(value);
         } finally {
             txn.exit();
+        }
+    }
+
+    static void findNoLock(Cursor c, byte[] key) throws IOException {
+        final boolean auto = c.autoload(false);
+        final Transaction txn = c.link(Transaction.BOGUS);
+        try {
+            c.find(key);
+        } finally {
+            c.link(txn);
+            c.autoload(auto);
+        }
+    }
+
+    @FunctionalInterface
+    static interface LockAction {
+        LockResult lock(Transaction txn, byte[] key)
+            throws LockFailureException, ViewConstraintException;
+    }
+
+    static LockResult tryLock(Transaction txn, byte[] key, long nanosTimeout, LockAction action)
+        throws DeadlockException, ViewConstraintException
+    {
+        final long originalTimeout = txn.lockTimeout(TimeUnit.NANOSECONDS);
+        try {
+            txn.lockTimeout(nanosTimeout, TimeUnit.NANOSECONDS);
+            return action.lock(txn, key);
+        } catch (DeadlockException e) {
+            throw e;
+        } catch (IllegalUpgradeException e) {
+            return LockResult.ILLEGAL;
+        } catch (LockInterruptedException e) {
+            return LockResult.INTERRUPTED;
+        } catch (LockFailureException e) {
+            return LockResult.TIMED_OUT_LOCK;
+        } finally {
+            txn.lockTimeout(originalTimeout, TimeUnit.NANOSECONDS);
         }
     }
 
