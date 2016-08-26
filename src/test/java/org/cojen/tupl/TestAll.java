@@ -26,6 +26,7 @@ public class TestAll {
     public static void main(String[] args) throws Exception {
         Class[] classes = {
             AAA_PageAccessTransformerTest.class,
+            CommitLockTest.class,
             ConfigTest.class,
             CrudTest.class,
             CrudDirectTest.class,
@@ -34,6 +35,7 @@ public class TestAll {
             CrudNonTransformTest.class,
             CrudBasicTransformTest.class,
             CrudBasicFilterTest.class,
+            CrudDefaultTest.class,
             CursorTest.class,
             CursorDirectTest.class,
             CursorDirectMappedTest.class,
@@ -41,6 +43,7 @@ public class TestAll {
             CursorNonTransformTest.class,
             CursorBasicTransformTest.class,
             CursorBasicFilterTest.class,
+            CursorDefaultTest.class,
             CountTest.class,
             LargeKeyTest.class,
             LargeKeyDirectTest.class,
@@ -98,6 +101,7 @@ public class TestAll {
             ContendedLockTest.class,
             DirectPageOpsTest.class,
             UnreplicatedTest.class,
+            TempIndexTest.class,
         };
 
         String[] names = new String[classes.length];

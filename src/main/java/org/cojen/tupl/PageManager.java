@@ -21,7 +21,6 @@ import java.io.IOException;
 import java.util.BitSet;
 
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
 
 import org.cojen.tupl.io.PageArray;
 
@@ -64,6 +63,7 @@ final class PageManager {
     private volatile boolean mCompacting;
     private long mCompactionTargetPageCount = Long.MAX_VALUE;
     private PageQueue mReserveList;
+    private long mReclaimUpperBound = Long.MIN_VALUE;
 
     static final int
         ALLOC_TRY_RESERVE = -1, // Create pages: no.  Compaction zone: yes
@@ -234,10 +234,12 @@ final class PageManager {
                             mCompacting = false;
                         }
                         // Attempt to raid the reserves.
-                        pageId = reserve.tryRemove(lock);
-                        if (pageId != 0) {
-                            // Lock has been released as a side-effect.
-                            return pageId;
+                        if (mReclaimUpperBound == Long.MIN_VALUE) {
+                            pageId = reserve.tryRemove(lock);
+                            if (pageId != 0) {
+                                // Lock has been released as a side-effect.
+                                return pageId;
+                            }
                         }
                     }
 
@@ -444,14 +446,12 @@ final class PageManager {
     private boolean compactionScanFreeList(CommitLock commitLock, PageQueue list)
         throws IOException
     {
-        ReadLock sharedCommitLock = commitLock.readLock();
-
         long target;
         mRemoveLock.lock();
         target = list.getRemoveScanTarget();
         mRemoveLock.unlock();
 
-        sharedCommitLock.lock();
+        commitLock.lock();
         try {
             while (mCompacting) {
                 mRemoveLock.lock();
@@ -468,12 +468,12 @@ final class PageManager {
                     mRecycleFreeList.append(pageId);
                 }
                 if (commitLock.hasQueuedThreads()) {
-                    sharedCommitLock.unlock();
-                    sharedCommitLock.lock();
+                    commitLock.unlock();
+                    commitLock.lock();
                 }
             }
         } finally {
-            sharedCommitLock.unlock();
+            commitLock.unlock();
         }
 
         return false;
@@ -522,26 +522,31 @@ final class PageManager {
         mCompacting = false;
         mCompactionTargetPageCount = Long.MAX_VALUE;
 
-        // Capture reserve list with full lock held to prevent allocPage from stealing from the
-        // reserves. They're now off limits.
-        PageQueue reserve = mReserveList;
-        mReserveList = null;
+        // Set the reclamation upper bound with full lock held to prevent allocPage from
+        // stealing from the reserves. They're now off limits.
+        mReclaimUpperBound = upperBound;
 
         fullUnlock();
         commitLock.releaseExclusive();
 
+        return ready;
+    }
+
+    public void compactionReclaim() throws IOException {
+        mRemoveLock.lock();
+        PageQueue reserve = mReserveList;
+        long upperBound = mReclaimUpperBound;
+        mReserveList = null;
+        mReclaimUpperBound = Long.MIN_VALUE;
+        mRemoveLock.unlock();
+
         if (reserve != null) {
             try {
-                // Need to unlock first because fullUnlock didn't see it.
-                reserve.appendLock().unlock();
-
                 reserve.reclaim(mRemoveLock, upperBound);
             } finally {
                 reserve.delete();
             }
         }
-
-        return ready;
     }
 
     /**

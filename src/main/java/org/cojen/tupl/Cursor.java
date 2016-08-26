@@ -307,7 +307,16 @@ public interface Cursor extends Scanner {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findGe(byte[] key) throws IOException;
+    public default LockResult findGe(byte[] key) throws IOException {
+        LockResult result = find(key);
+        if (value() == null) {
+            if (result == LockResult.ACQUIRED) {
+                link().unlock();
+            }
+            result = next();
+        }
+        return result;
+    }
 
     /**
      * Moves the Cursor to find the first available entry greater than the
@@ -322,7 +331,10 @@ public interface Cursor extends Scanner {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findGt(byte[] key) throws IOException;
+    public default LockResult findGt(byte[] key) throws IOException {
+        ViewUtils.findNoLock(this, key);
+        return next();
+    }
 
     /**
      * Moves the Cursor to find the first available entry less than or equal to
@@ -337,7 +349,16 @@ public interface Cursor extends Scanner {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findLe(byte[] key) throws IOException;
+    public default LockResult findLe(byte[] key) throws IOException {
+        LockResult result = find(key);
+        if (value() == null) {
+            if (result == LockResult.ACQUIRED) {
+                link().unlock();
+            }
+            result = previous();
+        }
+        return result;
+    }
 
     /**
      * Moves the Cursor to find the first available entry less than the given
@@ -352,7 +373,10 @@ public interface Cursor extends Scanner {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findLt(byte[] key) throws IOException;
+    public default LockResult findLt(byte[] key) throws IOException {
+        ViewUtils.findNoLock(this, key);
+        return previous();
+    }
 
     /**
      * Optimized version of the regular find method, which can perform fewer search steps if
@@ -368,7 +392,9 @@ public interface Cursor extends Scanner {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findNearby(byte[] key) throws IOException;
+    public default LockResult findNearby(byte[] key) throws IOException {
+        return find(key);
+    }
 
     /**
      * Moves the Cursor to a random entry, but not guaranteed to be chosen from
