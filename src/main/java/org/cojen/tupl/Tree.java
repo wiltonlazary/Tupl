@@ -51,20 +51,19 @@ class Tree implements View, Index {
     // Id is null for registry.
     final byte[] mIdBytes;
 
-    // Name is null for all internal trees.
-    volatile byte[] mName;
-
     // Although tree roots can be created and deleted, the object which refers
     // to the root remains the same. Internal state is transferred to/from this
     // object when the tree root changes.
     final Node mRoot;
 
-    Tree(LocalDatabase db, long id, byte[] idBytes, byte[] name, Node root) {
+    // Name is null for all internal trees.
+    volatile byte[] mName;
+
+    Tree(LocalDatabase db, long id, byte[] idBytes, Node root) {
         mDatabase = db;
         mLockManager = db.mLockManager;
         mId = id;
         mIdBytes = idBytes;
-        mName = name;
         mRoot = root;
     }
 
@@ -935,80 +934,6 @@ class Tree implements View, Index {
     final boolean allowStoredCounts() {
         // TODO: make configurable
         return true;
-    }
-
-    /**
-     * Non-transactionally insert an entry as the highest overall. Intended for filling up a
-     * new tree with ordered entries.
-     *
-     * @param key new highest key; no existing key can be greater than or equal to it
-     * @param frame frame bound to the tree leaf node
-     */
-    final void append(byte[] key, byte[] value, CursorFrame frame) throws IOException {
-        try {
-            final CommitLock commitLock = mDatabase.commitLock();
-            commitLock.lock();
-            Node node = latchDirty(frame);
-            try {
-                // TODO: inline and specialize
-                node.insertLeafEntry(frame, this, frame.mNodePos, key, value);
-                frame.mNodePos += 2;
-
-                while (node.mSplit != null) {
-                    if (node == mRoot) {
-                        node.finishSplitRoot();
-                        break;
-                    }
-                    Node childNode = node;
-                    frame = frame.mParentFrame;
-                    node = frame.mNode;
-                    // Latch coupling upwards is fine because nothing should be searching a
-                    // tree which is filling up.
-                    node.acquireExclusive();
-                    // TODO: inline and specialize
-                    node.insertSplitChildRef(frame, this, frame.mNodePos, childNode);
-                }
-            } finally {
-                node.releaseExclusive();
-                commitLock.unlock();
-            }
-        } catch (Throwable e) {
-            throw closeOnFailure(mDatabase, e);
-        }
-    }
-
-    /**
-     * Returns the frame node latched exclusively and marked dirty.
-     */
-    private Node latchDirty(CursorFrame frame) throws IOException {
-        final LocalDatabase db = mDatabase;
-        Node node = frame.mNode;
-        node.acquireExclusive();
-
-        if (db.shouldMarkDirty(node)) {
-            CursorFrame parentFrame = frame.mParentFrame;
-            try {
-                if (parentFrame == null) {
-                    db.doMarkDirty(this, node);
-                } else {
-                    // Latch coupling upwards is fine because nothing should be searching a tree
-                    // which is filling up.
-                    Node parentNode = latchDirty(parentFrame);
-                    try {
-                        if (db.markDirty(this, node)) {
-                            parentNode.updateChildRefId(parentFrame.mNodePos, node.mId);
-                        }
-                    } finally {
-                        parentNode.releaseExclusive();
-                    }
-                }
-            } catch (Throwable e) {
-                node.releaseExclusive();
-                throw e;
-            }
-        }
-
-        return node;
     }
 
     /**

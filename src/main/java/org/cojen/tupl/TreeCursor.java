@@ -2452,6 +2452,35 @@ class TreeCursor implements CauseCloseable, Cursor {
     }
 
     @Override
+    public final LockResult lock() throws IOException {
+        byte[] key = mKey;
+        ViewUtils.positionCheck(key);
+
+        LocalTransaction txn = mTxn;
+
+        if (txn == null) {
+            // Although it seems unnecessary, lock and then unlock is the correct behavior. At
+            // the very least, it ensures proper happens-before ordering.
+            mTree.mLockManager.lockUnlockSharedLocal(mTree.mId, key, keyHash());
+            return LockResult.UNOWNED;
+        }
+
+        LockMode mode = txn.lockMode();
+        if (mode.noReadLock) {
+            return LockResult.UNOWNED;
+        }
+
+        int keyHash = keyHash();
+
+        if (mode == LockMode.READ_COMMITTED) {
+            // See comment above.
+            return txn.lockUnlockShared(mTree.mId, key, keyHash, txn.mLockTimeoutNanos);
+        }
+
+        return txn.lock(mode.repeatable, mTree.mId, key, keyHash, txn.mLockTimeoutNanos);
+    }
+
+    @Override
     public final LockResult load() throws IOException {
         // This will always acquire a lock if required to. A try-lock pattern
         // can skip the lock acquisition in certain cases, but the optimization
@@ -2890,35 +2919,13 @@ class TreeCursor implements CauseCloseable, Cursor {
                     }
 
                     node.deleteLeafEntry(pos);
+
+                    // Fix this and all bound cursors.
+                    node.postDelete(pos, key);
                 } catch (Throwable e) {
                     node.releaseExclusive();
                     throw e;
                 }
-
-                int newPos = ~pos;
-                leaf.mNodePos = newPos;
-                leaf.mNotFoundKey = key;
-
-                // Fix all cursors bound to the node.
-                CursorFrame frame = node.mLastCursorFrame;
-                do {
-                    if (frame == leaf) {
-                        // Don't need to fix self.
-                        continue;
-                    }
-
-                    int framePos = frame.mNodePos;
-
-                    if (framePos == pos) {
-                        frame.mNodePos = newPos;
-                        frame.mNotFoundKey = key;
-                    } else if (framePos > pos) {
-                        frame.mNodePos = framePos - 2;
-                    } else if (framePos < newPos) {
-                        // Position is a complement, so add instead of subtract.
-                        frame.mNodePos = framePos + 2;
-                    }
-                } while ((frame = frame.mPrevCousin) != null);
 
                 if (node.shouldLeafMerge()) {
                     mergeLeaf(leaf, node);
@@ -3171,7 +3178,7 @@ class TreeCursor implements CauseCloseable, Cursor {
 
                 if (node.hasKeys()) {
                     node.releaseExclusive();
-                } else if (!deleteNode(mLeaf, node)) {
+                } else if (!deleteLowestNode(mLeaf, node)) {
                     mLeaf = null;
                     reset();
                     return;
@@ -3183,14 +3190,14 @@ class TreeCursor implements CauseCloseable, Cursor {
     }
 
     /**
-     * Deletes the latched node and assigns the next node to the frame. All latches are
+     * Deletes the lowest latched node and assigns the next node to the frame. All latches are
      * released by this method. No other cursors or threads can be active in the tree.
      *
      * @param frame node frame
      * @param node latched node, with no keys, and dirty
      * @return false if tree is empty
      */
-    private boolean deleteNode(final CursorFrame frame, final Node node) throws IOException {
+    private boolean deleteLowestNode(final CursorFrame frame, final Node node) throws IOException {
         node.mLastCursorFrame = null;
 
         LocalDatabase db = mTree.mDatabase;
@@ -3212,7 +3219,7 @@ class TreeCursor implements CauseCloseable, Cursor {
         if (parentNode.hasKeys()) {
             parentNode.deleteLeftChildRef(0);
         } else {
-            if (!deleteNode(parentFrame, parentNode)) {
+            if (!deleteLowestNode(parentFrame, parentNode)) {
                 db.deleteNode(node);
                 return false;
             }
