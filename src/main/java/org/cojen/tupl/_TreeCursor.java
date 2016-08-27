@@ -2588,9 +2588,31 @@ class _TreeCursor implements CauseCloseable, Cursor {
         txn.commit();
     }
 
-    // FIXME: transferTo
-    //@Override
-    //public void transferTo(Cursor target) throws IOException {
+    /* FIXME: transferTo
+    @Override
+    public void transferTo(Cursor c) throws IOException {
+        final Transaction txn;
+        final _TreeCursor target;
+
+        check: {
+            if (c instanceof _TreeCursor) {
+                target = (_TreeCursor) c;
+                txn = mTxn;
+                if (txn == null || txn != target.mTxn) {
+                    throw new IllegalArgumentException();
+                }
+                if (mTree.mDatabase == target.mTree.mDatabase) {
+                    break check;
+                }
+            }
+
+            ViewUtils.transfer(this, c);
+            return;
+        }
+
+        throw null;
+    }
+    */
 
     /**
      * Atomic find and store operation. Cursor must be in a reset state when called, and cursor

@@ -449,8 +449,8 @@ public interface Cursor {
     }
 
     /**
-     * Transfers the current entry to another position, in this or another view. If the target
-     * already has an entry, the transfer operation replaces it. Large values can be
+     * Transfers the current entry to another position, within this view or another view. If
+     * the target already has an entry, the transfer operation replaces it. Large values can be
      * transferred efficiently by not performing a full copy, but only when autoload is
      * disabled.
      *
