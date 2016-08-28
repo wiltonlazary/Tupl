@@ -2647,6 +2647,7 @@ class _TreeCursor implements CauseCloseable, Cursor {
             try {
                 // Latching two nodes is deadlock prone, so fail fast.
 
+                /* FIXME: must be dirtied
                 _CursorFrame sourceFrame;
                 quick: {
                     _CursorFrame targetFrame = target.leafExclusiveNotSplit();
@@ -2686,6 +2687,7 @@ class _TreeCursor implements CauseCloseable, Cursor {
 
                     throw null;
                 }
+                */
 
                 // FIXME: redo/undo
                 // FIXME: copy from source (don't reconstruct if fragmented)
