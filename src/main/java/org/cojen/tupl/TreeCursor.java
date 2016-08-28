@@ -2617,31 +2617,91 @@ class TreeCursor implements CauseCloseable, Cursor {
         txn.commit();
     }
 
-    /* FIXME: transferTo
     @Override
     public void transferTo(Cursor c) throws IOException {
-        final Transaction txn;
-        final TreeCursor target;
-
-        check: {
-            if (c instanceof TreeCursor) {
-                target = (TreeCursor) c;
-                txn = mTxn;
-                if (txn == null || txn != target.mTxn) {
-                    throw new IllegalArgumentException();
-                }
-                if (mTree.mDatabase == target.mTree.mDatabase) {
-                    break check;
-                }
-            }
-
+        if (!(c instanceof TreeCursor)) {
             ViewUtils.transfer(this, c);
             return;
         }
 
-        throw null;
+        final TreeCursor target = (TreeCursor) c;
+        final LocalTransaction txn = mTxn;
+
+        if (txn == null || txn != target.mTxn) {
+            throw new IllegalArgumentException();
+        }
+
+        byte[] sourceKey = this.mKey;
+        ViewUtils.positionCheck(sourceKey);
+
+        byte[] targetKey = target.mKey;
+        ViewUtils.positionCheck(targetKey);
+
+        txn.enter();
+        try {
+            txn.lockExclusive(this.mTree.mId, sourceKey, this.keyHash());
+            txn.lockExclusive(target.mTree.mId, targetKey, target.keyHash());
+
+            final CommitLock commitLock = mTree.mDatabase.commitLock();
+            commitLock.lock();
+            try {
+                // Latching two nodes is deadlock prone, so fail fast.
+
+                CursorFrame sourceFrame;
+                quick: {
+                    CursorFrame targetFrame = target.leafExclusiveNotSplit();
+                    try {
+                        sourceFrame = this.tryLeafExclusiveNotSplit();
+                    } catch (Throwable e) {
+                        targetFrame.mNode.releaseExclusive();
+                        throw e;
+                    }
+
+                    if (sourceFrame == null) {
+                        // Try again in reverse order. It might be possible that the source and
+                        // target cursors are acting on the same node, but don't bother detecting
+                        // it. The single node case requires special logic to work correctly.
+
+                        sourceFrame = this.leafExclusiveNotSplit();
+                        try {
+                            targetFrame = target.tryLeafExclusiveNotSplit();
+                        } catch (Throwable e) {
+                            sourceFrame.mNode.releaseExclusive();
+                            throw e;
+                        }
+
+                        if (targetFrame == null) {
+                            // Give up, but leave the source node latched.
+                            break quick;
+                        }
+                    }
+
+                    // FIXME: redo/undo
+                    // FIXME: get encoded length from source
+                    // FIXME: update target for encoded length
+                    // FIXME: copy value from source to target (don't reconstruct if fragmented)
+                    // FIXME: release target latch
+                    // FIXME: delete from source (and allow merge)
+                    // FIXME: commit txn
+
+                    throw null;
+                }
+
+                // FIXME: redo/undo
+                // FIXME: copy from source (don't reconstruct if fragmented)
+                // FIXME: delete from source (and allow merge)
+                // FIXME: latch target (source should have been released)
+                // FIXME: store to target (preserve fragmented bit)
+                // FIXME: commit txn (can combine with store to target)
+
+                throw null;
+            } finally {
+                commitLock.unlock();
+            }
+        } finally {
+            txn.exit();
+        }
     }
-    */
 
     /**
      * Atomic find and store operation. Cursor must be in a reset state when called, and cursor

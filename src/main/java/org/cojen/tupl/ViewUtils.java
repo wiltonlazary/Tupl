@@ -264,21 +264,21 @@ class ViewUtils {
         return LockResult.UNOWNED;
     }
 
-    static void transfer(Cursor from, Cursor target) throws IOException {
+    static void transfer(Cursor source, Cursor target) throws IOException {
         Transaction txn = target.link();
-        if (txn == null || txn != from.link()) {
+        if (txn == null || txn != source.link()) {
             throw new IllegalArgumentException();
         }
 
         txn.enter();
         try {
-            byte[] value = from.value();
+            byte[] value = source.value();
             if (value == Cursor.NOT_LOADED) {
-                from.load();
-                value = from.value();
+                source.load();
+                value = source.value();
             }
-            // Store first, in case from and target positions are identical.
-            from.store(null);
+            // Delete first, in case source and target positions are identical.
+            source.store(null);
             target.commit(value);
         } finally {
             txn.exit();
