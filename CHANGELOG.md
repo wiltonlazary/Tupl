@@ -1,10 +1,25 @@
 Changelog
 =========
 
-v1.3.3.2
---------
+v1.3.6 (2016-09-05)
+------
+* Fix updating of large entries into crammed nodes, which caused entries to get lost.
+* Fix database lock file retention issue.
+* Refine Cursor lock method to ensure that the latest value is retrieved.
+* Fix key order check when running verification.
+* Added file preallocation option. Allows early handling of disk full exceptions to prevent
+  crashes with SIGBUS in the case where the file is mmap'ed and a delayed block allocation fails
+  due to no space left on device.
+
+v1.3.5 (2016-08-28)
+------
 * Fix NullPointerException when too many nodes are unevictable. A CacheExhaustedException
   should be thrown instead.
+* Fix deadlock between node split and checkpoint.
+* Fix "Already in NodeMap" exception when loading fragmented nodes.
+* Fix for a rare assertion error when deleting the root node of a tree.
+* Added a Cursor lock method, for manual lock control.
+* Added some default View and Cursor method implementations.
 
 v1.3.3.1 (2016-08-02)
 --------

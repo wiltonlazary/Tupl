@@ -284,7 +284,7 @@ final class UndoLog implements DatabaseAccess {
         if (node != null) {
             // Push into allocated node, which must be marked dirty.
             node.acquireExclusive();
-            mDatabase.markUndoLogDirty(node);
+            mDatabase.markUnmappedDirty(node);
         } else quick: {
             // Try to push into a local buffer before allocating a node.
             byte[] buffer = mBuffer;
@@ -496,10 +496,12 @@ final class UndoLog implements DatabaseAccess {
                         node.undoTop(end);
                         p_bytePut(page, end, OP_COMMIT_TRUNCATE);
                     }
-                    // Release and re-acquire, to unblock any threads waiting for
-                    // checkpoint to begin.
-                    commitLock.unlock();
-                    commitLock.lock();
+                    if (commitLock.hasQueuedThreads()) {
+                        // Release and re-acquire, to unblock any threads waiting for
+                        // checkpoint to begin.
+                        commitLock.unlock();
+                        commitLock.lock();
+                    }
                 }
             }
             mLength = 0;

@@ -3,7 +3,7 @@ Tupl
 
 The Unnamed Persistence Library
 
-Tupl is a high-performance, concurrent, transactional, scalable, low-level embedded database. Features include record-level locking, upgradable locks, deadlock detection, cursors, hot backups, striped files, encryption, pluggable replication, nested transaction scopes, and direct lock control. Although written in Java, Tupl doesn't suffer from garbage collection pauses when configured with a large cache.
+Tupl is a high-performance, concurrent, transactional, scalable, low-level embedded database. Features include record-level locking, upgradable locks, deadlock detection, cursors, hot backups, striped files, encryption, pluggable replication, nested transaction scopes, and direct lock control.
 
 * [Javadocs](http://cojen.github.com/Tupl/javadoc/org/cojen/tupl/package-summary.html)
 * [FAQ](https://github.com/cojen/Tupl/wiki/FAQ)
@@ -41,7 +41,7 @@ Setting a minimum cache size is generally preferred over setting a maximum size,
 pre-allocates the cache when the Database is opened. This allows any heap size limits to be
 detected early, yielding an OutOfMemoryError. When not specified, the maximum cache size
 matches the minimum cache size. When neither is specified, the default cache size is 1000
-pages, where a page is 4096 bytes by default.
+pages, and the default page size is 4096 bytes.
 
 Basic operations
 ----------------
