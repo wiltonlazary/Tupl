@@ -2452,6 +2452,69 @@ class TreeCursor implements CauseCloseable, Cursor {
     }
 
     @Override
+    public final LockResult lock() throws IOException {
+        try {
+            return doLock(mTxn);
+        } catch (LockFailureException e) {
+            mValue = NOT_LOADED;
+            throw e;
+        }
+    }
+
+    private LockResult doLock(LocalTransaction txn) throws IOException {
+        byte[] key = mKey;
+        ViewUtils.positionCheck(key);
+
+        LockResult result;
+        Locker locker;
+
+        if (txn == null) {
+            result = LockResult.UNOWNED;
+            locker = mTree.lockSharedLocal(key, keyHash());
+        } else {
+            LockMode mode = txn.lockMode();
+            if (mode.noReadLock) {
+                return LockResult.UNOWNED;
+            }
+            int keyHash = keyHash();
+            if (mode == LockMode.READ_COMMITTED) {
+                result = txn.lockShared(mTree.mId, key, keyHash);
+                if (result != LockResult.ACQUIRED) {
+                    return result;
+                }
+                result = LockResult.UNOWNED;
+                locker = txn;
+            } else {
+                result = txn.lock
+                    (mode.repeatable, mTree.mId, key, keyHash, txn.mLockTimeoutNanos);
+                if (result != LockResult.ACQUIRED) {
+                    return result;
+                }
+                locker = null;
+            }
+        }
+
+        try {
+            CursorFrame frame = leafSharedNotSplit();
+            Node node = frame.mNode;
+            try {
+                int pos = frame.mNodePos;
+                mValue = pos < 0 ? null
+                    : mKeyOnly ? node.hasLeafValue(pos) : node.retrieveLeafValue(pos);
+            } catch (Throwable e) {
+                node.releaseShared();
+                throw e;
+            }
+            node.releaseShared();
+            return result;
+        } finally {
+            if (locker != null) {
+                locker.unlock();
+            }
+        }
+    }
+
+    @Override
     public final LockResult load() throws IOException {
         // This will always acquire a lock if required to. A try-lock pattern
         // can skip the lock acquisition in certain cases, but the optimization
@@ -2864,35 +2927,13 @@ class TreeCursor implements CauseCloseable, Cursor {
                     }
 
                     node.deleteLeafEntry(pos);
+
+                    // Fix this and all bound cursors.
+                    node.postDelete(pos, key);
                 } catch (Throwable e) {
                     node.releaseExclusive();
                     throw e;
                 }
-
-                int newPos = ~pos;
-                leaf.mNodePos = newPos;
-                leaf.mNotFoundKey = key;
-
-                // Fix all cursors bound to the node.
-                CursorFrame frame = node.mLastCursorFrame;
-                do {
-                    if (frame == leaf) {
-                        // Don't need to fix self.
-                        continue;
-                    }
-
-                    int framePos = frame.mNodePos;
-
-                    if (framePos == pos) {
-                        frame.mNodePos = newPos;
-                        frame.mNotFoundKey = key;
-                    } else if (framePos > pos) {
-                        frame.mNodePos = framePos - 2;
-                    } else if (framePos < newPos) {
-                        // Position is a complement, so add instead of subtract.
-                        frame.mNodePos = framePos + 2;
-                    }
-                } while ((frame = frame.mPrevCousin) != null);
 
                 if (node.shouldLeafMerge()) {
                     mergeLeaf(leaf, node);
@@ -3145,7 +3186,7 @@ class TreeCursor implements CauseCloseable, Cursor {
 
                 if (node.hasKeys()) {
                     node.releaseExclusive();
-                } else if (!deleteNode(mLeaf, node)) {
+                } else if (!deleteLowestNode(mLeaf, node)) {
                     mLeaf = null;
                     reset();
                     return;
@@ -3157,14 +3198,14 @@ class TreeCursor implements CauseCloseable, Cursor {
     }
 
     /**
-     * Deletes the latched node and assigns the next node to the frame. All latches are
+     * Deletes the lowest latched node and assigns the next node to the frame. All latches are
      * released by this method. No other cursors or threads can be active in the tree.
      *
      * @param frame node frame
      * @param node latched node, with no keys, and dirty
      * @return false if tree is empty
      */
-    private boolean deleteNode(final CursorFrame frame, final Node node) throws IOException {
+    private boolean deleteLowestNode(final CursorFrame frame, final Node node) throws IOException {
         node.mLastCursorFrame = null;
 
         LocalDatabase db = mTree.mDatabase;
@@ -3186,7 +3227,7 @@ class TreeCursor implements CauseCloseable, Cursor {
         if (parentNode.hasKeys()) {
             parentNode.deleteLeftChildRef(0);
         } else {
-            if (!deleteNode(parentFrame, parentNode)) {
+            if (!deleteLowestNode(parentFrame, parentNode)) {
                 db.deleteNode(node);
                 return false;
             }
@@ -3844,20 +3885,6 @@ class TreeCursor implements CauseCloseable, Cursor {
     protected final CursorFrame leafExclusive() {
         CursorFrame leaf = leaf();
         leaf.acquireExclusive();
-        return leaf;
-    }
-
-    /**
-     * Latches and returns leaf frame, not split.
-     *
-     * @throws IllegalStateException if unpositioned
-     */
-    final CursorFrame leafExclusiveNotSplit() throws IOException {
-        CursorFrame leaf = leaf();
-        Node node = leaf.acquireExclusive();
-        if (node.mSplit != null) {
-            mTree.finishSplit(leaf, node);
-        }
         return leaf;
     }
 

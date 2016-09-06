@@ -51,20 +51,19 @@ class _Tree implements View, Index {
     // Id is null for registry.
     final byte[] mIdBytes;
 
-    // Name is null for all internal trees.
-    volatile byte[] mName;
-
     // Although tree roots can be created and deleted, the object which refers
     // to the root remains the same. Internal state is transferred to/from this
     // object when the tree root changes.
     final _Node mRoot;
 
-    _Tree(_LocalDatabase db, long id, byte[] idBytes, byte[] name, _Node root) {
+    // Name is null for all internal trees.
+    volatile byte[] mName;
+
+    _Tree(_LocalDatabase db, long id, byte[] idBytes, _Node root) {
         mDatabase = db;
         mLockManager = db.mLockManager;
         mId = id;
         mIdBytes = idBytes;
-        mName = name;
         mRoot = root;
     }
 
@@ -637,7 +636,7 @@ class _Tree implements View, Index {
         _TreeCursor cursor = new _TreeCursor(this, Transaction.BOGUS);
         try {
             cursor.autoload(false);
-            cursor.firstAny();
+            cursor.first(); // must start with loaded key
             int height = cursor.height();
             if (!observer.indexBegin(view, height)) {
                 cursor.reset();
@@ -935,80 +934,6 @@ class _Tree implements View, Index {
     final boolean allowStoredCounts() {
         // TODO: make configurable
         return true;
-    }
-
-    /**
-     * Non-transactionally insert an entry as the highest overall. Intended for filling up a
-     * new tree with ordered entries.
-     *
-     * @param key new highest key; no existing key can be greater than or equal to it
-     * @param frame frame bound to the tree leaf node
-     */
-    final void append(byte[] key, byte[] value, _CursorFrame frame) throws IOException {
-        try {
-            final CommitLock commitLock = mDatabase.commitLock();
-            commitLock.lock();
-            _Node node = latchDirty(frame);
-            try {
-                // TODO: inline and specialize
-                node.insertLeafEntry(frame, this, frame.mNodePos, key, value);
-                frame.mNodePos += 2;
-
-                while (node.mSplit != null) {
-                    if (node == mRoot) {
-                        node.finishSplitRoot();
-                        break;
-                    }
-                    _Node childNode = node;
-                    frame = frame.mParentFrame;
-                    node = frame.mNode;
-                    // Latch coupling upwards is fine because nothing should be searching a
-                    // tree which is filling up.
-                    node.acquireExclusive();
-                    // TODO: inline and specialize
-                    node.insertSplitChildRef(frame, this, frame.mNodePos, childNode);
-                }
-            } finally {
-                node.releaseExclusive();
-                commitLock.unlock();
-            }
-        } catch (Throwable e) {
-            throw closeOnFailure(mDatabase, e);
-        }
-    }
-
-    /**
-     * Returns the frame node latched exclusively and marked dirty.
-     */
-    private _Node latchDirty(_CursorFrame frame) throws IOException {
-        final _LocalDatabase db = mDatabase;
-        _Node node = frame.mNode;
-        node.acquireExclusive();
-
-        if (db.shouldMarkDirty(node)) {
-            _CursorFrame parentFrame = frame.mParentFrame;
-            try {
-                if (parentFrame == null) {
-                    db.doMarkDirty(this, node);
-                } else {
-                    // Latch coupling upwards is fine because nothing should be searching a tree
-                    // which is filling up.
-                    _Node parentNode = latchDirty(parentFrame);
-                    try {
-                        if (db.markDirty(this, node)) {
-                            parentNode.updateChildRefId(parentFrame.mNodePos, node.mId);
-                        }
-                    } finally {
-                        parentNode.releaseExclusive();
-                    }
-                }
-            } catch (Throwable e) {
-                node.releaseExclusive();
-                throw e;
-            }
-        }
-
-        return node;
     }
 
     /**
