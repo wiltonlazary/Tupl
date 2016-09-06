@@ -113,12 +113,12 @@ final class TransformedCursor implements Cursor {
 
     @Override
     public LockResult skip(long amount) throws IOException {
-        return amount == 0 ? mSource.skip(0) : ViewUtils.doSkip(this, amount);
+        return ViewUtils.skipWithLocks(this, amount);
     }
 
     @Override
     public LockResult skip(long amount, byte[] limitKey, boolean inclusive) throws IOException {
-        return ViewUtils.skip(this, amount, limitKey, inclusive);
+        return ViewUtils.skipWithLocks(this, amount, limitKey, inclusive);
     }
 
     @Override
@@ -450,11 +450,14 @@ final class TransformedCursor implements Cursor {
     }
 
     @Override
+    public LockResult lock() throws IOException {
+        return mSource.lock();
+    }
+
+    @Override
     public LockResult load() throws IOException {
         final byte[] tkey = mKey;
-        if (tkey == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(tkey);
         mKey = tkey;
         mValue = NOT_LOADED;
         final Cursor c = mSource;
@@ -464,29 +467,23 @@ final class TransformedCursor implements Cursor {
     @Override
     public void store(final byte[] tvalue) throws IOException {
         final byte[] tkey = mKey;
-        if (tkey == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(tkey);
         final Cursor c = mSource;
         final byte[] key = c.key();
-        if (key == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(key);
         c.store(mTransformer.inverseTransformValue(tvalue, key, tkey));
+        mValue = tvalue;
     }
 
     @Override
     public void commit(final byte[] tvalue) throws IOException {
         final byte[] tkey = mKey;
-        if (tkey == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(tkey);
         final Cursor c = mSource;
         final byte[] key = c.key();
-        if (key == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(key);
         c.commit(mTransformer.inverseTransformValue(tvalue, key, tkey));
+        mValue = tvalue;
     }
 
     /*
@@ -517,9 +514,7 @@ final class TransformedCursor implements Cursor {
     }
 
     private byte[] inverseTransformKey(final byte[] tkey) {
-        if (tkey == null) {
-            throw new NullPointerException("Key is null");
-        }
+        Utils.keyCheck(tkey);
         return mTransformer.inverseTransformKey(tkey);
     }
 

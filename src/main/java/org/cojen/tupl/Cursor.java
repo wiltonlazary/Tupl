@@ -84,7 +84,8 @@ public interface Cursor {
     /**
      * By default, values are loaded automatically, as they are seen. When disabled, values
      * might need to be {@link Cursor#load manually loaded}. When a {@link Transformer} is
-     * used, the value might still be loaded automatically.
+     * used, the value might still be loaded automatically. When the value exists but hasn't
+     * been loaded, the value field of the cursor is set to {@link NOT_LOADED}.
      *
      * @param mode false to disable
      * @return prior autoload mode
@@ -216,7 +217,9 @@ public interface Cursor {
      * @throws NullPointerException if limit key is null
      * @throws IllegalStateException if position is undefined at invocation time
      */
-    public LockResult nextLe(byte[] limitKey) throws IOException;
+    public default LockResult nextLe(byte[] limitKey) throws IOException {
+        return ViewUtils.nextCmp(this, limitKey, 1);
+    }
 
     /**
      * Moves to the Cursor to the next available entry, but only when less than
@@ -230,7 +233,9 @@ public interface Cursor {
      * @throws NullPointerException if limit key is null
      * @throws IllegalStateException if position is undefined at invocation time
      */
-    public LockResult nextLt(byte[] limitKey) throws IOException;
+    public default LockResult nextLt(byte[] limitKey) throws IOException {
+        return ViewUtils.nextCmp(this, limitKey, 0);
+    }
 
     /**
      * Moves to the Cursor to the previous available entry. Cursor key and
@@ -258,7 +263,9 @@ public interface Cursor {
      * @throws NullPointerException if limit key is null
      * @throws IllegalStateException if position is undefined at invocation time
      */
-    public LockResult previousGe(byte[] limitKey) throws IOException;
+    public default LockResult previousGe(byte[] limitKey) throws IOException {
+        return ViewUtils.previousCmp(this, limitKey, -1);
+    }
 
     /**
      * Moves to the Cursor to the previous available entry, but only when
@@ -272,7 +279,9 @@ public interface Cursor {
      * @throws NullPointerException if limit key is null
      * @throws IllegalStateException if position is undefined at invocation time
      */
-    public LockResult previousGt(byte[] limitKey) throws IOException;
+    public default LockResult previousGt(byte[] limitKey) throws IOException {
+        return ViewUtils.previousCmp(this, limitKey, 0);
+    }
 
     /**
      * Moves the Cursor to find the given key.
@@ -301,7 +310,16 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findGe(byte[] key) throws IOException;
+    public default LockResult findGe(byte[] key) throws IOException {
+        LockResult result = find(key);
+        if (value() == null) {
+            if (result == LockResult.ACQUIRED) {
+                link().unlock();
+            }
+            result = next();
+        }
+        return result;
+    }
 
     /**
      * Moves the Cursor to find the first available entry greater than the
@@ -316,7 +334,10 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findGt(byte[] key) throws IOException;
+    public default LockResult findGt(byte[] key) throws IOException {
+        ViewUtils.findNoLock(this, key);
+        return next();
+    }
 
     /**
      * Moves the Cursor to find the first available entry less than or equal to
@@ -331,7 +352,16 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findLe(byte[] key) throws IOException;
+    public default LockResult findLe(byte[] key) throws IOException {
+        LockResult result = find(key);
+        if (value() == null) {
+            if (result == LockResult.ACQUIRED) {
+                link().unlock();
+            }
+            result = previous();
+        }
+        return result;
+    }
 
     /**
      * Moves the Cursor to find the first available entry less than the given
@@ -346,7 +376,10 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findLt(byte[] key) throws IOException;
+    public default LockResult findLt(byte[] key) throws IOException {
+        ViewUtils.findNoLock(this, key);
+        return previous();
+    }
 
     /**
      * Optimized version of the regular find method, which can perform fewer search steps if
@@ -362,7 +395,9 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findNearby(byte[] key) throws IOException;
+    public default LockResult findNearby(byte[] key) throws IOException {
+        return find(key);
+    }
 
     /**
      * Moves the Cursor to a random entry, but not guaranteed to be chosen from
@@ -379,9 +414,27 @@ public interface Cursor {
     public LockResult random(byte[] lowKey, byte[] highKey) throws IOException;
 
     /**
-     * Loads or reloads the value at the cursor's current position. Cursor
-     * value is set to null if entry no longer exists, but the position remains
-     * unmodified.
+     * Locks the current entry, as if by calling load. Locking is performed automatically
+     * within transactions, and so invocation of this method is necessary only when manually
+     * tweaking the lock mode. If a lock was acquired (even if not retained), the cursor value
+     * field is updated according to the current autoload mode.
+     *
+     * <p>By default, this method simply calls load. Subclasses are encouraged to provide a
+     * more efficient implementation.
+     *
+     * @throws IllegalStateException if position is undefined at invocation time
+     * @return {@link LockResult#UNOWNED UNOWNED}, {@link LockResult#ACQUIRED
+     * ACQUIRED}, {@link LockResult#OWNED_SHARED OWNED_SHARED}, {@link
+     * LockResult#OWNED_UPGRADABLE OWNED_UPGRADABLE}, or {@link
+     * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
+     */
+    public default LockResult lock() throws IOException {
+        return load();
+    }
+
+    /**
+     * Loads or reloads the value at the cursor's current position. Cursor value is set to null
+     * if entry no longer exists, but the position remains unmodified.
      *
      * @throws IllegalStateException if position is undefined at invocation time
      * @return {@link LockResult#UNOWNED UNOWNED}, {@link LockResult#ACQUIRED

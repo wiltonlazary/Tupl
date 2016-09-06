@@ -51,33 +51,20 @@ class Tree implements View, Index {
     // Id is null for registry.
     final byte[] mIdBytes;
 
-    // Name is null for all internal trees.
-    volatile byte[] mName;
-
     // Although tree roots can be created and deleted, the object which refers
     // to the root remains the same. Internal state is transferred to/from this
     // object when the tree root changes.
     final Node mRoot;
 
-    final int mMaxKeySize;
-    final int mMaxEntrySize;
+    // Name is null for all internal trees.
+    volatile byte[] mName;
 
-    Tree(LocalDatabase db, long id, byte[] idBytes, byte[] name, Node root) {
+    Tree(LocalDatabase db, long id, byte[] idBytes, Node root) {
         mDatabase = db;
         mLockManager = db.mLockManager;
         mId = id;
         mIdBytes = idBytes;
-        mName = name;
         mRoot = root;
-
-        int pageSize = db.pageSize();
-
-        // Key size is limited to ensure that internal nodes can hold at least two keys.
-        // Absolute maximum is dictated by key encoding, as described in Node class.
-        mMaxKeySize = Math.min(16383, (pageSize >> 1) - 22);
-
-        // Limit maximum non-fragmented entry size to 0.75 of usable node size.
-        mMaxEntrySize = ((pageSize - Node.TN_HEADER_SIZE) * 3) >> 2;
     }
 
     final int pageSize() {
@@ -122,13 +109,28 @@ class Tree implements View, Index {
         return new TreeCursor(this, txn);
     }
 
-    /*
     @Override
     public long count(byte[] lowKey, byte[] highKey) throws IOException {
-        // FIXME: use bottom internal node counts if allowStoredCounts is true
-        throw null;
+        TreeCursor cursor = new TreeCursor(this, Transaction.BOGUS);
+        TreeCursor high = null;
+        try {
+            if (highKey != null) {
+                high = new TreeCursor(this, Transaction.BOGUS);
+                high.autoload(false);
+                high.find(highKey);
+                if (high.mKey == null) {
+                    // Found nothing.
+                    return 0;
+                }
+            }
+            return cursor.count(lowKey, high);
+        } finally {
+            cursor.reset();
+            if (high != null) {
+                high.reset();
+            }
+        }
     }
-    */
 
     @Override
     public final byte[] load(Transaction txn, byte[] key) throws IOException {
@@ -284,7 +286,11 @@ class Tree implements View, Index {
                     // Need to acquire the lock before loading. To prevent deadlock, a cursor
                     // frame must be bound and then the node latch can be released.
                     frame = new CursorFrame();
-                    frame.bind(node, midPos - node.searchVecStart());
+                    int pos = midPos - node.searchVecStart();
+                    if (node.mSplit != null) {
+                        pos = node.mSplit.adjustBindPosition(pos);
+                    }
+                    frame.bind(node, pos);
                     break search;
                 }
             }
@@ -298,7 +304,11 @@ class Tree implements View, Index {
             // Need to lock even if no value was found.
             frame = new CursorFrame();
             frame.mNotFoundKey = key;
-            frame.bind(node, ~(lowPos - node.searchVecStart()));
+            int pos = lowPos - node.searchVecStart();
+            if (node.mSplit != null) {
+                pos = node.mSplit.adjustBindPosition(pos);
+            }
+            frame.bind(node, ~pos);
             break search;
         } finally {
             node.releaseShared();
@@ -318,11 +328,14 @@ class Tree implements View, Index {
             try {
                 node = frame.acquireShared();
                 try {
-                    if (node.mSplit != null) {
-                        node = node.mSplit.selectNode(node, key);
-                    }
                     int pos = frame.mNodePos;
-                    return pos >= 0 ? node.retrieveLeafValue(pos) : null;
+                    if (pos < 0) {
+                        return null;
+                    } else if (node.mSplit == null) {
+                        return node.retrieveLeafValue(pos);
+                    } else {
+                        return node.mSplit.retrieveLeafValue(node, pos);
+                    }
                 } finally {
                     node.releaseShared();
                 }
@@ -338,9 +351,7 @@ class Tree implements View, Index {
 
     @Override
     public void store(Transaction txn, byte[] key, byte[] value) throws IOException {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         TreeCursor cursor = new TreeCursor(this, txn);
         cursor.autoload(false);
         cursor.findAndStore(key, value);
@@ -348,17 +359,13 @@ class Tree implements View, Index {
 
     @Override
     public byte[] exchange(Transaction txn, byte[] key, byte[] value) throws IOException {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         return new TreeCursor(this, txn).findAndStore(key, value);
     }
 
     @Override
     public boolean insert(Transaction txn, byte[] key, byte[] value) throws IOException {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         TreeCursor cursor = new TreeCursor(this, txn);
         cursor.autoload(false);
         return cursor.findAndModify(key, TreeCursor.MODIFY_INSERT, value);
@@ -366,9 +373,7 @@ class Tree implements View, Index {
 
     @Override
     public boolean replace(Transaction txn, byte[] key, byte[] value) throws IOException {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         TreeCursor cursor = new TreeCursor(this, txn);
         cursor.autoload(false);
         return cursor.findAndModify(key, TreeCursor.MODIFY_REPLACE, value);
@@ -378,10 +383,15 @@ class Tree implements View, Index {
     public boolean update(Transaction txn, byte[] key, byte[] oldValue, byte[] newValue)
         throws IOException
     {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         return new TreeCursor(this, txn).findAndModify(key, oldValue, newValue);
+    }
+
+    @Override
+    public final LockResult tryLockShared(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException
+    {
+        return check(txn).tryLockShared(mId, key, nanosTimeout);
     }
 
     @Override
@@ -390,10 +400,24 @@ class Tree implements View, Index {
     }
 
     @Override
+    public final LockResult tryLockUpgradable(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException
+    {
+        return check(txn).tryLockUpgradable(mId, key, nanosTimeout);
+    }
+
+    @Override
     public final LockResult lockUpgradable(Transaction txn, byte[] key)
         throws LockFailureException
     {
         return check(txn).lockUpgradable(mId, key);
+    }
+
+    @Override
+    public final LockResult tryLockExclusive(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException
+    {
+        return check(txn).tryLockExclusive(mId, key, nanosTimeout);
     }
 
     @Override
@@ -612,7 +636,7 @@ class Tree implements View, Index {
         TreeCursor cursor = new TreeCursor(this, Transaction.BOGUS);
         try {
             cursor.autoload(false);
-            cursor.first();
+            cursor.first(); // must start with loaded key
             int height = cursor.height();
             if (!observer.indexBegin(view, height)) {
                 cursor.reset();
@@ -913,82 +937,13 @@ class Tree implements View, Index {
     }
 
     /**
-     * Non-transactionally insert an entry as the highest overall. Intended for filling up a
-     * new tree with ordered entries.
-     *
-     * @param key new highest key; no existing key can be greater than or equal to it
-     * @param frame frame bound to the tree leaf node
-     */
-    final void append(byte[] key, byte[] value, CursorFrame frame) throws IOException {
-        try {
-            final CommitLock commitLock = mDatabase.commitLock();
-            commitLock.acquireShared();
-            Node node = latchDirty(frame);
-            try {
-                // TODO: inline and specialize
-                node.insertLeafEntry(frame, this, frame.mNodePos, key, value);
-                frame.mNodePos += 2;
-
-                while (node.mSplit != null) {
-                    if (node == mRoot) {
-                        node.finishSplitRoot();
-                        break;
-                    }
-                    Node childNode = node;
-                    frame = frame.mParentFrame;
-                    node = frame.mNode;
-                    // Latch coupling upwards is fine because nothing should be searching a
-                    // tree which is filling up.
-                    node.acquireExclusive();
-                    // TODO: inline and specialize
-                    node.insertSplitChildRef(frame, this, frame.mNodePos, childNode);
-                }
-            } finally {
-                node.releaseExclusive();
-                commitLock.releaseShared();
-            }
-        } catch (Throwable e) {
-            throw closeOnFailure(mDatabase, e);
-        }
-    }
-
-    /**
-     * Returns the frame node latched exclusively and marked dirty.
-     */
-    private Node latchDirty(CursorFrame frame) throws IOException {
-        final LocalDatabase db = mDatabase;
-        Node node = frame.mNode;
-        node.acquireExclusive();
-
-        if (db.shouldMarkDirty(node)) {
-            CursorFrame parentFrame = frame.mParentFrame;
-            try {
-                if (parentFrame == null) {
-                    db.doMarkDirty(this, node);
-                } else {
-                    // Latch coupling upwards is fine because nothing should be searching a tree
-                    // which is filling up.
-                    Node parentNode = latchDirty(parentFrame);
-                    try {
-                        if (db.markDirty(this, node)) {
-                            parentNode.updateChildRefId(parentFrame.mNodePos, node.mId);
-                        }
-                    } finally {
-                        parentNode.releaseExclusive();
-                    }
-                }
-            } catch (Throwable e) {
-                node.releaseExclusive();
-                throw e;
-            }
-        }
-
-        return node;
-    }
-
-    /**
      * Caller must hold exclusive latch and it must verify that node has
      * split. Node latch is released if an exception is thrown.
+     *
+     * The caller should also hold at least a shared commit lock, because this function tries
+     * to allocate pages, and the page db may try to acquire a shared commit lock. Since the
+     * commit lock is reentrant, if the caller already holds a shared commit lock, it
+     * guarantees the page db can acquire another shared commit lock.
      *
      * @param frame bound cursor frame
      * @param node node which is bound to the frame, latched exclusively
@@ -1091,10 +1046,6 @@ class Tree implements View, Index {
      */
     final boolean markDirty(Node node) throws IOException {
         return mDatabase.markDirty(this, node);
-    }
-
-    final byte[] fragmentKey(byte[] key) throws IOException {
-        return mDatabase.fragment(key, key.length, mMaxKeySize);
     }
 
     private class Primer {

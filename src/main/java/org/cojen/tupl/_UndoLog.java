@@ -284,7 +284,7 @@ final class _UndoLog implements _DatabaseAccess {
         if (node != null) {
             // Push into allocated node, which must be marked dirty.
             node.acquireExclusive();
-            mDatabase.markUndoLogDirty(node);
+            mDatabase.markUnmappedDirty(node);
         } else quick: {
             // Try to push into a local buffer before allocating a node.
             byte[] buffer = mBuffer;
@@ -402,14 +402,21 @@ final class _UndoLog implements _DatabaseAccess {
      */
     final long scopeEnter() throws IOException {
         final CommitLock commitLock = mDatabase.commitLock();
-        commitLock.acquireShared();
+        commitLock.lock();
         try {
             long savepoint = mLength;
-            doPush(OP_SCOPE_ENTER);
+            doScopeEnter();
             return savepoint;
         } finally {
-            commitLock.releaseShared();
+            commitLock.unlock();
         }
+    }
+
+    /**
+     * Caller must hold db commit lock.
+     */
+    final void doScopeEnter() throws IOException {
+        doPush(OP_SCOPE_ENTER);
     }
 
     /**
@@ -419,12 +426,12 @@ final class _UndoLog implements _DatabaseAccess {
      */
     final long scopeCommit() throws IOException {
         final CommitLock commitLock = mDatabase.commitLock();
-        commitLock.acquireShared();
+        commitLock.lock();
         try {
             doPush(OP_SCOPE_COMMIT);
             return mLength;
         } finally {
-            commitLock.releaseShared();
+            commitLock.unlock();
         }
     }
 
@@ -434,14 +441,14 @@ final class _UndoLog implements _DatabaseAccess {
      */
     final void scopeRollback(long savepoint) throws IOException {
         final CommitLock commitLock = mDatabase.commitLock();
-        commitLock.acquireShared();
+        commitLock.lock();
         try {
             if (savepoint < mLength) {
                 // Rollback the entire scope, including the enter op.
                 doRollback(savepoint);
             }
         } finally {
-            commitLock.releaseShared();
+            commitLock.unlock();
         }
     }
 
@@ -452,11 +459,11 @@ final class _UndoLog implements _DatabaseAccess {
      */
     final void truncate(boolean commit) throws IOException {
         final CommitLock commitLock = mDatabase.commitLock();
-        commitLock.acquireShared();
+        commitLock.lock();
         try {
             doTruncate(commitLock, commit);
         } finally {
-            commitLock.releaseShared();
+            commitLock.unlock();
         }
     }
 
@@ -489,10 +496,12 @@ final class _UndoLog implements _DatabaseAccess {
                         node.undoTop(end);
                         p_bytePut(page, end, OP_COMMIT_TRUNCATE);
                     }
-                    // Release and re-acquire, to unblock any threads waiting for
-                    // checkpoint to begin.
-                    commitLock.releaseShared();
-                    commitLock.acquireShared();
+                    if (commitLock.hasQueuedThreads()) {
+                        // Release and re-acquire, to unblock any threads waiting for
+                        // checkpoint to begin.
+                        commitLock.unlock();
+                        commitLock.lock();
+                    }
                 }
             }
             mLength = 0;
@@ -510,11 +519,11 @@ final class _UndoLog implements _DatabaseAccess {
         }
 
         final CommitLock commitLock = mDatabase.commitLock();
-        commitLock.acquireShared();
+        commitLock.lock();
         try {
             doRollback(0);
         } finally {
-            commitLock.releaseShared();
+            commitLock.unlock();
         }
     }
 

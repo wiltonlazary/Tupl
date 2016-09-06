@@ -95,7 +95,7 @@ final class TreeValueStream extends AbstractStream {
                 return;
             }
 
-            final CursorFrame leaf = mCursor.leafExclusiveNotSplit();
+            final CursorFrame leaf = mCursor.leafExclusive();
 
             final CommitLock commitLock = mCursor.commitLock(leaf);
             try {
@@ -103,7 +103,7 @@ final class TreeValueStream extends AbstractStream {
                 action(leaf, OP_SET_LENGTH, length, EMPTY_BYTES, 0, 0);
                 leaf.mNode.releaseExclusive();
             } finally {
-                commitLock.releaseShared();
+                commitLock.unlock();
             }
         } catch (IllegalStateException e) {
             checkOpen();
@@ -130,7 +130,7 @@ final class TreeValueStream extends AbstractStream {
     void doWrite(long pos, byte[] buf, int off, int len) throws IOException {
         // FIXME: txn undo/redo
         try {
-            final CursorFrame leaf = mCursor.leafExclusiveNotSplit();
+            final CursorFrame leaf = mCursor.leafExclusive();
 
             final CommitLock commitLock = mCursor.commitLock(leaf);
             try {
@@ -138,7 +138,7 @@ final class TreeValueStream extends AbstractStream {
                 action(leaf, OP_WRITE, pos, buf, off, len);
                 leaf.mNode.releaseExclusive();
             } finally {
-                commitLock.releaseShared();
+                commitLock.unlock();
             }
         } catch (IllegalStateException e) {
             checkOpen();
@@ -1193,7 +1193,7 @@ final class TreeValueStream extends AbstractStream {
 
         // Note: As an optimization, search vector can be left as-is for new entry. Full delete
         // is simpler and re-uses existing code.
-        node.doDeleteLeafEntry(pos, loc - entryLoc);
+        node.finishDeleteLeafEntry(pos, loc - entryLoc);
 
         // TODO: need frame for rebalancing to work
         entryLoc = node.createLeafEntry(null, tree, pos, key.length + newValueLen);
