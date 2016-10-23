@@ -1,5 +1,5 @@
 /*
- *  Copyright 2014 Brian S O'Neill
+ *  Copyright 2014-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,14 +18,17 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
+import java.util.Arrays;
+
 /**
  * Tree which uses an explicit transaction when none is specified, excluding loads.
  *
  * @author Brian S O'Neill
  */
+/*P*/
 final class TxnTree extends Tree {
-    TxnTree(Database db, long id, byte[] idBytes, byte[] name, Node root) {
-        super(db, id, idBytes, name, root);
+    TxnTree(LocalDatabase db, long id, byte[] idBytes, Node root) {
+        super(db, id, idBytes, root);
     }
 
     @Override
@@ -38,14 +41,24 @@ final class TxnTree extends Tree {
         if (txn != null) {
             super.store(txn, key, value);
         } else {
-            txn = mDatabase.newAlwaysRedoTransaction();
+            txnStore(key, value);
+        }
+    }
+
+    private void txnStore(byte[] key, byte[] value) throws IOException {
+        Transaction txn = mDatabase.newAlwaysRedoTransaction();
+        try {
+            TreeCursor c = new TreeCursor(this, txn);
             try {
-                super.store(txn, key, value);
-                txn.commit();
-            } catch (Throwable e) {
-                txn.reset();
-                throw e;
+                c.mKeyOnly = true;
+                c.doFind(key);
+                c.commit(value);
+            } finally {
+                c.reset();
             }
+        } catch (Throwable e) {
+            txn.reset();
+            throw e;
         }
     }
 
@@ -54,15 +67,25 @@ final class TxnTree extends Tree {
         if (txn != null) {
             return super.exchange(txn, key, value);
         } else {
-            txn = mDatabase.newAlwaysRedoTransaction();
+            return txnExchange(key, value);
+        }
+    }
+
+    private byte[] txnExchange(byte[] key, byte[] value) throws IOException {
+        Transaction txn = mDatabase.newAlwaysRedoTransaction();
+        try {
+            TreeCursor c = new TreeCursor(this, txn);
             try {
-                byte[] oldValue = super.exchange(txn, key, value);
-                txn.commit();
+                c.doFind(key);
+                byte[] oldValue = c.mValue;
+                c.commit(value);
                 return oldValue;
-            } catch (Throwable e) {
-                txn.reset();
-                throw e;
+            } finally {
+                c.reset();
             }
+        } catch (Throwable e) {
+            txn.reset();
+            throw e;
         }
     }
 
@@ -71,15 +94,30 @@ final class TxnTree extends Tree {
         if (txn != null) {
             return super.insert(txn, key, value);
         } else {
-            txn = mDatabase.newAlwaysRedoTransaction();
+            return txnInsert(key, value);
+        }
+    }
+
+    private boolean txnInsert(byte[] key, byte[] value) throws IOException {
+        Transaction txn = mDatabase.newAlwaysRedoTransaction();
+        try {
+            TreeCursor c = new TreeCursor(this, txn);
             try {
-                boolean result = super.insert(txn, key, value);
-                txn.commit();
-                return result;
-            } catch (Throwable e) {
-                txn.reset();
-                throw e;
+                c.mKeyOnly = true;
+                c.doFind(key);
+                if (c.mValue == null) {
+                    c.commit(value);
+                    return true;
+                } else {
+                    txn.reset();
+                    return false;
+                }
+            } finally {
+                c.reset();
             }
+        } catch (Throwable e) {
+            txn.reset();
+            throw e;
         }
     }
 
@@ -88,15 +126,30 @@ final class TxnTree extends Tree {
         if (txn != null) {
             return super.replace(txn, key, value);
         } else {
-            txn = mDatabase.newAlwaysRedoTransaction();
+            return txnReplace(key, value);
+        }
+    }
+
+    private boolean txnReplace(byte[] key, byte[] value) throws IOException {
+        Transaction txn = mDatabase.newAlwaysRedoTransaction();
+        try {
+            TreeCursor c = new TreeCursor(this, txn);
             try {
-                boolean result = super.replace(txn, key, value);
-                txn.commit();
-                return result;
-            } catch (Throwable e) {
-                txn.reset();
-                throw e;
+                c.mKeyOnly = true;
+                c.doFind(key);
+                if (c.mValue != null) {
+                    c.commit(value);
+                    return true;
+                } else {
+                    txn.reset();
+                    return false;
+                }
+            } finally {
+                c.reset();
             }
+        } catch (Throwable e) {
+            txn.reset();
+            throw e;
         }
     }
 
@@ -107,22 +160,38 @@ final class TxnTree extends Tree {
         if (txn != null) {
             return super.update(txn, key, oldValue, newValue);
         } else {
-            txn = mDatabase.newAlwaysRedoTransaction();
-            try {
-                boolean result = super.update(txn, key, oldValue, newValue);
-                txn.commit();
-                return result;
-            } catch (Throwable e) {
-                txn.reset();
-                throw e;
-            }
+            return txnUpdate(key, oldValue, newValue);
         }
     }
 
+    public boolean txnUpdate(byte[] key, byte[] oldValue, byte[] newValue) throws IOException {
+        Transaction txn = mDatabase.newAlwaysRedoTransaction();
+        try {
+            TreeCursor c = new TreeCursor(this, txn);
+            try {
+                c.doFind(key);
+                if (Arrays.equals(oldValue, c.mValue)) {
+                    c.commit(newValue);
+                    return true;
+                } else {
+                    txn.reset();
+                    return false;
+                }
+            } finally {
+                c.reset();
+            }
+        } catch (Throwable e) {
+            txn.reset();
+            throw e;
+        }
+    }
+
+    /*
     @Override
     public Stream newStream() {
         TreeCursor cursor = new TxnTreeCursor(this);
         cursor.autoload(false);
         return new TreeValueStream(cursor);
     }
+    */
 }

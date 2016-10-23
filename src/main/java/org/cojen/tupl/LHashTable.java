@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -17,7 +17,9 @@
 package org.cojen.tupl;
 
 /**
- * Simple hash table which maps long keys to customizable entries.
+ * Simple hash table which maps long keys to customizable entries. The hash function only
+ * examines the lowest bits of the keys, and so the keys might need to be scrambled to reduce
+ * collisions.
  *
  * @author Brian S O'Neill
  */
@@ -77,7 +79,7 @@ abstract class LHashTable<E extends LHashTable.Entry<E>> {
         return mSize;
     }
 
-    @SuppressWarnings({"unchecked"})
+    @SuppressWarnings({"unchecked", "rawtypes"})
     public final void clear(int capacity) {
         if (capacity <= 0) {
             capacity = 1;
@@ -202,7 +204,7 @@ abstract class LHashTable<E extends LHashTable.Entry<E>> {
         return e;
     }
 
-    @SuppressWarnings({"unchecked"})
+    @SuppressWarnings({"unchecked", "rawtypes"})
     private boolean grow() {
         if (mSize < mGrowThreshold) {
             return false;
@@ -238,6 +240,7 @@ abstract class LHashTable<E extends LHashTable.Entry<E>> {
         E next;
     }
 
+    @FunctionalInterface
     public static interface Visitor<E extends Entry<E>, X extends Exception> {
         /**
          * @return true if entry should be deleted

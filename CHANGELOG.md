@@ -1,6 +1,165 @@
 Changelog
 =========
 
+v1.3.8
+------
+* Stripe transaction state to improve concurrency.
+
+v1.3.7.1 (2016-10-22)
+--------
+* Fix when updating a large value into a newly split node.
+* Fix race conditions when handling tree node stubs.
+* Replicated transaction rollback should propagate immediately.
+
+v1.3.7 (2016-10-15)
+------
+* Fix corruption caused by cursor traversal into split nodes.
+* Fix corruption caused by broken cursor binding following a node split and merge.
+* Fix latch upgrade race condition when deleting a ghost.
+* Fix race conditions when handling parent-before-child node evictions.
+* Fix race conditions when deleting and creating root node.
+* Fix snapshot handling when using fully mapped mode.
+* Fix stub node implementation when using fully mapped mode.
+* Add support for attaching objects to transactions, for tracking them.
+* Detect deadlocks when lock timeout is zero, for non-try variants.
+* Suppress transaction exceptions from cleanup methods when database is closed.
+
+v1.3.6 (2016-09-05)
+------
+* Fix updating of large entries into crammed nodes, which caused entries to get lost.
+* Fix database lock file retention issue.
+* Refine Cursor lock method to ensure that the latest value is retrieved.
+* Fix key order check when running verification.
+* Added file preallocation option. Allows early handling of disk full exceptions to prevent
+  crashes with SIGBUS in the case where the file is mmap'ed and a delayed block allocation fails
+  due to no space left on device.
+
+v1.3.5 (2016-08-28)
+------
+* Fix NullPointerException when too many nodes are unevictable. A CacheExhaustedException
+  should be thrown instead.
+* Fix deadlock between node split and checkpoint.
+* Fix "Already in NodeMap" exception when loading fragmented nodes.
+* Fix for a rare assertion error when deleting the root node of a tree.
+* Added a Cursor lock method, for manual lock control.
+* Added some default View and Cursor method implementations.
+
+v1.3.3.1 (2016-08-02)
+--------
+* Fix subtraction error when load encounters a split node, causing wrong value to be loaded.
+
+v1.3.3 (2016-07-30)
+------
+* Fixed transaction race condition which allowed shared locks to be prematurely released.
+* Fixed load race conditions which caused an incorrect value to be returned.
+* Fix for performing database compaction while old indexes are concurrently deleted. Some
+  pages would get lost, preventing compaction from ever working again.
+* Support temporary indexes.
+* Don't close in-use indexes during verification.
+* Redo decoder should be lenient if EOF is reached in the middle of an operation.
+* Rewrite CommitLock to stripe shared lock requests, improving concurrency.
+* Use Java 9 vectorized comparison method if available.
+* Add full stats support for non-durable databases.
+
+v1.3.2 (2016-06-04)
+------
+* Fix storage leak when database capacity is reached during fragmented value allocation.
+* Fix deadlock when gathering stats while trees are concurrently closed.
+* Optimize count method, utilizing stored internal node counts.
+* Add file I/O support for ByteBuffers.
+
+v1.3.1 (2016-05-07)
+------
+* Fix handling of invalidated transactions, and defined a new exception type for it.
+* Fix root node initialization for new trees when using fully mapped mode.
+* Fix various replication issues.
+* Fix race conditions when closing database.
+* Prevent improper use of bogus transaction.
+
+v1.3.0.1 (2016-04-16)
+--------
+* Fix for Index.load during concurrent node splits. It caused the load to falsely return null.
+* Fix undo log node creation when using direct page access mode. The reserved byte was not
+  explicitly cleared, allowing fragmented values to corrupt the nodes as pages get recycled.
+* Fix shared latch double release when using VARIANT_RETAIN, which would result in a
+  deadlock. This affected the Cursor.findGe and Cursor.findLe methods.
+* Fix handling of Index.evict when encountering empty nodes, and lock keys as required by the
+  transaction.
+* Fix handling of index delete and recovery. Deleted index must be closed just like they were
+  before recovery, to allow recovery to complete.
+* Fix for deleting empty indexes which caused an exception.
+* Eliminate overhead of zero-length memory copy when using direct page access mode. This
+  primarily affected the performance of values larger than the page size.
+* Allow node merge to propagate upwards for empty nodes.
+* Ensure that compaction and verification visit all nodes, even empty ones.
+
+v1.3.0 (2016-04-02)
+------
+* Depends on Java 8.
+* Several top-level classes are now interfaces.
+* Tree search operations rely extensively on shared latches instead of exclusive latches,
+  improving concurrency.
+* Fix cursor race condition which allowed split nodes to be modified too soon, leading to
+  database corruption.
+* Fix deadlock when closing database.
+* Fix handling of mapped file shrinkage on Windows.
+* More fixes for random search and add improve safety of frame binding.
+* Added method to analyze index size.
+* Added capacity limit feature.
+* Added fully mapped mode when using direct page access and MappedPageArray.
+* Added method to evict records from an Index.
+* File sync improvements for Linux and MacOS. Performs directory sync'ng and F_FULLSYNC.
+* Use JNA to access native I/O functions, eliminating extra system calls.
+* Make Latch class a public utility.
+
+v1.2.7.1 (2015-12-22)
+--------
+* Fix defect in cursor skip which might operate against an unlatched node.
+
+v1.2.7 (2015-10-04)
+------
+* Fixed reverse view range handling.
+* Fixed compareKeyTo methods for transformed and trimmed views.
+* Require that bounded views only operate on ordered views.
+* Added method to count entries in a View.
+* Exposed a few more utility methods.
+* When using direct page access mode, page fields are no longer copied to Node instance
+  fields. This reduces overall Java heap memory footprint.
+
+v1.2.6.1 (2015-09-05)
+--------
+* Fix when using mapped files on Linux. Shrinking the database file would cause the process to
+  crash when the file is accessed again.
+
+v1.2.6 (2015-08-30)
+------
+* Counts stored in bottom internal nodes, for speeding up cursor skip operations.
+* Added skip method which accepts a limit key.
+* More failure handling improvements.
+
+v1.2.5 (2015-07-19)
+------
+* Fix non-transactional delete race condition.
+* Fixes for random cursor search, when encountering internal nodes with few entries or when
+  the search range is empty.
+* Bug fix for findNearby acting on a closed index.
+* Improvements for handling temporary write failures.
+* Allow replicas to create no-redo transactions.
+* Added option to change transaction durability mode.
+* Define an evict operation on the page array, for eliminating unnecessary copies.
+* Introduce concurrent cache priming.
+
+v1.2.4 (2015-06-14)
+------
+* Fix node delete race condition which triggered an assertion error.
+* Fix case in which a cursor value was not set if it caused a node merge.
+* Add basic AbstractCursor implementation.
+* Merge custom redo and undo handler interfaces into one.
+* Add checkpoint support to custom transaction handler.
+* Provide access to transaction nesting level.
+* Attempting to write into an unmodifiable transaction should not invalidate it.
+* Introduce combined store and commit operation.
+
 v1.2.3 (2015-05-16)
 ------
 * Fix snapshot deadlock when reading from the cache.

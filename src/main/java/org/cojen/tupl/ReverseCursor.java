@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -67,12 +67,12 @@ final class ReverseCursor implements Cursor {
 
     @Override
     public int compareKeyTo(byte[] rkey) {
-        return mSource.compareKeyTo(rkey);
+        return -mSource.compareKeyTo(rkey);
     }
 
     @Override
     public int compareKeyTo(byte[] rkey, int offset, int length) {
-        return mSource.compareKeyTo(rkey, offset, length);
+        return -mSource.compareKeyTo(rkey, offset, length);
     }
 
     @Override
@@ -97,6 +97,21 @@ final class ReverseCursor implements Cursor {
             return next();
         } else {
             return mSource.skip(-amount);
+        }
+    }
+
+    @Override
+    public LockResult skip(long amount, byte[] limitKey, boolean inclusive) throws IOException {
+        if (amount == Long.MIN_VALUE) {
+            LockResult result = mSource.skip(Long.MAX_VALUE, limitKey, inclusive);
+            if (mSource.key() == null) {
+                return result;
+            }
+            // Should release the lock if just acquired, although it's unlikely
+            // that an index will actually have 2^63 entries.
+            return next();
+        } else {
+            return mSource.skip(-amount, limitKey, inclusive);
         }
     }
 
@@ -162,7 +177,12 @@ final class ReverseCursor implements Cursor {
 
     @Override
     public LockResult random(byte[] lowKey, byte[] highKey) throws IOException {
-        return mSource.random(lowKey, highKey);
+        return mSource.random(ReverseView.appendZero(highKey), ReverseView.appendZero((lowKey)));
+    }
+
+    @Override
+    public LockResult lock() throws IOException {
+        return mSource.lock();
     }
 
     @Override
@@ -176,9 +196,16 @@ final class ReverseCursor implements Cursor {
     }
 
     @Override
+    public void commit(byte[] value) throws IOException {
+        mSource.commit(value);
+    }
+
+    /*
+    @Override
     public Stream newStream() {
         return mSource.newStream();
     }
+    */
 
     @Override
     public Cursor copy() {

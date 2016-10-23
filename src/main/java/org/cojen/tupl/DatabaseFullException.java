@@ -1,5 +1,5 @@
 /*
- *  Copyright 2014 Brian S O'Neill
+ *  Copyright 2014-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 package org.cojen.tupl;
 
 /**
- * Thrown when a non-durable database is full and no more data can be stored into it.
+ * Thrown when database is full and no more data can be stored into it.
  *
  * @author Brian S O'Neill
  */
@@ -25,6 +25,14 @@ public class DatabaseFullException extends DatabaseException {
     private static final long serialVersionUID = 1L;
 
     public DatabaseFullException() {
+    }
+
+    public DatabaseFullException(Throwable cause) {
+        super(cause);
+    }
+
+    public DatabaseFullException(String message) {
+        super(message);
     }
 
     @Override

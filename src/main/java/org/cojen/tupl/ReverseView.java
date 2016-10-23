@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,6 +38,11 @@ final class ReverseView implements View {
     @Override
     public Cursor newCursor(Transaction txn) {
         return new ReverseCursor(mSource.newCursor(txn));
+    }
+
+    @Override
+    public long count(byte[] lowKey, byte[] highKey) throws IOException {
+        return mSource.count(appendZero(highKey), appendZero((lowKey)));
     }
 
     @Override
@@ -83,6 +88,13 @@ final class ReverseView implements View {
     }
 
     @Override
+    public LockResult tryLockShared(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        return mSource.tryLockShared(txn, key, nanosTimeout);
+    }
+
+    @Override
     public LockResult lockShared(Transaction txn, byte[] key)
         throws LockFailureException, ViewConstraintException
     {
@@ -90,10 +102,24 @@ final class ReverseView implements View {
     }
 
     @Override
+    public LockResult tryLockUpgradable(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        return mSource.tryLockUpgradable(txn, key, nanosTimeout);
+    }
+
+    @Override
     public LockResult lockUpgradable(Transaction txn, byte[] key)
         throws LockFailureException, ViewConstraintException
     {
         return mSource.lockUpgradable(txn, key);
+    }
+
+    @Override
+    public LockResult tryLockExclusive(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        return mSource.tryLockExclusive(txn, key, nanosTimeout);
     }
 
     @Override
@@ -108,10 +134,12 @@ final class ReverseView implements View {
         return mSource.lockCheck(txn, key);
     }
 
+    /*
     @Override
     public Stream newStream() {
         return mSource.newStream();
     }
+    */
 
     @Override
     public View viewGe(byte[] key) {
@@ -156,5 +184,9 @@ final class ReverseView implements View {
     @Override
     public boolean isUnmodifiable() {
         return mSource.isUnmodifiable();
+    }
+
+    static byte[] appendZero(byte[] key) {
+        return key == null ? null : ViewUtils.appendZero(key);
     }
 }

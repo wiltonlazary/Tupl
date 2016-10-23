@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -103,7 +103,7 @@ public class LargeValueTest {
 
     @Test
     public void testUpdateLarger() throws Exception {
-        // Special regresion test, discovered when updating a fragmented value
+        // Special regression test, discovered when updating a fragmented value
         // to be slightly larger. The inline content length was between 1 and
         // 128 before and after. The node was split to make room, but the split
         // direction guess was wrong. This caused updateLeafValue to be called
@@ -136,10 +136,135 @@ public class LargeValueTest {
         assertTrue(ix.verify(null));
     }
 
-    private byte[] key(int i) {
+    @Test
+    public void testUpdateLargerAgain() throws Exception {
+        // Another update regression test. Update must not double split the node.
+
+        Index ix = mDb.openIndex("test");
+
+        Random rnd = new Random(123456);
+
+        byte[][] keys = new byte[4][];
+        byte[][] values = new byte[keys.length][];
+
+        for (int i=0; i<keys.length; i++) {
+            keys[i] = new byte[300];
+            rnd.nextBytes(keys[i]);
+            // Define key ordering.
+            keys[i][0] = (byte) i;
+        }
+
+        // Store carefully crafted entries, to force an incorrectly balanced split.
+        int[] sizes = {2200, 10, 300, 300};
+        assertEquals(keys.length, sizes.length);
+        for (int i=0; i<keys.length; i++) { 
+            values[i] = new byte[sizes[i]];
+            rnd.nextBytes(values[i]);
+            ix.store(Transaction.BOGUS, keys[i], values[i]);
+        }
+
+        // Update a value to be larger, forcing a split.
+        values[1] = new byte[2570];
+        rnd.nextBytes(values[1]);
+        ix.store(Transaction.BOGUS, keys[1], values[1]);
+
+        // Verify that all the entries are correct.
+        assertEquals(keys.length, ix.count(null, null));
+        for (int i=0; i<keys.length; i++) {
+            byte[] actual = ix.load(Transaction.BOGUS, keys[i]);
+            fastAssertArrayEquals(values[i], actual);
+        }
+    }
+
+    @Test
+    public void testUpdateLargerAgainAgain() throws Exception {
+        // Yet another update regression test. Update of large value into a split node must
+        // consider the key size when fragmenting.
+
+        Index ix = mDb.openIndex("test");
+
+        Random rnd = new Random(123456);
+
+        byte[][] keys = new byte[4][];
+        byte[][] values = new byte[keys.length][];
+
+        for (int i=0; i<keys.length; i++) {
+            keys[i] = new byte[300];
+            rnd.nextBytes(keys[i]);
+            // Define key ordering.
+            keys[i][0] = (byte) i;
+        }
+
+        // Store carefully crafted entries, to force an incorrectly balanced split.
+        int[] sizes = {1720, 0, 840, 300};
+        assertEquals(keys.length, sizes.length);
+        for (int i=0; i<keys.length; i++) { 
+            values[i] = new byte[sizes[i]];
+            rnd.nextBytes(values[i]);
+            ix.store(Transaction.BOGUS, keys[i], values[i]);
+        }
+
+        // Update a value to be larger, forcing a split. Value will be inline encoded if key
+        // size isn't considered, and it won't fit.
+        values[1] = new byte[2030];
+        rnd.nextBytes(values[1]);
+        ix.store(Transaction.BOGUS, keys[1], values[1]);
+
+        // Verify that all the entries are correct.
+        assertEquals(keys.length, ix.count(null, null));
+        for (int i=0; i<keys.length; i++) {
+            byte[] actual = ix.load(Transaction.BOGUS, keys[i]);
+            fastAssertArrayEquals(values[i], actual);
+        }
+    }
+
+    private static byte[] key(int i) {
         byte[] key = new byte[4];
         Utils.encodeIntBE(key, 0, i);
         return key;
     }
-        
+
+    @Test
+    public void largePageRecycle() throws Exception {
+        // Tests that as large pages with user content are recycled, that the header fields of
+        // new tree nodes are defined properly.
+
+        Index ix = mDb.openIndex("test");
+
+        {
+            byte[] value = new byte[4_000_000];
+            Arrays.fill(value, (byte) 0x55);
+            ix.store(Transaction.BOGUS, "hello".getBytes(), value);
+        }
+
+        for (int i=0; i<1_000_000; i++) {
+            ix.store(Transaction.BOGUS, ("key-" + i).getBytes(), (("value-" + i).getBytes()));
+        }
+
+        for (int i=0; i<1_000_000; i++) {
+            byte[] value = ix.load(Transaction.BOGUS, ("key-" + i).getBytes());
+            fastAssertArrayEquals(("value-" + i).getBytes(), value);
+        }
+
+        // Now test undo log nodes.
+
+        {
+            byte[] value = new byte[4_000_000];
+            Arrays.fill(value, (byte) 0x55);
+            ix.store(Transaction.BOGUS, "world".getBytes(), value);
+        }
+
+        Transaction txn = mDb.newTransaction();
+
+        for (int i=0; i<1_000_000; i++) {
+            ix.store(txn, ("akey-" + i).getBytes(), (("avalue-" + i).getBytes()));
+        }
+
+        txn.exit();
+
+        for (int i=0; i<1_000_000; i++) {
+            byte[] value = ix.load(Transaction.BOGUS, ("akey-" + i).getBytes());
+            assertNull(value);
+        }
+    }
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package org.cojen.tupl.ext;
 import java.io.Closeable;
 import java.io.IOException;
 
+import org.cojen.tupl.ConfirmationFailureException;
 import org.cojen.tupl.DatabaseConfig;
 import org.cojen.tupl.DurabilityMode;
 import org.cojen.tupl.EventListener;
@@ -102,24 +103,48 @@ public interface ReplicationManager extends Closeable {
         long position();
 
         /**
-         * Fully writes the given data, returning a confirmation position. When the local
-         * instance loses leadership, all data rolls back to the highest confirmed position.
+         * Invokes the given callback upon a leadership change. Callback should be invoked at
+         * most once, but extra invocations are ignored.
          *
-         * @return confirmation position, or -1 if not leader
+         * @return false if not leader
+         */
+        boolean leaderNotify(Runnable callback);
+
+        /**
+         * Fully writes the given data, returning a potential confirmation position. When the
+         * local instance loses leadership, all data rolls back to the highest confirmed
+         * position.
+         *
+         * @return potential confirmation position, or -1 if not leader
          */
         long write(byte[] b, int off, int len) throws IOException;
 
         /**
-         * Blocks until all data up to the given log position is confirmed.
+         * Same as the regular write method, except that the message contains a transaction
+         * commit operation. This variant exists to allow an implementation to capture the
+         * confirmation position of a transaction, in a thread-local variable.
          *
-         * @return false if not leader
-         * @throws ConfirmationFailureException
+         * @return potential confirmation position, or -1 if not leader
          */
-        boolean confirm(long position) throws IOException;
+        default long writeCommit(byte[] b, int off, int len) throws IOException {
+            return write(b, off, len);
+        }
 
         /**
          * Blocks until all data up to the given log position is confirmed.
          *
+         * @param position confirmation position as provided by the write method
+         * @return false if not leader
+         * @throws ConfirmationFailureException
+         */
+        default boolean confirm(long position) throws IOException {
+            return confirm(position, -1);
+        }
+
+        /**
+         * Blocks until all data up to the given log position is confirmed.
+         *
+         * @param position confirmation position as provided by the write method
          * @param timeoutNanos pass -1 for infinite
          * @return false if not leader
          * @throws ConfirmationFailureException
@@ -138,7 +163,9 @@ public interface ReplicationManager extends Closeable {
      *
      * @throws ConfirmationFailureException
      */
-    void syncConfirm(long position) throws IOException;
+    default void syncConfirm(long position) throws IOException {
+        syncConfirm(position, -1);
+    }
 
     /**
      * Durably flushes all local data to non-volatile storage, up to the given confirmed
@@ -169,7 +196,7 @@ public interface ReplicationManager extends Closeable {
      * @param key non-null key; contents must not be modified
      * @param value null if entry is deleted; contents can be modified
      */
-    void notifyStore(Index index, byte[] key, byte[] value);
+    default void notifyStore(Index index, byte[] key, byte[] value) {}
 
     /**
      * Notification to replica after an index is renamed. The current thread is free to perform
@@ -180,7 +207,7 @@ public interface ReplicationManager extends Closeable {
      * @param oldName non-null old index name
      * @param newName non-null new index name
      */
-    void notifyRename(Index index, byte[] oldName, byte[] newName);
+    default void notifyRename(Index index, byte[] oldName, byte[] newName) {}
 
     /**
      * Notification to replica after an index is dropped. The current thread is free to perform
@@ -189,7 +216,7 @@ public interface ReplicationManager extends Closeable {
      *
      * @param index non-null closed and dropped index reference
      */
-    void notifyDrop(Index index);
+    default void notifyDrop(Index index) {}
 
     /**
      * Forward a change from a replica to the leader. Change must arrive back through the input

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -96,6 +96,16 @@ abstract class SubView implements View {
     }
 
     @Override
+    public LockResult tryLockShared(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        if (inRange(key)) {
+            return mSource.tryLockShared(txn, key, nanosTimeout);
+        }
+        throw fail();
+    }
+
+    @Override
     public final LockResult lockShared(Transaction txn, byte[] key)
         throws LockFailureException, ViewConstraintException
     {
@@ -106,11 +116,31 @@ abstract class SubView implements View {
     }
 
     @Override
+    public LockResult tryLockUpgradable(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        if (inRange(key)) {
+            return mSource.tryLockUpgradable(txn, key, nanosTimeout);
+        }
+        throw fail();
+    }
+
+    @Override
     public final LockResult lockUpgradable(Transaction txn, byte[] key)
         throws LockFailureException, ViewConstraintException
     {
         if (inRange(key)) {
             return mSource.lockUpgradable(txn, key);
+        }
+        throw fail();
+    }
+
+    @Override
+    public final LockResult tryLockExclusive(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        if (inRange(key)) {
+            return mSource.tryLockExclusive(txn, key, nanosTimeout);
         }
         throw fail();
     }
@@ -133,10 +163,12 @@ abstract class SubView implements View {
         throw fail();
     }
 
+    /*
     @Override
     public Stream newStream() {
         return new SubStream(this, mSource.newStream());
     }
+    */
 
     @Override
     public View viewTransformed(Transformer transformer) {

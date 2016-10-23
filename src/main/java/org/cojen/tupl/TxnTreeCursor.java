@@ -1,5 +1,5 @@
 /*
- *  Copyright 2014 Brian S O'Neill
+ *  Copyright 2014-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import java.io.IOException;
  *
  * @author Brian S O'Neill
  */
+/*P*/
 final class TxnTreeCursor extends TreeCursor {
     TxnTreeCursor(TxnTree tree, Transaction txn) {
         super(tree, txn);
@@ -35,20 +36,17 @@ final class TxnTreeCursor extends TreeCursor {
     @Override
     public final void store(byte[] value) throws IOException {
         byte[] key = mKey;
-        if (key == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(key);
 
         try {
-            Transaction txn = mTxn;
-            final int hash = keyHash();
+            LocalTransaction txn = mTxn;
             if (txn == null) {
                 txn = mTree.mDatabase.newAlwaysRedoTransaction();
                 try {
                     if (txn.lockMode() != LockMode.UNSAFE) {
-                        txn.lockExclusive(mTree.mId, key, hash);
+                        txn.lockExclusive(mTree.mId, key, keyHash());
                     }
-                    store(txn, leafExclusive(), value, false);
+                    store(txn, leafExclusive(), value);
                     txn.commit();
                 } catch (Throwable e) {
                     txn.reset();
@@ -56,9 +54,32 @@ final class TxnTreeCursor extends TreeCursor {
                 }
             } else {
                 if (txn.lockMode() != LockMode.UNSAFE) {
-                    txn.lockExclusive(mTree.mId, key, hash);
+                    txn.lockExclusive(mTree.mId, key, keyHash());
                 }
-                store(txn, leafExclusive(), value, false);
+                store(txn, leafExclusive(), value);
+            }
+        } catch (Throwable e) {
+            throw handleException(e, false);
+        }
+    }
+
+    @Override
+    public final void commit(byte[] value) throws IOException {
+        byte[] key = mKey;
+        ViewUtils.positionCheck(key);
+
+        try {
+            LocalTransaction txn = mTxn;
+            if (txn == null) {
+                txn = mTree.mDatabase.newAlwaysRedoTransaction();
+                try {
+                    doCommit(txn, key, value);
+                } catch (Throwable e) {
+                    txn.reset();
+                    throw e;
+                }
+            } else {
+                doCommit(txn, key, value);
             }
         } catch (Throwable e) {
             throw handleException(e, false);

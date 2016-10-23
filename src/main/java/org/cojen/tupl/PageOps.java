@@ -1,5 +1,5 @@
 /*
- *  Copyright 2015 Brian S O'Neill
+ *  Copyright 2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,11 +20,7 @@ import java.io.IOException;
 
 import java.nio.ByteBuffer;
 
-import java.security.GeneralSecurityException;
-
 import java.util.zip.CRC32;
-
-import javax.crypto.Cipher;
 
 import static org.cojen.tupl.Utils.*;
 
@@ -34,12 +30,75 @@ import static org.cojen.tupl.Utils.*;
  * @author Brian S O'Neill
  */
 final class PageOps {
+    /*
+     * Approximate byte overhead per Node, assuming 32-bit pointers. Overhead is determined by
+     * examining all the fields in the Node class, including inherited ones. In addition, each
+     * Node is referenced by mNodeMapTable.
+     *
+     * References: 1 field per Node instance
+     * Node class: 18 fields (mId is counted twice)
+     * Latch class: 0 fields
+     * AbstractQueuedSynchronizer class: 3 fields
+     * AbstractOwnableSynchronizer class: 1 field
+     * Object class: Minimum 8 byte overhead
+     * Total: (23 * 4 + 8) = 100
+     */
+    static final int NODE_OVERHEAD = 100;
+
+    private static final byte[] CLOSED_TREE_PAGE;
+    private static final byte[] STUB_TREE_PAGE;
+
+    static {
+        CLOSED_TREE_PAGE = newEmptyTreeLeafPage();
+        STUB_TREE_PAGE = newEmptyTreePage(Node.TN_HEADER_SIZE + 8, Node.TYPE_TN_IN);
+    }
+
+    private static /*P*/ byte[] newEmptyTreeLeafPage() {
+        return newEmptyTreePage
+            (Node.TN_HEADER_SIZE, Node.TYPE_TN_LEAF | Node.LOW_EXTREMITY | Node.HIGH_EXTREMITY);
+    }
+
+    private static /*P*/ byte[] newEmptyTreePage(int pageSize, int type) {
+        byte[] empty = new byte[pageSize];
+
+        empty[0] = (byte) type;
+
+        // Set fields such that binary search returns ~0 and availableBytes returns 0.
+
+        // Note: Same as Node.clearEntries.
+        p_shortPutLE(empty, 4,  Node.TN_HEADER_SIZE);     // leftSegTail
+        p_shortPutLE(empty, 6,  pageSize - 1);            // rightSegTail
+        p_shortPutLE(empty, 8,  Node.TN_HEADER_SIZE);     // searchVecStart
+        p_shortPutLE(empty, 10, Node.TN_HEADER_SIZE - 2); // searchVecEnd
+
+        return empty;
+    }
+
     static /*P*/ byte[] p_null() {
         return null;
     }
 
-    static /*P*/ byte[] p_empty() {
-        return EMPTY_BYTES;
+    /**
+     * Returned page is 12 bytes, defining a closed tree leaf node. Contents must not be
+     * modified.
+     */
+    static /*P*/ byte[] p_closedTreePage() {
+        return CLOSED_TREE_PAGE;
+    }
+
+    /**
+     * Returned page is 20 bytes, defining a tree stub node. Contents must not be modified.
+     *
+     * A stub is an internal node (TYPE_TN_IN), no extremity bits set, with a single child id
+     * of zero. Stubs are encountered by cursors when popping up, which only happens during
+     * cursor iteration (next/previous), findNearby, and reset. Cursor iteration stops when it
+     * encounters a stub node, because it has no more children. The findNearby method might
+     * search into the child node, but this is prohibited. When the extremity bits are clear,
+     * findNearby keeps popping up until no more nodes are found. Then it starts over from the
+     * root node.
+     */
+    static /*P*/ byte[] p_stubTreePage() {
+        return STUB_TREE_PAGE;
     }
 
     static /*P*/ byte[] p_alloc(int size) {
@@ -57,7 +116,37 @@ final class PageOps {
     static void p_delete(/*P*/ byte[] page) {
     }
 
-    static /*P*/ byte[] p_clone(/*P*/ byte[] page) {
+    /**
+     * Allocates an "arena", which contains a fixed number of pages. Pages in an arena cannot
+     * be deleted, and calling p_delete on arena pages does nothing. Call p_arenaDelete to
+     * fully delete the entire arena when not used anymore.
+     *
+     * @return null if not supported
+     */
+    static Object p_arenaAlloc(int pageSize, long pageCount) throws IOException {
+        return null;
+    }
+
+    /**
+     * @throws IllegalArgumentException if unknown arena
+     */
+    static void p_arenaDelete(Object arena) throws IOException {
+        if (arena != null) {
+            throw new IllegalArgumentException();
+        }
+    }
+
+    /**
+     * Allocate a zero-filled page from an arena. If arena is null or depleted, then a regular
+     * page is allocated.
+     *
+     * @throws IllegalArgumentException if unknown arena or if page size doesn't match
+     */
+    static /*P*/ byte[] p_calloc(Object arena, int size) {
+        return p_calloc(size);
+    }
+
+    static /*P*/ byte[] p_clone(/*P*/ byte[] page, int length) {
         return page.clone();
     }
 
@@ -77,10 +166,6 @@ final class PageOps {
      */
     static /*P*/ byte[] p_transferTo(byte[] array, /*P*/ byte[] page) {
         return array;
-    }
-
-    static int p_length(/*P*/ byte[] page) {
-        return page.length;
     }
 
     static byte p_byteGet(/*P*/ byte[] page, int index) {
@@ -163,10 +248,6 @@ final class PageOps {
         return calcUnsignedVarLongLength(v);
     }
 
-    static void p_clear(/*P*/ byte[] page) {
-        java.util.Arrays.fill(page, (byte) 0);
-    }
-
     static void p_clear(/*P*/ byte[] page, int fromIndex, int toIndex) {
         java.util.Arrays.fill(page, fromIndex, toIndex, (byte) 0);
     }
@@ -242,54 +323,36 @@ final class PageOps {
     static int p_compareKeysPageToArray(/*P*/ byte[] apage, int aoff, int alen,
                                         byte[] b, int boff, int blen)
     {
-        return compareKeys(apage, aoff, alen, b, boff, blen);
+        return compareUnsigned(apage, aoff, alen, b, boff, blen);
     }
 
     static int p_compareKeysPageToPage(/*P*/ byte[] apage, int aoff, int alen,
                                        /*P*/ byte[] bpage, int boff, int blen)
     {
-        return compareKeys(apage, aoff, alen, bpage, boff, blen);
+        return compareUnsigned(apage, aoff, alen, bpage, boff, blen);
     }
 
     static byte[] p_midKeyLowPage(/*P*/ byte[] lowPage, int lowOff, int lowLen,
-                                  /*P*/ byte[] high, int highOff, int highLen)
+                                  byte[] high, int highOff)
     {
-        return midKey(lowPage, lowOff, lowLen, high, highOff, highLen);
+        return midKey(lowPage, lowOff, lowLen, high, highOff);
     }
 
     static byte[] p_midKeyHighPage(byte[] low, int lowOff, int lowLen,
-                                   /*P*/ byte[] highPage, int highOff, int highLen)
+                                   /*P*/ byte[] highPage, int highOff)
     {
-        return midKey(low, lowOff, lowLen, highPage, highOff, highLen);
+        return midKey(low, lowOff, lowLen, highPage, highOff);
     }
 
     static byte[] p_midKeyLowHighPage(/*P*/ byte[] lowPage, int lowOff, int lowLen,
-                                      /*P*/ byte[] highPage, int highOff, int highLen)
+                                      /*P*/ byte[] highPage, int highOff)
     {
-        return midKey(lowPage, lowOff, lowLen, highPage, highOff, highLen);
+        return midKey(lowPage, lowOff, lowLen, highPage, highOff);
     }
 
     static int p_crc32(/*P*/ byte[] srcPage, int srcStart, int len) {
         CRC32 crc = new CRC32();
         crc.update(srcPage, srcStart, len);
         return (int) crc.getValue();
-    }
-
-    static int p_cipherDoFinal(Cipher cipher,
-                               /*P*/ byte[] srcPage, int srcStart, int srcLen,
-                               /*P*/ byte[] dstPage, int dstStart)
-        throws GeneralSecurityException
-    {
-        return cipher.doFinal(srcPage, srcStart, srcLen, dstPage, dstStart);
-    }
-
-    /**
-     * Not very low-level, but this is much simpler.
-     */
-    static void p_undoPush(UndoLog undo, long indexId, byte op,
-                           /*P*/ byte[] payload, int off, int len)
-        throws IOException
-    {
-        undo.push(indexId, op, payload, off, len);
     }
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -173,69 +173,40 @@ final class BoundedCursor implements Cursor {
 
     @Override
     public LockResult skip(long amount) throws IOException {
-        if (amount == 0) {
+        BoundedView view = mView;
+        byte[] limitKey;
+        boolean inclusive;
+        if (amount >= 0) {
+            limitKey = view.mEnd;
+            inclusive = (view.mMode & END_EXCLUSIVE) == 0;
+        } else {
+            limitKey = view.mStart;
+            inclusive = (view.mMode & START_EXCLUSIVE) == 0;
+        }
+        return mSource.skip(amount, limitKey, inclusive);
+    }
+
+    @Override
+    public LockResult skip(long amount, byte[] limitKey, boolean inclusive) throws IOException {
+        if (amount == 0 || limitKey == null) {
             return mSource.skip(0);
         }
 
         BoundedView view = mView;
 
-        final Cursor source;
         if (amount > 0) {
-            byte[] end = view.mEnd;
-            if (end == null) {
-                return mSource.skip(amount);
-            }
-
-            source = mSource;
-            final Transaction txn = source.link(Transaction.BOGUS);
-            final boolean autoload = source.autoload(false);
-            try {
-                do {
-                    source.next();
-
-                    byte[] key = source.key();
-                    if (key == null) {
-                        return LockResult.UNOWNED;
-                    }
-                    if (view.endRangeCompare(end, key) > 0) {
-                        source.reset();
-                        return LockResult.UNOWNED;
-                    }
-                } while (--amount > 0);
-            } finally {
-                autoload(autoload);
-                link(txn);
+            if (view.endRangeCompare(limitKey) > 0) {
+                limitKey = view.mEnd;
+                inclusive = (view.mMode & END_EXCLUSIVE) == 0;
             }
         } else {
-            byte[] start = view.mStart;
-            if (start == null) {
-                return mSource.skip(amount);
-            }
-
-            source = mSource;
-            final Transaction txn = source.link(Transaction.BOGUS);
-            final boolean autoload = source.autoload(false);
-            try {
-                do {
-                    source.previous();
-
-                    byte[] key = source.key();
-                    if (key == null) {
-                        return LockResult.UNOWNED;
-                    }
-                    if (view.startRangeCompare(start, key) < 0) {
-                        source.reset();
-                        return LockResult.UNOWNED;
-                    }
-                } while (++amount < 0);
-            } finally {
-                autoload(autoload);
-                link(txn);
+            if (view.startRangeCompare(limitKey) < 0) {
+                limitKey = view.mStart;
+                inclusive = (view.mMode & START_EXCLUSIVE) == 0;
             }
         }
 
-        // This performs any required lock acquisition.
-        return source.load();
+        return mSource.skip(amount, limitKey, inclusive);
     }
 
     @Override
@@ -458,26 +429,12 @@ final class BoundedCursor implements Cursor {
 
     @Override
     public LockResult random(byte[] lowKey, byte[] highKey) throws IOException {
-        BoundedView view = mView;
-        if (lowKey == null || view.startRangeCompare(lowKey) < 0) {
-            if ((lowKey = view.mStart) != null && (view.mMode & START_EXCLUSIVE) != 0) {
-                // Switch to exclusive start behavior.
-                lowKey = appendZero(lowKey);
-            }
-        }
-        if (highKey == null || view.endRangeCompare(highKey) > 0) {
-            if ((highKey = view.mEnd) != null && (view.mMode & END_EXCLUSIVE) == 0) {
-                // Switch to inclusive end behavior.
-                highKey = appendZero(highKey);
-            }
-        }
-        return mSource.random(lowKey, highKey);
+        return mSource.random(mView.adjustLowKey(lowKey), mView.adjustHighKey(highKey));
     }
 
-    private static byte[] appendZero(byte[] key) {
-        byte[] newKey = new byte[key.length + 1];
-        System.arraycopy(key, 0, newKey, 0, key.length);
-        return newKey;
+    @Override
+    public LockResult lock() throws IOException {
+        return mSource.lock();
     }
 
     @Override
@@ -491,9 +448,16 @@ final class BoundedCursor implements Cursor {
     }
 
     @Override
+    public void commit(byte[] value) throws IOException {
+        mSource.commit(value);
+    }
+
+    /*
+    @Override
     public Stream newStream() {
         return new SubStream(mView, mSource.newStream());
     }
+    */
 
     @Override
     public Cursor copy() {

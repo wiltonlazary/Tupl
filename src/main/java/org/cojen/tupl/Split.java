@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -51,11 +51,18 @@ final class Split {
     }
 
     /**
+     * @return null if key is not fragmented
+     */
+    final byte[] fragmentedKey() {
+        return mFullKey == mActualKey ? null : mActualKey;
+    }
+
+    /**
      * Compares to the split key, returning <0 if given key is lower, 0 if
      * equal, >0 if greater.
      */
     final int compare(byte[] key) {
-        return Utils.compareKeys(key, 0, key.length, mFullKey, 0, mFullKey.length);
+        return Utils.compareUnsigned(key, 0, key.length, mFullKey, 0, mFullKey.length);
     }
 
     /**
@@ -67,7 +74,7 @@ final class Split {
      * @param node node which was split; shared latch must be held
      * @return original node or sibling
      */
-    final Node selectNodeShared(Node node, byte[] key) {
+    final Node selectNode(Node node, byte[] key) {
         Node sibling = mSibling;
         sibling.acquireShared();
 
@@ -90,40 +97,65 @@ final class Split {
     }
 
     /**
-     * Allows a search/insert/update to continue into a split node by selecting the
-     * original node or the sibling. If the original node is returned, its exclusive lock
-     * is still held. If the sibling is returned, it will have an exclusive latch held and
-     * the original node's latch is released.
+     * When binding to a node which is in a split state, the position must be adjusted in order
+     * for rebindFrame to work properly. The position cannot be used for accessing entries
+     * until after rebindFrame is called, or if retrieveLeafValue is called.
      *
-     * @param node node which was split; exclusive latch must be held
-     * @return original node or sibling
+     * @param pos non-negative bind position
+     * @return adjusted bind position
      */
-    final Node selectNodeExclusive(Node node, byte[] key) {
-        Node sibling = latchSibling();
+    final int adjustBindPosition(int pos) {
+        if (!mSplitRight) {
+            // To prevent the rebind operation from breaking things, the position must be
+            // defined as though it was created before the node was split. When rebindFrame is
+            // called, the position is moved to the correct location.
+            Node sibling = latchSibling();
+            pos += sibling.highestPos() + 2;
+            sibling.releaseShared();
+        }
 
-        Node left, right;
+        return pos;
+    }
+
+    /**
+     * Retrieves a value from a split node, by selecting the sibling node or by adjusting the
+     * bind position. Given position must not be negative.
+     *
+     * @param node split applies to this node
+     * @param pos non-negative bind position
+     */
+    final byte[] retrieveLeafValue(Node node, int pos) throws IOException {
         if (mSplitRight) {
-            left = node;
-            right = sibling;
+            int highestPos = node.highestPos();
+            if (pos > highestPos) {
+                Node sibling = latchSibling();
+                try {
+                    return sibling.retrieveLeafValue(pos - highestPos - 2);
+                } finally {
+                    sibling.releaseShared();
+                }
+            }
         } else {
-            left = sibling;
-            right = node;
+            Node sibling = latchSibling();
+            try {
+                int highestPos = sibling.highestPos();
+                if (pos <= highestPos) {
+                    return sibling.retrieveLeafValue(pos);
+                }
+                pos = pos - highestPos - 2;
+            } finally {
+                sibling.releaseShared();
+            }
         }
 
-        if (compare(key) < 0) {
-            right.releaseExclusive();
-            return left;
-        } else {
-            left.releaseExclusive();
-            return right;
-        }
+        return node.retrieveLeafValue(pos);
     }
 
     /**
      * Performs a binary search against the split, returning the position
      * within the original node as if it had not split.
      */
-    final int binarySearch(Node node, byte[] key) throws IOException {
+    final int binarySearchLeaf(Node node, byte[] key) throws IOException {
         Node sibling = latchSibling();
 
         Node left, right;
@@ -148,39 +180,39 @@ final class Split {
             }
         }
 
-        sibling.releaseExclusive();
+        sibling.releaseShared();
 
         return searchPos;
     }
 
     /**
-     * Return the left split node, latched exclusively. Other node is unlatched.
+     * Returns the highest position within the original node as if it had not split.
      */
-    final Node latchLeft(Node node) {
-        if (mSplitRight) {
-            return node;
-        }
+    final int highestPos(Node node) {
+        int pos;
         Node sibling = latchSibling();
-        node.releaseExclusive();
-        return sibling;
+        if (node.isLeaf()) {
+            pos = node.highestLeafPos() + 2 + sibling.highestLeafPos();
+        } else {
+            pos = node.highestInternalPos() + 2 + sibling.highestInternalPos();
+        }
+        sibling.releaseShared();
+        return pos;
     }
 
     /**
-     * Return the right split node, latched exclusively. Other node is unlatched.
+     * @return sibling with shared latch held
      */
-    final Node latchRight(Node node) {
-        if (mSplitRight) {
-            Node sibling = latchSibling();
-            node.releaseExclusive();
-            return sibling;
-        }
-        return node;
+    final Node latchSibling() {
+        Node sibling = mSibling;
+        sibling.acquireShared();
+        return sibling;
     }
 
     /**
      * @return sibling with exclusive latch held
      */
-    final Node latchSibling() {
+    final Node latchSiblingEx() {
         Node sibling = mSibling;
         sibling.acquireExclusive();
         return sibling;
@@ -189,19 +221,23 @@ final class Split {
     /**
      * @param frame frame affected by split; exclusive latch for sibling must also be held
      */
-    final void rebindFrame(TreeCursorFrame frame, Node sibling) {
-        Node node = frame.mNode;
+    final void rebindFrame(CursorFrame frame, Node sibling) {
         int pos = frame.mNodePos;
 
         if (mSplitRight) {
-            int highestPos = node.highestPos();
+            Node frameNode = frame.mNode;
+            if (frameNode == null) {
+                // Frame is being concurrently unbound.
+                return;
+            }
+
+            int highestPos = frameNode.highestPos();
 
             if (pos >= 0) {
                 if (pos <= highestPos) {
                     // Nothing to do.
                 } else {
-                    frame.unbind();
-                    frame.bind(sibling, pos - highestPos - 2);
+                    frame.rebind(sibling, pos - highestPos - 2);
                 }
                 return;
             }
@@ -215,21 +251,19 @@ final class Split {
 
             if (pos == highestPos + 2) {
                 byte[] key = frame.mNotFoundKey;
-                if (compare(key) < 0) {
+                if (key == null || compare(key) < 0) {
                     // Nothing to do.
                     return;
                 }
             }
 
-            frame.unbind();
-            frame.bind(sibling, ~(pos - highestPos - 2));
+            frame.rebind(sibling, ~(pos - highestPos - 2));
         } else {
             int highestPos = sibling.highestPos();
 
             if (pos >= 0) {
                 if (pos <= highestPos) {
-                    frame.unbind();
-                    frame.bind(sibling, pos);
+                    frame.rebind(sibling, pos);
                 } else {
                     frame.mNodePos = pos - highestPos - 2;
                 }
@@ -239,16 +273,17 @@ final class Split {
             pos = ~pos;
 
             if (pos <= highestPos) {
-                frame.unbind();
-                frame.bind(sibling, ~pos);
+                frame.rebind(sibling, ~pos);
                 return;
             }
 
             if (pos == highestPos + 2) {
                 byte[] key = frame.mNotFoundKey;
+                if (key == null) {
+                    return;
+                }
                 if (compare(key) < 0) {
-                    frame.unbind();
-                    frame.bind(sibling, ~pos);
+                    frame.rebind(sibling, ~pos);
                     return;
                 }
             }

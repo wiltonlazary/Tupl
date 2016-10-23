@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -504,18 +504,25 @@ public class CrudTest {
         assertEquals(0, count(ix));
     }
 
-    static int count(View ix) throws Exception {
-        int count1 = 0;
+    static long count(View ix) throws Exception {
+        long count0 = ix.count(null, null);
+
+        long count1 = 0;
         Cursor c = ix.newCursor(Transaction.BOGUS);
         c.autoload(false);
         for (c.first(); c.key() != null; c.next()) {
             count1++;
         }
-        int count2 = 0;
+
+        assertEquals(count0, count1);
+
+        long count2 = 0;
         for (c.last(); c.key() != null; c.previous()) {
             count2++;
         }
-        assertEquals(count1, count2);
-        return count1;
+
+        assertEquals(count0, count2);
+
+        return count0;
     }
 }

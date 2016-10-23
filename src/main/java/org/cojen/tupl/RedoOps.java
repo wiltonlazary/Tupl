@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -42,6 +42,9 @@ class RedoOps {
 
         /** random: long */
         OP_NOP_RANDOM = 6,
+
+        /** txnId: long */
+        OP_TXN_ID_RESET = 7,
 
         /** indexId: long, keyLength: varInt, key: bytes, valueLength: varInt, value: bytes */
         OP_STORE = 16,

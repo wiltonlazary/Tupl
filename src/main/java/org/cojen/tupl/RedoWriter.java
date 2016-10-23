@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ package org.cojen.tupl;
 import java.io.Flushable;
 import java.io.IOException;
 
+import java.util.Random;
+
 import org.cojen.tupl.io.CauseCloseable;
 
 import static org.cojen.tupl.RedoOps.*;
@@ -30,7 +32,8 @@ import static org.cojen.tupl.Utils.*;
  * @author Brian S O'Neill
  * @see RedoDecoder
  */
-abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flushable {
+/*P*/
+abstract class RedoWriter implements CauseCloseable, ShutdownHook, Flushable {
     private final byte[] mBuffer;
     private int mBufferPos;
 
@@ -56,9 +59,7 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
     public long store(long indexId, byte[] key, byte[] value, DurabilityMode mode)
         throws IOException
     {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
 
         synchronized (this) {
             if (value == null) {
@@ -89,9 +90,7 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
     public long storeNoLock(long indexId, byte[] key, byte[] value, DurabilityMode mode)
         throws IOException
     {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
 
         synchronized (this) {
             if (value == null) {
@@ -188,7 +187,7 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
      * @param txn transaction committed
      * @param commitPos highest position to sync (exclusive)
      */
-    public void txnCommitSync(Transaction txn, long commitPos) throws IOException {
+    public void txnCommitSync(LocalTransaction txn, long commitPos) throws IOException {
         sync(false);
     }
 
@@ -204,9 +203,7 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
     public synchronized void txnStore(byte op, long txnId, long indexId, byte[] key, byte[] value)
         throws IOException
     {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         writeTxnOp(op, txnId);
         writeLongLE(indexId);
         writeUnsignedVarInt(key.length);
@@ -216,17 +213,37 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
         writeTerminator();
     }
 
+    /**
+     * @return non-zero position if caller should call txnCommitSync
+     */
+    public synchronized long txnStoreCommitFinal(long txnId, long indexId,
+                                                 byte[] key, byte[] value, DurabilityMode mode)
+        throws IOException
+    {
+        txnStore(OP_TXN_STORE_COMMIT_FINAL, txnId, indexId, key, value);
+        return commitFlush(mode);
+    }
+
     public synchronized void txnDelete(byte op, long txnId, long indexId, byte[] key)
         throws IOException
     {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         writeTxnOp(op, txnId);
         writeLongLE(indexId);
         writeUnsignedVarInt(key.length);
         writeBytes(key);
         writeTerminator();
+    }
+
+    /**
+     * @return non-zero position if caller should call txnCommitSync
+     */
+    public synchronized long txnDeleteCommitFinal(long txnId, long indexId,
+                                                  byte[] key, DurabilityMode mode)
+        throws IOException
+    {
+        txnDelete(OP_TXN_DELETE_COMMIT_FINAL, txnId, indexId, key);
+        return commitFlush(mode);
     }
 
     public synchronized void txnCustom(long txnId, byte[] message)
@@ -244,9 +261,7 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
     public synchronized void txnCustomLock(long txnId, byte[] message, long indexId, byte[] key)
         throws IOException
     {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        keyCheck(key);
         if (message == null) {
             throw new NullPointerException("Message is null");
         }
@@ -271,7 +286,7 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
     }
 
     public synchronized void nopRandom() throws IOException {
-        writeOp(OP_NOP_RANDOM, random().nextLong());
+        writeOp(OP_NOP_RANDOM, new Random().nextLong());
         writeTerminator();
         flush();
     }
@@ -281,9 +296,9 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
         doFlush();
     }
 
-    public void sync() throws IOException {
+    public void flushSync(boolean metadata) throws IOException {
         flush();
-        sync(false);
+        sync(metadata);
     }
 
     @Override
@@ -395,14 +410,32 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
     abstract void checkpointStarted() throws IOException;
 
     /**
+     * Called after all dirty pages have flushed.
+     */
+    abstract void checkpointFlushed() throws IOException;
+
+    /**
      * Writer can discard all redo data lower than the checkpointed position, which was
      * captured earlier.
      */
     abstract void checkpointFinished() throws IOException;
 
+    /**
+     * @throws UnmodifiableReplicaException if a replica
+     */
     // Caller must be synchronized.
     void opWriteCheck() throws IOException {
-        // Always writable by default.
+        // Non-replica by default.
+    }
+
+    /**
+     * Negate the identifier if a replica, but leave alone otherwise.
+     *
+     * @param id new transaction identifier; greater than zero
+     */
+    long adjustTransactionId(long txnId) {
+        // Non-replica by default.
+        return txnId;
     }
 
     /**
@@ -546,11 +579,11 @@ abstract class RedoWriter implements CauseCloseable, Checkpointer.Shutdown, Flus
 
     // Caller must be synchronized.
     private void doFlush(byte[] buffer, int len) throws IOException {
-        // Discard buffer even if the write fails. Caller is expected to
-        // rollback the transaction, and so redo is not used.
         try {
-            mBufferPos = 0;
             write(buffer, len);
+            // Discard only if write succeeds. Although caller is expected to rollback, redo
+            // entries from other transactions might also exist.
+            mBufferPos = 0;
         } catch (IOException e) {
             throw rethrow(e, mCause);
         }

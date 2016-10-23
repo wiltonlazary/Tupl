@@ -1,5 +1,5 @@
 /*
- *  Copyright 2015 Brian S O'Neill
+ *  Copyright 2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -21,18 +21,23 @@ package org.cojen.tupl;
  *
  * @author Brian S O'Neill
  */
-class LockOwner {
+/*P*/
+abstract class LockOwner {
+    private final int mHash;
+
     // LockOwner is currently waiting to acquire this lock. Used for deadlock detection.
     Lock mWaitingFor;
 
-    private int mHashCode;
+    LockOwner() {
+        mHash = Utils.cheapRandom();
+    }
 
     @Override
     public final int hashCode() {
-        int hash = mHashCode;
-        if (hash == 0) {
-            mHashCode = hash = Utils.randomSeed();
-        }
-        return hash;
+        return mHash;
     }
+
+    public abstract void attach(Object obj);
+
+    public abstract Object attachment();
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2015 Brian S O'Neill
+ *  Copyright 2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -56,6 +56,7 @@ class Hasher {
         return INSTANCE.doHash(hash, b);
     }
 
+    @SuppressWarnings("fallthrough")
     long doHash(long hash, byte[] b) {
         int len = b.length;
         hash ^= len;
@@ -99,7 +100,7 @@ class Hasher {
 
     static Unsafe getUnsafe() {
         if (INSTANCE instanceof UnsafeLE) {
-            return ((UnsafeLE) INSTANCE).UNSAFE;
+            return UnsafeLE.UNSAFE;
         }
         return null;
     }
@@ -124,6 +125,7 @@ class Hasher {
         }
 
         @Override
+        @SuppressWarnings("fallthrough")
         long doHash(long hash, byte[] b) {
             int len = b.length;
             hash ^= len;

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 package org.cojen.tupl;
 
+import java.io.IOException;
 import java.io.Serializable;
 
 import java.util.Set;
@@ -29,34 +30,17 @@ import java.util.Set;
 public final class DeadlockSet implements Serializable {
     private static final long serialVersionUID = 1L;
 
-    private final long[] mIndexIds;
-    private final byte[][] mKeys;
+    private final OwnerInfo[] mInfoSet;
 
-    DeadlockSet(Set<Lock> locks) {
-        int size = locks.size();
-        long[] indexIds = new long[size];
-        byte[][] keys = new byte[size][];
-
-        int i = 0;
-        for (Lock lock : locks) {
-            indexIds[i] = lock.mIndexId;
-            byte[] key = lock.mKey;
-            if (key != null) {
-                key = key.clone();
-            }
-            keys[i] = key;
-            i++;
-        }
-
-        mIndexIds = indexIds;
-        mKeys = keys;
+    DeadlockSet(OwnerInfo[] infoSet) {
+        mInfoSet = infoSet;
     }
 
     /**
      * @return number of elements in the set
      */
     public int size() {
-        return mIndexIds.length;
+        return mInfoSet.length;
     }
 
     /**
@@ -64,7 +48,34 @@ public final class DeadlockSet implements Serializable {
      * @throws IndexOutOfBoundsException
      */
     public long getIndexId(int pos) {
-        return mIndexIds[pos];
+        return mInfoSet[pos].mIndexId;
+    }
+
+    /**
+     * @return the lock request index name at the given set position, possibly null
+     * @throws IndexOutOfBoundsException
+     */
+    public byte[] getIndexName(int pos) {
+        return mInfoSet[pos].mIndexName;
+    }
+
+    /**
+     * @return the lock request index name string at the given set position, possibly null
+     * @throws IndexOutOfBoundsException
+     */
+    public String getIndexNameString(int pos) {
+        return indexNameString(getIndexName(pos));
+    }
+
+    private static String indexNameString(byte[] name) {
+        if (name == null) {
+            return null;
+        }
+        try {
+            return new String(name, "UTF-8");
+        } catch (IOException e) {
+            return new String(name);
+        }
     }
 
     /**
@@ -72,7 +83,15 @@ public final class DeadlockSet implements Serializable {
      * @throws IndexOutOfBoundsException
      */
     public byte[] getKey(int pos) {
-        return mKeys[pos];
+        return mInfoSet[pos].mKey;
+    }
+
+    /**
+     * @return the lock owner attachment at the given set position, possibly null
+     * @throws IndexOutOfBoundsException
+     */
+    public Object getOwnerAttachment(int pos) {
+        return mInfoSet[pos].mAttachment;
     }
 
     @Override
@@ -84,15 +103,37 @@ public final class DeadlockSet implements Serializable {
     }
 
     void appendMembers(StringBuilder b) {
-        for (int i=0; i<mIndexIds.length; i++) {
+        for (int i=0; i<mInfoSet.length; i++) {
+            OwnerInfo info = mInfoSet[i];
             if (i > 0) {
                 b.append(", ");
             }
             b.append('{');
-            b.append("indexId").append(": ").append(mIndexIds[i]);
+            b.append("indexId").append(": ").append(info.mIndexId);
             b.append(", ");
-            b.append("key").append(": ").append(Utils.toHex(mKeys[i]));
+
+            String name = indexNameString(info.mIndexName);
+            if (name != null) {
+                b.append("indexName").append(": ").append(name);
+                b.append(", ");
+            }
+
+            b.append("key").append(": ").append(Utils.toHex(info.mKey));
+
+            Object att = info.mAttachment;
+            if (att != null) {
+                b.append(", ");
+                b.append("attachment").append(": ").append(att);
+            }
+
             b.append('}');
         }
+    }
+
+    static class OwnerInfo {
+        long mIndexId;
+        byte[] mIndexName;
+        byte[] mKey;
+        Object mAttachment;
     }
 }

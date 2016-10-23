@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package org.cojen.tupl;
 
 import java.util.Random;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.*;
 import static org.junit.Assert.*;
@@ -420,6 +421,36 @@ public class CursorTest {
     }
 
     @Test
+    public void previousGeSkip() throws Exception {
+        View ix = openIndex("test");
+        ix.store(Transaction.BOGUS, key(0), value(0));
+        ix.store(Transaction.BOGUS, key(1), value(1));
+        ix.store(Transaction.BOGUS, key(2), value(2));
+
+        Cursor c = ix.newCursor(null);
+        c.last();
+
+        // Lock key 1.
+        Transaction txn = mDb.newTransaction();
+        ix.lockExclusive(txn, key(1));
+
+        // Wait and then delete the key.
+        new Thread(() -> {
+            try {
+                Thread.sleep(500);
+                ix.delete(txn, key(1));
+                txn.commit();
+            } catch (Exception e) {
+            }
+        }).start();
+
+        // Must fully skip past key 1.
+        c.previousGe(key(0));
+
+        fastAssertArrayEquals(value(0), c.value());
+    }
+
+    @Test
     public void nextLe() throws Exception {
         nextLe(3);
         nextLe(4);
@@ -477,6 +508,36 @@ public class CursorTest {
         fastAssertArrayEquals(value(1), c.value());
 
         c.reset();
+    }
+
+    @Test
+    public void nextLeSkip() throws Exception {
+        View ix = openIndex("test");
+        ix.store(Transaction.BOGUS, key(0), value(0));
+        ix.store(Transaction.BOGUS, key(1), value(1));
+        ix.store(Transaction.BOGUS, key(2), value(2));
+
+        Cursor c = ix.newCursor(null);
+        c.first();
+
+        // Lock key 1.
+        Transaction txn = mDb.newTransaction();
+        ix.lockExclusive(txn, key(1));
+
+        // Wait and then delete the key.
+        new Thread(() -> {
+            try {
+                Thread.sleep(500);
+                ix.delete(txn, key(1));
+                txn.commit();
+            } catch (Exception e) {
+            }
+        }).start();
+
+        // Must fully skip past key 1.
+        c.nextLe(key(2));
+
+        fastAssertArrayEquals(value(2), c.value());
     }
 
     @Test
@@ -654,6 +715,133 @@ public class CursorTest {
     }
 
     @Test
+    public void bigSkip() throws Exception {
+        View ix = openIndex("skippy");
+
+        for (int i=0; i<1_000_000; i++) {
+            ix.store(Transaction.BOGUS, key(i), value(1));
+        }
+
+        // Force leaf pages to be clean for accumulating counts.
+        mDb.checkpoint();
+
+        Cursor c = ix.newCursor(null);
+
+        // Force counts to be generated.
+        c.first();
+        c.skip(10_000);
+        fastAssertArrayEquals(key(10_000), c.key());
+
+        // Force counts to be persisted.
+        mDb.checkpoint();
+
+        c.first();
+        c.skip(10_000);
+        fastAssertArrayEquals(key(10_000), c.key());
+
+        c.skip(900_000);
+        fastAssertArrayEquals(key(910_000), c.key());
+
+        // Force counts to be persisted.
+        mDb.checkpoint();
+
+        c.last();
+        c.skip(-9_999);
+        fastAssertArrayEquals(key(990_000), c.key());
+
+        c.skip(-980_000);
+        fastAssertArrayEquals(key(10_000), c.key());
+
+        c.skip(Long.MIN_VALUE);
+        assertNull(c.key());
+
+        try {
+            c.skip(Long.MAX_VALUE);
+            fail();
+        } catch (IllegalStateException e) {
+        }
+    }
+
+    @Test
+    public void bigSkipBounded() throws Exception {
+        View ix = openIndex("skippy");
+
+        for (int i=0; i<1_000_000; i++) {
+            ix.store(Transaction.BOGUS, key(i), value(1));
+        }
+
+        Cursor c = ix.newCursor(null);
+
+        c.first();
+        c.skip(100_000, key(50_000), false);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(50_000), true);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(99_999), false);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(99_999), true);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(100_000), false);
+        assertNull(c.key());
+
+        c.first();
+        c.skip(100_000, key(100_000), true);
+        fastAssertArrayEquals(key(100_000), c.key());
+
+        c.first();
+        c.skip(100_000, key(100_001), false);
+        fastAssertArrayEquals(key(100_000), c.key());
+
+        c.first();
+        c.skip(100_000, key(100_001), true);
+        fastAssertArrayEquals(key(100_000), c.key());
+
+        // In reverse.
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 50_000), false);
+        assertNull(c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 50_000), true);
+        assertNull(c.key());
+        
+        c.last();
+        c.skip(-100_000, key(999_999 - 99_999), false);
+        assertNull(c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 99_999), true);
+        assertNull(c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 100_000), false);
+        assertNull(c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 100_000), true);
+        fastAssertArrayEquals(key(999_999 - 100_000), c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 100_001), false);
+        fastAssertArrayEquals(key(999_999 - 100_000), c.key());
+
+        c.last();
+        c.skip(-100_000, key(999_999 - 100_001), true);
+        fastAssertArrayEquals(key(999_999 - 100_000), c.key());
+
+        c.reset();
+    }
+
+    @Test
     public void randomLock() throws Exception {
         View ix = openIndex("test");
         ix.store(Transaction.BOGUS, key(0), value(0));
@@ -800,7 +988,7 @@ public class CursorTest {
         assertTrue(verify(ix));
     }
 
-    private void verifyExtremities(View ix) throws Exception {
+    protected void verifyExtremities(View ix) throws Exception {
         TreeCursor extremity = treeCursor(ix.newCursor(Transaction.BOGUS));
         assertTrue(extremity.verifyExtremities(Node.LOW_EXTREMITY));
         assertTrue(extremity.verifyExtremities(Node.HIGH_EXTREMITY));
@@ -916,6 +1104,204 @@ public class CursorTest {
     }
 
     @Test
+    public void randomNonRange() throws Exception {
+        View ix = openIndex("test");
+
+        Cursor c = ix.newCursor(null);
+
+        byte[] low = {10};
+        byte[] high = {20};
+
+        c.random(low, low);
+        assertNull(c.key());
+
+        c.random(high, low);
+        assertNull(c.key());
+
+        ix.store(Transaction.BOGUS, low, low);
+        ix.store(Transaction.BOGUS, high, high);
+
+        c.random(low, low);
+        assertNull(c.key());
+
+        c.random(high, low);
+        assertNull(c.key());
+
+        for (int i=1; i<=20000; i+=2) {
+            ix.store(Transaction.BOGUS, key(i), value(i));
+        }
+
+        c.random(low, low);
+        assertNull(c.key());
+    
+        c.random(new byte[] {0, 0, 0, 2}, new byte[] {0, 0, 0, 3});
+        assertNull(c.key());
+
+        c.random(null, new byte[] {0, 0, 0, 0});
+        assertNull(c.key());
+    }
+
+    @Test
+    public void lockNoLoad() throws Exception {
+        lockNoLoad(false, false);
+        lockNoLoad(false, true);
+        lockNoLoad(true, false);
+        lockNoLoad(true, true);
+    }
+
+    private void lockNoLoad(boolean ghost, boolean ge) throws Exception {
+        View ix = openIndex("test");
+
+        for (Cursor c = ix.newCursor(null); c.key() != null; c.next()) {
+            c.store(null);
+        }
+
+        byte[] key1 = "hello".getBytes();
+        byte[] key2 = "hello!".getBytes();
+        byte[] value1 = "world".getBytes();
+        byte[] value2 = "world!".getBytes();
+
+        byte[] key = key1;
+        byte[] value;
+
+        if (ghost) {
+            ix.store(null, key1, value1);
+            value = null;
+        } else {
+            value = value1;
+        }
+
+        ix.store(null, key2, value2);
+
+        Thread t = new Thread(() -> {
+            try {
+                Transaction txn = mDb.newTransaction();
+                try {
+                    ix.store(txn, key, value);
+                    Thread.sleep(1000);
+                    txn.commit();
+                } finally {
+                    txn.reset();
+                }
+            } catch (Exception e) {
+                throw Utils.rethrow(e);
+            }
+        });
+
+        t.start();
+
+        // Wait for thread to lock the key.
+        while (t.isAlive()) {
+            Transaction txn = mDb.newTransaction();
+            try {
+                txn.lockTimeout(1, TimeUnit.MILLISECONDS);
+                try {
+                    ix.load(txn, key);
+                } catch (LockTimeoutException e) {
+                    // Locked.
+                    break;
+                }
+            } finally {
+                txn.reset();
+            }
+        }
+
+        Transaction txn = mDb.newTransaction();
+        try {
+            txn.lockTimeout(10, TimeUnit.SECONDS);
+
+            Cursor c = ix.newCursor(txn);
+            try {
+                c.autoload(false);
+
+                // Even if the lock is not immediately available, the value shouldn't be loaded.
+                // Ghost detection still works, as some operations depend on this behavior.
+
+                if (ge) {
+                    c.findGe(key);
+                    if (ghost) {
+                        assertArrayEquals(key2, c.key());
+                    } else {
+                        assertArrayEquals(key1, c.key());
+                    }
+                    assertTrue(c.value() == Cursor.NOT_LOADED);
+                } else {
+                    c.find(key);
+                    assertArrayEquals(key1, c.key());
+                    if (ghost) {
+                        assertNull(c.value());
+                    } else {
+                        assertTrue(c.value() == Cursor.NOT_LOADED);
+                    }
+                }
+            } finally {
+                c.reset();
+            }
+        } finally {
+            txn.reset();
+        }
+
+        t.join();
+    }
+
+    @Test
+    public void stubRecycle() throws Exception {
+        // When the tree root is deleted, a stub will remain for any other active cursors.
+        // Stubs must not be recycled until after all frames bound to it have unbound.
+
+        View ix = openIndex("test");
+
+        final int count = 10000;
+        for (int i=0; i<count; i++) {
+            ix.store(Transaction.BOGUS, key(i), value(i));
+        }
+
+        // Position a cursor in the middle.
+        Cursor c = ix.newCursor(Transaction.BOGUS);
+        int mid = count / 2;
+        c.find(key(mid));
+        fastAssertArrayEquals(value(mid), c.value());
+
+        // Another at the same position.
+        Cursor c2 = c.copy();
+
+        // Delete everything.
+        for (int i=0; i<count; i++) {
+            ix.delete(Transaction.BOGUS, key(i));
+        }
+
+        // Ensure that stub pages aren't recycled.
+        mDb.checkpoint();
+        View ix2 = openIndex("test2");
+        for (int i=0; i<count; i++) {
+            ix2.store(Transaction.BOGUS, key(i), value(i));
+        }
+
+        // Original cursor should still be valid, acting on an empty index. Advancing forward
+        // should reset it. If the stub pages were recycled, then this step would likely fail
+        // with a CorruptDatabaseException.
+
+        c.next();
+        assertNull(c.key());
+
+        // Insert back into the first index, and verify that the other cursor works fine,
+        // oblivious to all the changes made to the underlying tree.
+
+        for (int i=0; i<count; i++) {
+            ix.store(Transaction.BOGUS, key(i), value(i));
+        }
+
+        for (; c2.key() != null; c2.next()) {
+            int actualKey = Utils.decodeIntBE(c2.key(), 0);
+            fastAssertArrayEquals(key(mid), c2.key());
+            fastAssertArrayEquals(value(mid), c2.value());
+            mid++;
+        }
+
+        assertEquals(count, mid);
+    }
+
+    @Test
     public void stability() throws Exception {
         // Verifies that cursors are positioned properly after making structural modifications
         // to the tree.
@@ -944,6 +1330,8 @@ public class CursorTest {
         }
 
         assertTrue(verify(ix));
+
+        assertEquals(foundCursors.length + notFoundCursors.length, mDb.stats().cursorCount());
 
         verifyPositions(ix, foundCursors);
         verifyPositions(ix, notFoundCursors);
@@ -1001,7 +1389,7 @@ public class CursorTest {
         verifyPositions(ix, cursors);
     }
 
-    private void verifyPositions(View ix, Cursor[] cursors) throws Exception {
+    protected void verifyPositions(View ix, Cursor[] cursors) throws Exception {
         for (Cursor existing : cursors) {
             Cursor c = ix.newCursor(Transaction.BOGUS);
             byte[] key = existing.key();

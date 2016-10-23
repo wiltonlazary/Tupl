@@ -1,5 +1,5 @@
 /*
- *  Copyright 2015 Brian S O'Neill
+ *  Copyright 2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 package org.cojen.tupl;
 
 import java.io.IOException;
+
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * 
@@ -72,14 +74,17 @@ final class TransformedCursor implements Cursor {
 
     @Override
     public final int compareKeyTo(byte[] rkey) {
-        byte[] lkey = mKey;
-        return Utils.compareKeys(lkey, 0, lkey.length, rkey, 0, rkey.length);
+        return mSource.compareKeyTo(mTransformer.inverseTransformKey(rkey));
     }
 
     @Override
     public final int compareKeyTo(byte[] rkey, int offset, int length) {
-        byte[] lkey = mKey;
-        return Utils.compareKeys(lkey, 0, lkey.length, rkey, offset, length);
+        if (offset != 0 || length != rkey.length) {
+            byte[] newRkey = new byte[length];
+            System.arraycopy(rkey, offset, newRkey, 0, length);
+            rkey = newRkey;
+        }
+        return mSource.compareKeyTo(mTransformer.inverseTransformKey(rkey));
     }
 
     @Override
@@ -108,29 +113,12 @@ final class TransformedCursor implements Cursor {
 
     @Override
     public LockResult skip(long amount) throws IOException {
-        final Cursor c = mSource;
+        return ViewUtils.skipWithLocks(this, amount);
+    }
 
-        if (amount == 0) {
-            return c.skip(0);
-        }
-
-        if (amount > 0) while (true) {
-            LockResult result = next();
-            if (mKey == null || --amount <= 0) {
-                return result;
-            }
-            if (result == LockResult.ACQUIRED) {
-                c.link().unlock();
-            }
-        } else while (true) {
-            LockResult result = previous();
-            if (mKey == null || ++amount >= 0) {
-                return result;
-            }
-            if (result == LockResult.ACQUIRED) {
-                c.link().unlock();
-            }
-        }
+    @Override
+    public LockResult skip(long amount, byte[] limitKey, boolean inclusive) throws IOException {
+        return ViewUtils.skipWithLocks(this, amount, limitKey, inclusive);
     }
 
     @Override
@@ -443,7 +431,7 @@ final class TransformedCursor implements Cursor {
         result = transformCurrent(result);
 
         if (result == null) {
-            if (Utils.random().nextBoolean()) {
+            if (ThreadLocalRandom.current().nextBoolean()) {
                 result = next();
                 if (mKey == null) {
                     // Reached the end, so wrap around.
@@ -462,11 +450,14 @@ final class TransformedCursor implements Cursor {
     }
 
     @Override
+    public LockResult lock() throws IOException {
+        return mSource.lock();
+    }
+
+    @Override
     public LockResult load() throws IOException {
         final byte[] tkey = mKey;
-        if (tkey == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(tkey);
         mKey = tkey;
         mValue = NOT_LOADED;
         final Cursor c = mSource;
@@ -476,17 +467,26 @@ final class TransformedCursor implements Cursor {
     @Override
     public void store(final byte[] tvalue) throws IOException {
         final byte[] tkey = mKey;
-        if (tkey == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(tkey);
         final Cursor c = mSource;
         final byte[] key = c.key();
-        if (key == null) {
-            throw new IllegalStateException("Cursor position is undefined");
-        }
+        ViewUtils.positionCheck(key);
         c.store(mTransformer.inverseTransformValue(tvalue, key, tkey));
+        mValue = tvalue;
     }
 
+    @Override
+    public void commit(final byte[] tvalue) throws IOException {
+        final byte[] tkey = mKey;
+        ViewUtils.positionCheck(tkey);
+        final Cursor c = mSource;
+        final byte[] key = c.key();
+        ViewUtils.positionCheck(key);
+        c.commit(mTransformer.inverseTransformValue(tvalue, key, tkey));
+        mValue = tvalue;
+    }
+
+    /*
     @Override
     public Stream newStream() {
         Cursor c = mSource;
@@ -496,6 +496,7 @@ final class TransformedCursor implements Cursor {
         }
         return new TransformedStream(c.newStream(), mTransformer);
     }
+    */
 
     @Override
     public Cursor copy() {
@@ -513,9 +514,7 @@ final class TransformedCursor implements Cursor {
     }
 
     private byte[] inverseTransformKey(final byte[] tkey) {
-        if (tkey == null) {
-            throw new NullPointerException("Key is null");
-        }
+        Utils.keyCheck(tkey);
         return mTransformer.inverseTransformKey(tkey);
     }
 

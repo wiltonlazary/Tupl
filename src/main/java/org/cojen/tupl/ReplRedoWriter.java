@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2015 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import org.cojen.tupl.ext.ReplicationManager;
  *
  * @author Brian S O'Neill
  */
+/*P*/
 class ReplRedoWriter extends RedoWriter {
     final ReplRedoEngine mEngine;
 
@@ -88,12 +89,24 @@ class ReplRedoWriter extends RedoWriter {
     }
 
     @Override
+    public final synchronized void txnRollback(long txnId) throws IOException {
+        super.txnRollback(txnId);
+        flush();
+    }
+
+    @Override
+    public final synchronized void txnRollbackFinal(long txnId) throws IOException {
+        super.txnRollbackFinal(txnId);
+        flush();
+    }
+
+    @Override
     public final long txnCommitFinal(long txnId, DurabilityMode mode) throws IOException {
         return super.txnCommitFinal(txnId, DurabilityMode.SYNC);
     }
 
     @Override
-    public final void txnCommitSync(Transaction txn, long commitPos) throws IOException {
+    public final void txnCommitSync(LocalTransaction txn, long commitPos) throws IOException {
         ReplicationManager.Writer writer = mReplWriter;
         if (writer == null) {
             throw new UnmodifiableReplicaException();
@@ -140,7 +153,7 @@ class ReplRedoWriter extends RedoWriter {
         }
 
         if (action != PendingTxnWaiter.PENDING) {
-            Database db = mEngine.mDatabase;
+            LocalDatabase db = mEngine.mDatabase;
             if (action == PendingTxnWaiter.DO_COMMIT) {
                 pending.commit(db);
             } else if (action == PendingTxnWaiter.DO_ROLLBACK) {
@@ -196,6 +209,8 @@ class ReplRedoWriter extends RedoWriter {
                 return true;
             }
         }
+
+        mEngine.mController.switchToReplica(mReplWriter, false);
 
         return false;
     }
@@ -264,6 +279,11 @@ class ReplRedoWriter extends RedoWriter {
     }
 
     @Override
+    void checkpointFlushed() throws IOException {
+        throw fail();
+    }
+
+    @Override
     void checkpointFinished() throws IOException {
         throw fail();
     }
@@ -292,7 +312,7 @@ class ReplRedoWriter extends RedoWriter {
             if (writer == null) {
                 throw new UnmodifiableReplicaException();
             }
-            long pos = writer.write(buffer, 0, len);
+            long pos = writer.writeCommit(buffer, 0, len);
             if (pos >= 0) {
                 mLastCommitPos = pos;
                 mLastCommitTxnId = lastTransactionId();
@@ -305,7 +325,7 @@ class ReplRedoWriter extends RedoWriter {
     }
 
     @Override
-    final void force(boolean metadata) throws IOException {
+    void force(boolean metadata) throws IOException {
         mEngine.mManager.sync();
     }
 
@@ -335,7 +355,7 @@ class ReplRedoWriter extends RedoWriter {
     }
 
     private UnsupportedOperationException fail() {
-        // ReplRedoEngineWriter subclass supports checkpoint operations.
+        // ReplRedoController subclass supports checkpoint operations.
         return new UnsupportedOperationException();
     }
 

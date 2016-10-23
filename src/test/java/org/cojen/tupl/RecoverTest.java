@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -39,6 +39,7 @@ public class RecoverTest {
     @Before
     public void createTempDb() throws Exception {
         mConfig = new DatabaseConfig()
+            .directPageAccess(false)
             .checkpointRate(-1, null)
             .durabilityMode(DurabilityMode.NO_FLUSH);
         mDb = newTempDatabase(mConfig);
@@ -88,11 +89,8 @@ public class RecoverTest {
 
         assertTrue(w.ex instanceof LockInterruptedException);
 
-        try {
-            txn1.exit();
-            fail();
-        } catch (DatabaseException e) {
-        }
+        // Any exception should be suppressed.
+        txn1.exit();
 
         Transaction txn2 = mDb.newTransaction();
         try {
@@ -339,8 +337,8 @@ public class RecoverTest {
             mDb.checkpoint();
         }
 
-        int count1 = CrudTest.count(ix1);
-        int count2 = CrudTest.count(ix2);
+        long count1 = CrudTest.count(ix1);
+        long count2 = CrudTest.count(ix2);
 
         txn.enter();
         for (int i=0; i<count; i++) {
@@ -666,5 +664,33 @@ public class RecoverTest {
 
         mDb = reopenTempDatabase(mDb, mConfig);
         assertFalse(primer.exists());
+    }
+
+    @Test
+    public void trashDelete() throws Exception {
+        Index ix = mDb.openIndex("trash");
+        ix.store(null, "hello".getBytes(), "world".getBytes());
+        mDb.checkpoint();
+
+        // Write after the checkpoint.
+        ix.store(null, "goodbye".getBytes(), "world".getBytes());
+
+        // Moves ix into the trash
+        mDb.deleteIndex(ix);
+
+        mDb = reopenTempDatabase(mDb, mConfig);
+        assertNull(mDb.findIndex("trash"));
+    }
+
+    @Test
+    public void trashDeleteEmpty() throws Exception {
+        final String ixname = "empty";
+        Index ix = mDb.openIndex(ixname);
+        mDb.deleteIndex(ix);
+        mDb.checkpoint();
+
+        // Re-opening will start background job to delete trashed index.
+        mDb = reopenTempDatabase(mDb, mConfig);
+        assertNull(mDb.findIndex(ixname));
     }
 }

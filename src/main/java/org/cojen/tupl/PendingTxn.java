@@ -1,5 +1,5 @@
 /*
- *  Copyright 2015 Brian S O'Neill
+ *  Copyright 2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,15 +23,18 @@ import java.io.IOException;
  *
  * @author Brian S O'Neill
  */
+/*P*/
 final class PendingTxn extends LockOwner {
     private final Lock mFirst;
     private Lock[] mRest;
     private int mRestSize;
 
+    TransactionContext mTxnContext;
     long mTxnId;
     long mCommitPos;
     UndoLog mUndoLog;
     boolean mHasFragmentedTrash;
+    private Object mAttachment;
 
     PendingTxn mPrev;
 
@@ -39,10 +42,24 @@ final class PendingTxn extends LockOwner {
         mFirst = first;
     }
 
+    @Override
+    public void attach(Object obj) {
+        mAttachment = obj;
+    }
+
+    @Override
+    public Object attachment() {
+        return mAttachment;
+    }
+
     /**
      * Add an exclusive lock into the set, retaining FIFO (queue) order.
      */
     void add(Lock lock) {
+        Lock first = mFirst;
+        if (first == null) {
+            throw new IllegalStateException("cannot add lock");
+        }
         Lock[] rest = mRest;
         if (rest == null) {
             rest = new Lock[8];
@@ -65,7 +82,7 @@ final class PendingTxn extends LockOwner {
      * Releases all the locks and then discards the undo log. This object must be discarded
      * afterwards.
      */
-    void commit(Database db) throws IOException {
+    void commit(LocalDatabase db) throws IOException {
         // See Transaction.commit for more info.
 
         unlockAll(db);
@@ -73,7 +90,7 @@ final class PendingTxn extends LockOwner {
         UndoLog undo = mUndoLog;
         if (undo != null) {
             undo.truncate(true);
-            db.unregister(undo);
+            mTxnContext.unregister(undo);
         }
 
         if (mHasFragmentedTrash) {
@@ -85,7 +102,7 @@ final class PendingTxn extends LockOwner {
      * Applies the undo log, releases all the locks, and then discards the undo log. This
      * object must be discarded afterwards.
      */
-    void rollback(Database db) throws IOException {
+    void rollback(LocalDatabase db) throws IOException {
         // See Transaction.exit for more info.
 
         UndoLog undo = mUndoLog;
@@ -96,20 +113,23 @@ final class PendingTxn extends LockOwner {
         unlockAll(db);
 
         if (undo != null) {
-            db.unregister(undo);
+            mTxnContext.unregister(undo);
         }
     }
 
-    private void unlockAll(Database db) {
-        LockManager manager = db.mLockManager;
-        manager.unlock(this, mFirst);
-        Lock[] rest = mRest;
-        if (rest != null) {
-            for (Lock lock : rest) {
-                if (lock == null) {
-                    return;
+    private void unlockAll(LocalDatabase db) {
+        Lock first = mFirst;
+        if (first != null) {
+            LockManager manager = db.mLockManager;
+            manager.unlock(this, first);
+            Lock[] rest = mRest;
+            if (rest != null) {
+                for (Lock lock : rest) {
+                    if (lock == null) {
+                        return;
+                    }
+                    manager.unlock(this, lock);
                 }
-                manager.unlock(this, lock);
             }
         }
     }

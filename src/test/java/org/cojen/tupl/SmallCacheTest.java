@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -214,6 +214,12 @@ public class SmallCacheTest {
             fail();
         } catch (CacheExhaustedException e) {
         }
+
+        // Free up two nodes, as required by the tests.
+        for (int i=0; i<2; i++) {
+            indexes.remove(indexes.size() - 1).close();
+        }
+
         return indexes;
     }
 }

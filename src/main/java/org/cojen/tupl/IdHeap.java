@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 package org.cojen.tupl;
 
+import java.util.Arrays;
 import java.util.NoSuchElementException;
 
 /**
@@ -25,13 +26,15 @@ import java.util.NoSuchElementException;
  * @author Brian S O'Neill
  */
 final class IdHeap {
-    private final long[] mIds;
+    private final int mDrainSize;
+    private long[] mIds;
     private int mSize;
 
-    public IdHeap(int maxSize) {
+    public IdHeap(int drainSize) {
+        mDrainSize = drainSize;
         // Pad one more id to account for delete requiring an extra alloc if
         // free list node is deleted.
-        mIds = new long[maxSize + 1];
+        mIds = new long[drainSize + 1];
     }
 
     public int size() {
@@ -44,6 +47,14 @@ final class IdHeap {
     public void add(long id) {
         long[] ids = mIds;
         int pos = mSize;
+        if (pos >= ids.length) {
+            // Usually a single padding element is sufficient, but sometimes the free list
+            // contains many nodes which only have a single element. This can cause additional
+            // deletions during a drain operation and overflow the heap. This is usually caused
+            // by aggressive forced checkpoints, typical of a database compaction operation.
+            // Grow the heap capacity incrementally.
+            mIds = ids = Arrays.copyOf(ids, ids.length + 1);
+        }
         while (pos > 0) {
             int parentPos = (pos - 1) >>> 1;
             long parentId = ids[parentPos];
@@ -112,9 +123,28 @@ final class IdHeap {
         return result;
     }
 
+    /**
+     * Removes a specific id, intended for recovering from exceptions.
+     */
+    public void remove(long id) {
+        long[] copy = new long[mIds.length];
+        int pos = 0;
+        while (true) {
+            long removed = tryRemove();
+            if (removed == 0) {
+                break;
+            }
+            if (removed != id) {
+                copy[pos++] = removed;
+            }
+        }
+        while (--pos >= 0) {
+            add(copy[pos]);
+        }
+    }
+
     public boolean shouldDrain() {
-        // Compare and ignore padding added by constructor.
-        return mSize >= mIds.length - 1;
+        return mSize >= mDrainSize;
     }
 
     /**
@@ -137,5 +167,19 @@ final class IdHeap {
             prevId = id;
         }
         return offset;
+    }
+
+    /**
+     * @param id first id; was prevId for drain method call
+     * @param endOffset must be return offset from drain
+     */
+    public void undrain(long id, /*P*/ byte[] buffer, int offset, int endOffset) {
+        add(id);
+        IntegerRef offsetRef = new IntegerRef.Value();
+        offsetRef.set(offset);
+        while (offsetRef.get() < endOffset) {
+            id += PageOps.p_ulongGetVar(buffer, offsetRef);
+            add(id);
+        }
     }
 }

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,11 +18,13 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
+import org.cojen.tupl.util.Latch;
+
 import static org.cojen.tupl.PageOps.*;
 
 import static org.cojen.tupl.Utils.EMPTY_BYTES;
 import static org.cojen.tupl.Utils.closeOnFailure;
-import static org.cojen.tupl.Utils.compareKeys;
+import static org.cojen.tupl.Utils.compareUnsigned;
 import static org.cojen.tupl.Utils.rethrow;
 
 /**
@@ -30,6 +32,7 @@ import static org.cojen.tupl.Utils.rethrow;
  *
  * @author Brian S O'Neill
  */
+@SuppressWarnings("serial")
 final class Node extends Latch implements DatabaseAccess {
     // Note: Changing these values affects how the Database class handles the
     // commit flag. It only needs to flip bit 0 to switch dirty states.
@@ -57,7 +60,9 @@ final class Node extends Latch implements DatabaseAccess {
 
     static final byte
         TYPE_NONE     = 0,
-        TYPE_FRAGMENT = (byte) 0x20, // 0b0010_000_0
+        /*P*/ // [
+        TYPE_FRAGMENT = (byte) 0x20, // 0b0010_000_0 (never persisted)
+        /*P*/ // ]
         TYPE_UNDO_LOG = (byte) 0x40, // 0b0100_000_0
         TYPE_TN_IN    = (byte) 0x64, // 0b0110_010_0
         TYPE_TN_BIN   = (byte) 0x74, // 0b0111_010_0
@@ -68,7 +73,8 @@ final class Node extends Latch implements DatabaseAccess {
     // Tree node header size.
     static final int TN_HEADER_SIZE = 12;
 
-    static final int STUB_ID = 1;
+    // Negative id indicates that node is not in use, and 1 is a reserved page id.
+    private static final int CLOSED_ID = -1;
 
     static final int ENTRY_FRAGMENTED = 0x40;
 
@@ -79,7 +85,7 @@ final class Node extends Latch implements DatabaseAccess {
     Node mMoreUsed; // points to more recently used node
     Node mLessUsed; // points to less recently used node
 
-    // Links within dirty list, guarded by PageAllocator.
+    // Links within dirty list, guarded by NodeDirtyList.
     Node mNextDirty;
     Node mPrevDirty;
 
@@ -192,6 +198,44 @@ final class Node extends Latch implements DatabaseAccess {
       Child node identifiers are encoded immediately following the search vector. Free space
       management must account for this, treating it as an extension to the search vector.
 
+      Each entry in the child node id segment contains 6 byte child node id, followed by
+      2 byte count of keys in the child node. The child node ids are in the same order as
+      keys in the search vector.
+
+      +----------------------------------------+
+      | byte:   node type                      |  header
+      | byte:   reserved (must be 0)           |
+      | ushort: garbage in segments            |
+      | ushort: pointer to left segment tail   |
+      | ushort: pointer to right segment tail  |
+      | ushort: pointer to search vector start |
+      | ushort: pointer to search vector end   |
+      +----------------------------------------+
+      | left key segment                       |
+      -                                        -
+      |                                        |
+      +----------------------------------------+
+      | free space                             | <-- left segment tail (exclusive)
+      -                                        -
+      |                                        |
+      +----------------------------------------+
+      | search vector                          | <-- search vector start (inclusive)
+      -                                        -
+      |                                        | <-- search vector end (inclusive)
+      +----------------------------------------+
+      | child node id segment                  |
+      -                                        -
+      |                                        |
+      +----------------------------------------+
+      | free space                             |
+      -                                        -
+      |                                        | <-- right segment tail (exclusive)
+      +----------------------------------------+
+      | right key segment                      |
+      -                                        -
+      |                                        |
+      +----------------------------------------+
+
      */
 
     // Raw contents of node.
@@ -208,59 +252,105 @@ final class Node extends Latch implements DatabaseAccess {
 
     byte mCachedState;
 
+    /*P*/ // [
     // Entries from header, available as fields for quick access.
-    byte mType;
-    int mGarbage;
-    int mLeftSegTail;
-    int mRightSegTail;
-    int mSearchVecStart;
-    int mSearchVecEnd;
+    private byte mType;
+    private int mGarbage;
+    private int mLeftSegTail;
+    private int mRightSegTail;
+    private int mSearchVecStart;
+    private int mSearchVecEnd;
+    /*P*/ // ]
 
-    // Next in NodeMap collision chain or lower node in UndoLog.
-    Node mNodeChainNext;
+    // Next in NodeMap collision chain.
+    Node mNodeMapNext;
 
-    // Linked stack of TreeCursorFrames bound to this Node.
-    transient TreeCursorFrame mLastCursorFrame;
+    // Linked stack of CursorFrames bound to this Node.
+    transient volatile CursorFrame mLastCursorFrame;
 
     // Set by a partially completed split.
     transient Split mSplit;
 
-    Node(NodeUsageList usageList, int pageSize) {
-        this(usageList, p_calloc(pageSize));
-    }
-
-    private Node(NodeUsageList usageList, /*P*/ byte[] page) {
+    Node(NodeUsageList usageList, /*P*/ byte[] page) {
         mUsageList = usageList;
         mPage = page;
+    }
+
+    // Construct a stub node, latched exclusively.
+    Node(NodeUsageList usageList) {
+        super(EXCLUSIVE);
+
+        mUsageList = usageList;
+        mPage = p_stubTreePage();
+
+        // Special stub id. Page 0 and 1 are never used by nodes, and negative indicates that
+        // node shouldn't be persisted.
+        mId = -1;
+
+        mCachedState = CACHED_CLEAN;
+
+        /*P*/ // [
+        type(TYPE_TN_IN);
+        garbage(0);
+        leftSegTail(TN_HEADER_SIZE);
+        rightSegTail(TN_HEADER_SIZE + 8 - 1);
+        searchVecStart(TN_HEADER_SIZE);
+        searchVecEnd(TN_HEADER_SIZE - 2); // inclusive
+        /*P*/ // ]
+    }
+
+    // Construct a "lock" object for use when loading a node. See loadChild method.
+    private Node(long id) {
+        super(EXCLUSIVE);
+        mUsageList = null;
+        mId = id;
     }
 
     /**
      * Must be called when object is no longer referenced.
      */
-    void delete() {
+    void delete(LocalDatabase db) {
         acquireExclusive();
+        try {
+            doDelete(db);
+        } finally {
+            releaseExclusive();
+        }
+    }
+
+    /**
+     * Must be called when object is no longer referenced. Caller must acquire exclusive latch.
+     */
+    void doDelete(LocalDatabase db) {
+        /*P*/ // [|
+        /*P*/ // if (db.mFullyMapped) {
+        /*P*/ //     // Cannot delete mapped pages.
+        /*P*/ //     closeRoot();
+        /*P*/ //     return;
+        /*P*/ // }
+        /*P*/ // ]
+
         /*P*/ byte[] page = mPage;
-        if (page != p_empty()) {
+        if (page != p_closedTreePage()) {
             p_delete(page);
             closeRoot();
         }
-        releaseExclusive();
     }
 
     @Override
-    public Database getDatabase() {
+    public LocalDatabase getDatabase() {
         return mUsageList.mDatabase;
     }
 
     void asEmptyRoot() {
         mId = 0;
         mCachedState = CACHED_CLEAN;
-        mType = TYPE_TN_LEAF | LOW_EXTREMITY | HIGH_EXTREMITY;
+        type((byte) (TYPE_TN_LEAF | LOW_EXTREMITY | HIGH_EXTREMITY));
         clearEntries();
     }
 
     void asTrimmedRoot() {
-        mType = TYPE_TN_LEAF | LOW_EXTREMITY | HIGH_EXTREMITY;
+        type((byte) (TYPE_TN_LEAF | LOW_EXTREMITY | HIGH_EXTREMITY));
         clearEntries();
     }
 
@@ -269,41 +359,35 @@ final class Node extends Latch implements DatabaseAccess {
      */
     void closeRoot() {
         // Prevent node from being marked dirty.
-        mId = STUB_ID;
+        mId = CLOSED_ID;
         mCachedState = CACHED_CLEAN;
-        mType = TYPE_TN_LEAF | LOW_EXTREMITY | HIGH_EXTREMITY;
-        mPage = p_empty();
-        mGarbage = 0;
-
-        // Clear entries with the lowest positive values for an empty node.
-        // Binary search must return ~0 and availableBytes must return 0.
-        mLeftSegTail = 2;
-        mRightSegTail = 1;
-        mSearchVecStart = 2;
-        mSearchVecEnd = 0;
+        mPage = p_closedTreePage();
+        readFields();
     }
 
     Node cloneNode() {
         Node newNode = new Node(mUsageList, mPage);
         newNode.mId = mId;
         newNode.mCachedState = mCachedState;
-        newNode.mType = mType;
-        newNode.mGarbage = mGarbage;
-        newNode.mLeftSegTail = mLeftSegTail;
-        newNode.mRightSegTail = mRightSegTail;
-        newNode.mSearchVecStart = mSearchVecStart;
-        newNode.mSearchVecEnd = mSearchVecEnd;
+        /*P*/ // [
+        newNode.type(type());
+        newNode.garbage(garbage());
+        newNode.leftSegTail(leftSegTail());
+        newNode.rightSegTail(rightSegTail());
+        newNode.searchVecStart(searchVecStart());
+        newNode.searchVecEnd(searchVecEnd());
+        /*P*/ // ]
         return newNode;
     }
 
     private void clearEntries() {
-        mGarbage = 0;
-        mLeftSegTail = TN_HEADER_SIZE;
-        int pageSize = p_length(mPage);
-        mRightSegTail = pageSize - 1;
+        garbage(0);
+        leftSegTail(TN_HEADER_SIZE);
+        int pageSize = pageSize(mPage);
+        rightSegTail(pageSize - 1);
         // Search vector location must be even.
-        mSearchVecStart = (TN_HEADER_SIZE + ((pageSize - TN_HEADER_SIZE) >> 1)) & ~1;
-        mSearchVecEnd = mSearchVecStart - 2; // inclusive
+        searchVecStart((TN_HEADER_SIZE + ((pageSize - TN_HEADER_SIZE) >> 1)) & ~1);
+        searchVecEnd(searchVecStart() - 2); // inclusive
     }
 
     /**
@@ -348,325 +432,109 @@ final class Node extends Latch implements DatabaseAccess {
     }
 
     /**
-     * Search for a value, starting from the root node.
-     *
-     * @param node root node
-     * @param key search key
-     * @return copy of value or null if not found
+     * Options for loadChild. Caller must latch parent as shared or exclusive, which can be
+     * retained (default) or released if shared. Child node is latched shared (default) or
+     * exclusive.
      */
-    static byte[] search(Node node, Tree tree, byte[] key) throws IOException {
-        node.acquireShared();
-
-        // Note: No need to check if root has split, since root splits are always completed
-        // before releasing the root latch. Also, Database.used is not invoked for the root
-        // node. Root node is not managed in usage list, because it cannot be evicted.
-
-        if (!node.isLeaf()) {
-            // Shared latch held on parent. Is null for root or if exclusive latch is held on
-            // active node.
-            Latch parentLatch = null;
-            boolean exclusiveHeld = false;
-
-            loop: while (true) {
-                int childPos;
-                try {
-                    childPos = internalPos(node.binarySearch(key));
-                } catch (Throwable e) {
-                    node.release(exclusiveHeld);
-                    if (parentLatch != null) {
-                        parentLatch.releaseShared();
-                    }
-                    throw e;
-                }
-
-                long childId = node.retrieveChildRefId(childPos);
-                Node childNode = tree.mDatabase.mTreeNodeMap.get(childId);
-
-                childCheck: if (childNode != null) {
-                    latchChild: if (!childNode.tryAcquireShared()) {
-                        if (!exclusiveHeld) {
-                            childNode.acquireShared();
-                            break latchChild;
-                        }
-                        // If exclusive latch is held, then this node was just loaded. If child
-                        // node cannot be immediately latched, it might have been evicted out
-                        // of order. This can create a deadlock with a thread that may hold the
-                        // exclusive latch and is now trying to latch this node.
-                        if (childId != childNode.mId) {
-                            break childCheck;
-                        }
-                        if (!childNode.tryAcquireShared()) {
-                            // Be safe and start over with a Cursor. It doesn't have the same
-                            // deadlock potential, because it prevents visited nodes from being
-                            // evicted.
-                            node.releaseExclusive();
-                            return searchWithCursor(tree, key);
-                        }
-                    }
-
-                    // Need to check again in case evict snuck in.
-                    if (childId != childNode.mId) {
-                        childNode.releaseShared();
-                        break childCheck;
-                    }
-
-                    if (!exclusiveHeld && parentLatch != null) {
-                        parentLatch.releaseShared();
-                    }
-
-                    if (childNode.mSplit != null) {
-                        childNode = childNode.mSplit.selectNodeShared(childNode, key);
-                    }
-
-                    if (childNode.isLeaf()) {
-                        node.release(exclusiveHeld);
-                        childNode.used();
-                        node = childNode;
-                        break loop;
-                    } else {
-                        // Keep shared latch on this parent node, in case sub search
-                        // needs to upgrade its shared latch.
-                        if (exclusiveHeld) {
-                            node.downgrade();
-                            exclusiveHeld = false;
-                        }
-                        childNode.used();
-                        parentLatch = node;
-                        node = childNode;
-                        continue;
-                    }
-                } // end childCheck
-
-                // Child needs to be loaded.
-
-                tryLoadChild: {
-                    if (!exclusiveHeld) {
-                        if (!node.tryUpgrade()) {
-                            break tryLoadChild;
-                        }
-                        exclusiveHeld = true;
-                        if (parentLatch != null) {
-                            parentLatch.releaseShared();
-                            parentLatch = null;
-                        }
-                    }
-
-                    // Succeeded in obtaining an exclusive latch, so now load the child.
-
-                    node = node.loadChild(tree.mDatabase, childId, true);
-
-                    if (node.isLeaf()) {
-                        node.downgrade();
-                        break loop;
-                    }
-
-                    // Keep exclusive latch on internal child, because it will most likely need
-                    // to load its own child nodes to continue the search. This eliminates the
-                    // latch upgrade step.
-
-                    continue;
-                }
-
-                // Release shared latch, re-acquire exclusive latch, and start over.
-
-                long id = node.mId;
-                node.releaseShared();
-                node.acquireExclusive();
-
-                if (node.mId != id && node != tree.mRoot) {
-                    // Node got evicted or dirtied when latch was released. To be
-                    // safe, the search must be retried from the root.
-                    node.releaseExclusive();
-                    if (parentLatch != null) {
-                        parentLatch.releaseShared();
-                    }
-                    // Retry with a cursor, which is reliable, but slower.
-                    return searchWithCursor(tree, key);
-                }
-
-                exclusiveHeld = true;
-
-                if (parentLatch != null) {
-                    parentLatch.releaseShared();
-                    parentLatch = null;
-                }
-
-                if (node.mSplit != null) {
-                    // Node might have split while shared latch was not held.
-                    node = node.mSplit.selectNodeExclusive(node, key);
-                }
-
-                if (node == tree.mRoot) {
-                    // This is the root node, and so no parent latch exists. It's possible that
-                    // a delete slipped in when the latch was released, and that the root is
-                    // now a leaf.
-                    if (node.isLeaf()) {
-                        node.downgrade();
-                        break loop;
-                    }
-                }
-            } // end loop
-        }
-
-        // Sub search into leaf with shared latch held.
-
-        // Same code as binarySearch, but instead of returning the position, it directly copies
-        // the value if found. This avoids having to decode the found value location twice.
-
-        try {
-            final /*P*/ byte[] page = node.mPage;
-            final int keyLen = key.length;
-            int lowPos = node.mSearchVecStart;
-            int highPos = node.mSearchVecEnd;
-
-            int lowMatch = 0;
-            int highMatch = 0;
-
-            outer: while (lowPos <= highPos) {
-                int midPos = ((lowPos + highPos) >> 1) & ~1;
-
-                int compareLoc, compareLen, i;
-                compare: {
-                    compareLoc = p_ushortGetLE(page, midPos);
-                    compareLen = p_byteGet(page, compareLoc++);
-                    if (compareLen >= 0) {
-                        compareLen++;
-                    } else {
-                        int header = compareLen;
-                        compareLen = ((compareLen & 0x3f) << 8) | p_ubyteGet(page, compareLoc++);
-
-                        if ((header & ENTRY_FRAGMENTED) != 0) {
-                            // Note: An optimized version wouldn't need to copy the whole key.
-                            byte[] compareKey = tree.mDatabase.reconstructKey
-                                (page, compareLoc, compareLen);
-
-                            int fullCompareLen = compareKey.length;
-
-                            int minLen = Math.min(fullCompareLen, keyLen);
-                            i = Math.min(lowMatch, highMatch);
-                            for (; i<minLen; i++) {
-                                byte cb = compareKey[i];
-                                byte kb = key[i];
-                                if (cb != kb) {
-                                    if ((cb & 0xff) < (kb & 0xff)) {
-                                        lowPos = midPos + 2;
-                                        lowMatch = i;
-                                    } else {
-                                        highPos = midPos - 2;
-                                        highMatch = i;
-                                    }
-                                    continue outer;
-                                }
-                            }
-
-                            // Update compareLen and compareLoc for use by the code after the
-                            // current scope. The compareLoc is completely bogus at this point,
-                            // but is corrected when the value is retrieved below.
-                            compareLoc += compareLen - fullCompareLen;
-                            compareLen = fullCompareLen;
-
-                            break compare;
-                        }
-                    }
-
-                    int minLen = Math.min(compareLen, keyLen);
-                    i = Math.min(lowMatch, highMatch);
-                    for (; i<minLen; i++) {
-                        byte cb = p_byteGet(page, compareLoc + i);
-                        byte kb = key[i];
-                        if (cb != kb) {
-                            if ((cb & 0xff) < (kb & 0xff)) {
-                                lowPos = midPos + 2;
-                                lowMatch = i;
-                            } else {
-                                highPos = midPos - 2;
-                                highMatch = i;
-                            }
-                            continue outer;
-                        }
-                    }
-                }
-
-                if (compareLen < keyLen) {
-                    lowPos = midPos + 2;
-                    lowMatch = i;
-                } else if (compareLen > keyLen) {
-                    highPos = midPos - 2;
-                    highMatch = i;
-                } else {
-                    return retrieveLeafValueAtLoc(node, page, compareLoc + compareLen);
-                }
-            }
-
-            return null;
-        } finally {
-            node.releaseShared();
-        }
-    }
+    static final int OPTION_PARENT_RELEASE_SHARED = 0b001, OPTION_CHILD_ACQUIRE_EXCLUSIVE = 0b100;
 
     /**
-     * With this parent node held exclusively, loads child with exclusive latch
-     * held. Caller must ensure that child is not already loaded. If an
-     * exception is thrown, parent and child latches are always released.
+     * With this parent node latched shared or exclusive, loads child with shared or exclusive
+     * latch. Caller must ensure that child is not already loaded. If an exception is thrown,
+     * parent and child latches are always released.
      *
-     * @param releaseParent when true, release this node latch always; when false, release only
-     * if an exception is thrown
+     * @param options described by OPTION_* fields
+     * @return child node, possibly split
      */
-    Node loadChild(Database db, long childId, boolean releaseParent) throws IOException {
-        Node childNode;
+    Node loadChild(LocalDatabase db, long childId, int options) throws IOException {
+        // Insert a "lock", which is a temporary node latched exclusively. All other threads
+        // attempting to load the child node will block trying to acquire the exclusive latch.
+        Node lock;
         try {
-            childNode = db.allocLatchedNode(childId);
-            childNode.mId = childId;
+            lock = new Node(childId);
+
+            if (childId <= 1) {
+                throw new AssertionError("Illegal child id: " + childId);
+            }
         } catch (Throwable e) {
-            releaseExclusive();
+            releaseEither();
             throw e;
         }
 
-        db.mTreeNodeMap.put(childNode);
+        try {
+            while (true) {
+                Node childNode = db.nodeMapPutIfAbsent(lock);
+                if (childNode == null) {
+                    break;
+                }
 
-        // Release parent latch before child has been loaded. Any threads
-        // which wish to access the same child will block until this thread
-        // has finished loading the child and released its exclusive latch.
-        if (releaseParent) {
-            releaseExclusive();
+                // Was already loaded, or is currently being loaded.
+                if ((options & OPTION_CHILD_ACQUIRE_EXCLUSIVE) == 0) {
+                    childNode.acquireShared();
+                    if (childId == childNode.mId) {
+                        return childNode;
+                    }
+                    childNode.releaseShared();
+                } else {
+                    childNode.acquireExclusive();
+                    if (childId == childNode.mId) {
+                        return childNode;
+                    }
+                    childNode.releaseExclusive();
+                }
+            }
+        } finally {
+            // Release parent latch before child has been loaded. Any threads which wish to
+            // access the same child will block until this thread has finished loading the
+            // child and released its exclusive latch.
+            if ((options & OPTION_PARENT_RELEASE_SHARED) != 0) {
+                releaseShared();
+            }
         }
 
-        // FIXME: Don't hold latch during load. Instead, use an object for
-        // holding state, and include a "loading" state. As other threads see
-        // this state, they replace the state object with a linked stack of
-        // parked threads. When the load is finished, all waiting threads are
-        // unparked. Without this change, latch blockage can reach the root.
-
         try {
-            childNode.read(db, childId);
-        } catch (Throwable e) {
-            // Another thread might access child and see that it is invalid because
-            // id is zero. It will assume it got evicted and will load child again.
-            db.mTreeNodeMap.remove(childNode, NodeMap.hash(childId));
-            childNode.mId = 0;
-            childNode.mType = TYPE_NONE;
-            childNode.releaseExclusive();
-
-            if (!releaseParent) {
-                // Obey the method contract and release latch due to exception.
-                releaseExclusive();
+            Node childNode;
+            try {
+                childNode = db.allocLatchedNode(childId);
+                childNode.mId = childId;
+            } catch (Throwable e) {
+                db.nodeMapRemove(lock);
+                throw e;
             }
 
-            throw e;
-        }
+            // Replace the lock with the real child node, but don't notify any threads waiting
+            // on the lock just yet. They'd go back to sleep waiting for the read to finish.
+            db.nodeMapReplace(lock, childNode);
 
-        return childNode;
-    }
+            try {
+                childNode.read(db, childId);
+            } catch (Throwable e) {
+                // Another thread might access child and see that it's invalid because the id
+                // is zero. It will assume it got evicted and will attempt to reload it
+                db.nodeMapRemove(childNode);
+                childNode.mId = 0;
+                childNode.type(TYPE_NONE);
+                childNode.releaseExclusive();
+                throw e;
+            }
 
-    private static byte[] searchWithCursor(Tree tree, byte[] key) throws IOException {
-        TreeCursor cursor = new TreeCursor(tree, Transaction.BOGUS);
-        try {
-            cursor.find(key);
-            byte[] value = cursor.value();
-            cursor.reset();
-            return value;
+            if ((options & OPTION_CHILD_ACQUIRE_EXCLUSIVE) == 0){
+                childNode.downgrade();
+            }
+
+            return childNode;
         } catch (Throwable e) {
-            throw closeOnFailure(cursor, e);
+            if ((options & OPTION_PARENT_RELEASE_SHARED) == 0) {
+                // Obey the method contract and release parent latch due to exception.
+                releaseEither();
+            }
+            throw e;
+        } finally {
+            // Wake any threads waiting on the lock now that the real child node is ready, or
+            // if the load failed. Lock id must be set to zero to ensure that it's not accepted
+            // as the child node.
+            lock.mId = 0;
+            lock.releaseExclusive();
         }
     }
 
@@ -679,61 +547,76 @@ final class Node extends Latch implements DatabaseAccess {
      */
     private Node tryLatchChildNotSplit(int childPos) throws IOException {
         final long childId = retrieveChildRefId(childPos);
-        final Database db = getDatabase();
-        Node childNode = db.mTreeNodeMap.get(childId);
+        final LocalDatabase db = getDatabase();
+        Node childNode = db.nodeMapGet(childId);
 
-        if (childNode != null) {
-            if (!childNode.tryAcquireExclusive()) {
-                return null;
-            }
-            // Need to check again in case evict snuck in.
-            if (childId != childNode.mId) {
+        latchChild: {
+            if (childNode != null) {
+                if (!childNode.tryAcquireExclusive()) {
+                    return null;
+                }
+                // Need to check again in case evict snuck in.
+                if (childId == childNode.mId) {
+                    break latchChild;
+                }
                 childNode.releaseExclusive();
-            } else if (childNode.mSplit == null) {
-                // Return without updating LRU position. Node contents were not user requested.
-                return childNode;
-            } else {
-                childNode.releaseExclusive();
-                return null;
             }
+            childNode = loadChild(db, childId, OPTION_CHILD_ACQUIRE_EXCLUSIVE);
         }
 
-        return loadChild(db, childId, false);
+        if (childNode.mSplit == null) {
+            // Return without updating LRU position. Node contents were not user requested.
+            return childNode;
+        } else {
+            childNode.releaseExclusive();
+            return null;
+        }
     }
 
     /**
      * Caller must hold exclusive root latch and it must verify that root has split.
-     *
-     * @param stub Old root node stub, latched exclusively, whose cursors must
-     * transfer into the new root. Stub latch is released by this method.
      */
-    void finishSplitRoot(Tree tree, Node stub) throws IOException {
+    void finishSplitRoot() throws IOException {
         // Create a child node and copy this root node state into it. Then update this
         // root node to point to new and split child nodes. New root is always an internal node.
 
-        Database db = tree.mDatabase;
+        LocalDatabase db = mUsageList.mDatabase;
         Node child = db.allocDirtyNode();
-        db.mTreeNodeMap.put(child);
+        db.nodeMapPut(child);
 
-        /*P*/ byte[] newPage = child.mPage;
+        /*P*/ byte[] newRootPage;
+
+        /*P*/ // [
+        newRootPage = child.mPage;
         child.mPage = mPage;
-        child.mType = mType;
-        child.mGarbage = mGarbage;
-        child.mLeftSegTail = mLeftSegTail;
-        child.mRightSegTail = mRightSegTail;
-        child.mSearchVecStart = mSearchVecStart;
-        child.mSearchVecEnd = mSearchVecEnd;
-        child.mLastCursorFrame = mLastCursorFrame;
-
-        // Fix child node cursor frame bindings.
-        for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
-            frame.mNode = child;
-            frame = frame.mPrevCousin;
-        }
+        child.type(type());
+        child.garbage(garbage());
+        child.leftSegTail(leftSegTail());
+        child.rightSegTail(rightSegTail());
+        child.searchVecStart(searchVecStart());
+        child.searchVecEnd(searchVecEnd());
+        /*P*/ // |
+        /*P*/ // if (db.mFullyMapped) {
+        /*P*/ //     // Page cannot change, so copy it instead.
+        /*P*/ //     newRootPage = mPage;
+        /*P*/ //     p_copy(newRootPage, 0, child.mPage, 0, db.pageSize());
+        /*P*/ // } else {
+        /*P*/ //     newRootPage = child.mPage;
+        /*P*/ //     child.mPage = mPage;
+        /*P*/ // }
+        /*P*/ // ]
 
         final Split split = mSplit;
         final Node sibling = rebindSplitFrames(split);
         mSplit = null;
+
+        // Fix child node cursor frame bindings.
+        for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
+            // Capture previous frame from linked list before changing the links.
+            CursorFrame prev = frame.mPrevCousin;
+            frame.rebind(child, frame.mNodePos);
+            frame = prev;
+        }
 
         Node left, right;
         if (split.mSplitRight) {
@@ -744,55 +627,61 @@ final class Node extends Latch implements DatabaseAccess {
             right = child;
         }
 
-        int leftSegTail = split.copySplitKeyToParent(newPage, TN_HEADER_SIZE);
+        int leftSegTail = split.copySplitKeyToParent(newRootPage, TN_HEADER_SIZE);
 
         // Create new single-element search vector. Center it using the same formula as the
         // compactInternal method.
-        final int searchVecStart = p_length(newPage) -
-            (((p_length(newPage) - leftSegTail + (2 + 8 + 8)) >> 1) & ~1);
-        p_shortPutLE(newPage, searchVecStart, TN_HEADER_SIZE);
-        p_longPutLE(newPage, searchVecStart + 2, left.mId);
-        p_longPutLE(newPage, searchVecStart + 2 + 8, right.mId);
+        final int searchVecStart = pageSize(newRootPage) -
+            (((pageSize(newRootPage) - leftSegTail + (2 + 8 + 8)) >> 1) & ~1);
+        p_shortPutLE(newRootPage, searchVecStart, TN_HEADER_SIZE);
+        p_longPutLE(newRootPage, searchVecStart + 2, left.mId);
+        p_longPutLE(newRootPage, searchVecStart + 2 + 8, right.mId);
 
-        mPage = newPage;
-        mType = isLeaf() ? (byte) (TYPE_TN_BIN | LOW_EXTREMITY | HIGH_EXTREMITY)
+        byte newType = isLeaf() ? (byte) (TYPE_TN_BIN | LOW_EXTREMITY | HIGH_EXTREMITY)
             : (byte) (TYPE_TN_IN | LOW_EXTREMITY | HIGH_EXTREMITY);
-        mGarbage = 0;
-        mLeftSegTail = leftSegTail;
-        mRightSegTail = p_length(newPage) - 1;
-        mSearchVecStart = searchVecStart;
-        mSearchVecEnd = searchVecStart;
-        mLastCursorFrame = null;
+
+        mPage = newRootPage;
+        /*P*/ // [
+        type(newType);
+        garbage(0);
+        /*P*/ // |
+        /*P*/ // p_intPutLE(newRootPage, 0, newType & 0xff); // type, reserved byte, and garbage
+        /*P*/ // ]
+        leftSegTail(leftSegTail);
+        rightSegTail(pageSize(newRootPage) - 1);
+        searchVecStart(searchVecStart);
+        searchVecEnd(searchVecStart);
 
         // Add a parent cursor frame for all left and right node cursors.
-        addParentFrames(stub, left, 0);
-        addParentFrames(stub, right, 2);
+        CursorFrame lock = new CursorFrame();
+        addParentFrames(lock, left, 0);
+        addParentFrames(lock, right, 2);
 
         child.releaseExclusive();
         sibling.releaseExclusive();
 
         // Split complete, so allow new node to be evictable.
         sibling.makeEvictable();
-
-        if (stub != null) {
-            stub.releaseExclusive();
-        }
     }
 
-    private void addParentFrames(Node stub, Node child, int pos) {
-        for (TreeCursorFrame frame = child.mLastCursorFrame; frame != null; ) {
-            TreeCursorFrame parentFrame = frame.mParentFrame;
-            if (parentFrame == null) {
-                parentFrame = new TreeCursorFrame();
-            } else {
-                if (parentFrame.mNode != stub) {
-                    throw new AssertionError
-                        ("Stub mismatch: " + parentFrame.mNode + " != " + stub);
+    private void addParentFrames(CursorFrame lock, Node child, int pos) {
+        for (CursorFrame frame = child.mLastCursorFrame; frame != null; ) {
+            CursorFrame lockResult = frame.tryLock(lock);
+            if (lockResult != null) {
+                try {
+                    CursorFrame parentFrame = frame.mParentFrame;
+                    if (parentFrame == null) {
+                        parentFrame = new CursorFrame();
+                        parentFrame.bind(this, pos);
+                        frame.mParentFrame = parentFrame;
+                    } else {
+                        parentFrame.rebind(this, pos);
+                    }
+                } finally {
+                    frame.unlock(lockResult);
                 }
-                parentFrame.unbind();
             }
-            parentFrame.bind(this, pos);
-            frame.mParentFrame = parentFrame;
+
             frame = frame.mPrevCousin;
         }
     }
@@ -801,138 +690,127 @@ final class Node extends Latch implements DatabaseAccess {
      * Caller must hold exclusive latch. Latch is never released by this method, even if
      * an exception is thrown.
      */
-    void read(Database db, long id) throws IOException {
+    void read(LocalDatabase db, long id) throws IOException {
+        db.readNode(this, id);
+        try {
+            readFields();
+        } catch (IllegalStateException e) {
+            throw new CorruptDatabaseException(e.getMessage());
+        }
+    }
+
+    private void readFields() throws IllegalStateException {
         /*P*/ byte[] page = mPage;
 
-        mCachedState = db.readNodePage(id, page);
-        mId = id;
-
         byte type = p_byteGet(page, 0);
-        mType = type;
+
+        /*P*/ // [
+        type(type);
 
         // For undo log node, this is top entry pointer.
-        mGarbage = p_ushortGetLE(page, 2);
+        garbage(p_ushortGetLE(page, 2));
+        /*P*/ // ]
 
         if (type != TYPE_UNDO_LOG) {
-            mLeftSegTail = p_ushortGetLE(page, 4);
-            mRightSegTail = p_ushortGetLE(page, 6);
-            mSearchVecStart = p_ushortGetLE(page, 8);
-            mSearchVecEnd = p_ushortGetLE(page, 10);
+            /*P*/ // [
+            leftSegTail(p_ushortGetLE(page, 4));
+            rightSegTail(p_ushortGetLE(page, 6));
+            searchVecStart(p_ushortGetLE(page, 8));
+            searchVecEnd(p_ushortGetLE(page, 10));
+            /*P*/ // ]
             type &= ~(LOW_EXTREMITY | HIGH_EXTREMITY);
             if (type >= 0 && type != TYPE_TN_IN && type != TYPE_TN_BIN) {
-                throw new CorruptDatabaseException("Unknown node type: " + mType + ", id: " + id);
+                throw new IllegalStateException("Unknown node type: " + type + ", id: " + mId);
             }
         }
 
         if (p_byteGet(page, 1) != 0) {
-            throw new CorruptDatabaseException
-                ("Illegal reserved byte in node: " + p_byteGet(page, 1));
+            throw new IllegalStateException
+                ("Illegal reserved byte in node: " + p_byteGet(page, 1) + ", id: " + mId);
         }
     }
 
     /**
      * Caller must hold any latch, which is not released, even if an exception is thrown.
      */
-    void write(PageDb db) throws IOException {
+    void write(PageDb db) throws WriteFailureException {
+        /*P*/ byte[] page = prepareWrite();
+        try {
+            db.writePage(mId, page);
+        } catch (IOException e) {
+            throw new WriteFailureException(e);
+        }
+    }
+
+    private /*P*/ byte[] prepareWrite() {
         if (mSplit != null) {
             throw new AssertionError("Cannot write partially split node");
         }
 
         /*P*/ byte[] page = mPage;
 
-        if (mType != TYPE_FRAGMENT) {
-            p_bytePut(page, 0, mType);
+        /*P*/ // [
+        if (type() != TYPE_FRAGMENT) {
+            p_bytePut(page, 0, type());
             p_bytePut(page, 1, 0); // reserved
 
             // For undo log node, this is top entry pointer.
-            p_shortPutLE(page, 2, mGarbage);
+            p_shortPutLE(page, 2, garbage());
 
-            if (mType != TYPE_UNDO_LOG) {
-                p_shortPutLE(page, 4, mLeftSegTail);
-                p_shortPutLE(page, 6, mRightSegTail);
-                p_shortPutLE(page, 8, mSearchVecStart);
-                p_shortPutLE(page, 10, mSearchVecEnd);
+            if (type() != TYPE_UNDO_LOG) {
+                p_shortPutLE(page, 4, leftSegTail());
+                p_shortPutLE(page, 6, rightSegTail());
+                p_shortPutLE(page, 8, searchVecStart());
+                p_shortPutLE(page, 10, searchVecEnd());
             }
         }
+        /*P*/ // ]
 
-        db.writePage(mId, page);
+        return page;
     }
 
     /**
      * Caller must hold exclusive latch on node. Latch is released by this
-     * method when null is returned or if an exception is thrown. If another
-     * node is returned, it is latched exclusively and original is released.
+     * method when false is returned or if an exception is thrown.
      *
-     * @return original or another node to be evicted; null if cannot evict
+     * @return false if cannot evict
      */
-    static Node evict(Node node, Database db) throws IOException {
-        if (node.mType != TYPE_UNDO_LOG) {
-            return node.evictTreeNode(db);
-        }
-
-        while (true) {
-            Node child = node.mNodeChainNext;
-            if (child != null) {
-                long childId = p_longGetLE(node.mPage, UndoLog.I_LOWER_NODE_ID);
-                // Check id match before lock attempt, as a quick short
-                // circuit if child has already been evicted.
-                if (childId == child.mId) {
-                    if (child.tryAcquireExclusive()) {
-                        // Check again in case another evict snuck in.
-                        if (childId == child.mId && child.mCachedState != CACHED_CLEAN) {
-                            // Try evicting the child instead.
-                            node.releaseExclusive();
-                            node = child;
-                            continue;
-                        }
-                        child.releaseExclusive();
-                    } else {
-                        // If latch cannot be acquired, assume child is still
-                        // in use, and so the parent node should be kept.
-                        node.releaseExclusive();
-                        return null;
-                    }
-                }
-            }
-            node.doEvict(db);
-            return node;
-        }
-    }
-
-    private Node evictTreeNode(Database db) throws IOException {
+    boolean evict(LocalDatabase db) throws IOException {
         if (mLastCursorFrame != null || mSplit != null) {
             // Cannot evict if in use by a cursor or if splitting. The split
             // check is redundant, since a node cannot be in a split state
             // without a cursor registered against it.
             releaseExclusive();
-            return null;
+            return false;
         }
 
-        // Check if <= 0 (already evicted) or stub.
-        if (mId > STUB_ID) {
-            doEvict(db);
-        }
-
-        return this;
-    }
-
-    /**
-     * Caller must hold exclusive latch on node. Latch is released by this
-     * method when an exception is thrown.
-     */
-    void doEvict(Database db) throws IOException {
         try {
-            if (mCachedState == CACHED_CLEAN) {
-                // Try to move to a secondary cache.
-                db.mPageDb.cachePage(mId, mPage);
-            } else {
-                write(db.mPageDb);
-                mCachedState = CACHED_CLEAN;
+            // Check if <= 0 (already evicted).
+            long id = mId;
+            if (id > 0) {
+                PageDb pageDb = db.mPageDb;
+                if (mCachedState == CACHED_CLEAN) {
+                    // Try to move to a secondary cache.
+                    pageDb.cachePage(id, mPage);
+                } else {
+                    /*P*/ byte[] page = prepareWrite();
+                    /*P*/ byte[] newPage = pageDb.evictPage(id, page);
+                    if (newPage != page) {
+                        mPage = newPage;
+                    }
+                    mCachedState = CACHED_CLEAN;
+                }
+
+                db.nodeMapRemove(this, Long.hashCode(id));
+                mId = 0;
+
+                // Note: Don't do this. In the fully mapped mode (using MappedPageArray),
+                // setting the type will corrupt the evicted node. The caller swaps in a
+                // different page, which is where the type should be written to.
+                //type(TYPE_NONE);
             }
 
-            db.mTreeNodeMap.remove(this, NodeMap.hash(mId));
-            mId = 0;
-            mType = TYPE_NONE;
+            return true;
         } catch (Throwable e) {
             releaseExclusive();
             throw e;
@@ -943,79 +821,263 @@ final class Node extends Latch implements DatabaseAccess {
      * Invalidate all cursors, starting from the root. Used when closing an index which still
      * has active cursors. Caller must hold exclusive latch on node.
      */
-    void invalidateCursors(NodeMap map) {
-        invalidateCursors(map, createEmptyNode(mType));
+    void invalidateCursors() {
+        invalidateCursors(createClosedNode());
     }
 
-    private void invalidateCursors(NodeMap map, Node empty) {
+    private void invalidateCursors(Node closed) {
         int pos = isLeaf() ? -1 : 0;
 
-        for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
-            frame.mNode = empty;
-            frame.mNodePos = pos;
-            frame = frame.mPrevCousin;
+        closed.acquireExclusive();
+        try {
+            for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
+                // Capture previous frame from linked list before changing the links.
+                CursorFrame prev = frame.mPrevCousin;
+                frame.rebind(closed, pos);
+                frame = prev;
+            }
+        } finally {
+            closed.releaseExclusive();
         }
 
         if (!isInternal()) {
             return;
         }
 
-        empty = null;
+        LocalDatabase db = mUsageList.mDatabase;
 
-        int childPtr = mSearchVecEnd + 2;
+        closed = null;
+
+        int childPtr = searchVecEnd() + 2;
         final int highestPtr = childPtr + (highestInternalPos() << 2);
         for (; childPtr <= highestPtr; childPtr += 8) {
             long childId = p_uint48GetLE(mPage, childPtr);
-            Node child = map.get(childId);
+            Node child = db.nodeMapGet(childId);
             if (child != null) {
                 child.acquireExclusive();
                 if (childId == child.mId) {
-                    if (empty == null) {
-                        empty = createEmptyNode(child.mType);
+                    if (closed == null) {
+                        closed = createClosedNode();
                     }
-                    child.invalidateCursors(map, empty);
+                    child.invalidateCursors(closed);
                 }
                 child.releaseExclusive();
             }
         }
     }
 
-    private static Node createEmptyNode(byte type) {
-        Node empty = new Node(null, p_empty());
-        empty.mId = STUB_ID;
-        empty.mCachedState = CACHED_CLEAN;
-        empty.mType = type;
-        empty.mSearchVecStart = 2;
-        empty.mSearchVecEnd = 0;
-        return empty;
+    private static Node createClosedNode() {
+        Node closed = new Node(null, p_closedTreePage());
+        closed.mId = CLOSED_ID;
+        closed.mCachedState = CACHED_CLEAN;
+        closed.readFields();
+        return closed;
+    }
+
+    private int pageSize(/*P*/ byte[] page) {
+        /*P*/ // [
+        return page.length;
+        /*P*/ // |
+        /*P*/ // return mUsageList.pageSize();
+        /*P*/ // ]
+    }
+
+    /**
+     * Get the node type.
+     */
+    byte type() {
+        /*P*/ // [
+        return mType;
+        /*P*/ // |
+        /*P*/ // return p_byteGet(mPage, 0);
+        /*P*/ // ]
+    }
+
+    /**
+     * Set the node type.
+     */
+    void type(byte type) {
+        /*P*/ // [
+        mType = type;
+        /*P*/ // |
+        /*P*/ // p_shortPutLE(mPage, 0, type & 0xff); // clear reserved byte too
+        /*P*/ // ]
+    }
+
+    /**
+     * Get the node garbage size.
+     */
+    int garbage() {
+        /*P*/ // [
+        return mGarbage;
+        /*P*/ // |
+        /*P*/ // return p_ushortGetLE(mPage, 2);
+        /*P*/ // ]
+    }
+
+    /**
+     * Set the node garbage size.
+     */
+    void garbage(int garbage) {
+        /*P*/ // [
+        mGarbage = garbage;
+        /*P*/ // |
+        /*P*/ // p_shortPutLE(mPage, 2, garbage);
+        /*P*/ // ]
+    }
+
+    /**
+     * Get the undo log node top entry pointer. (same field as garbage)
+     */
+    int undoTop() {
+        /*P*/ // [
+        return mGarbage;
+        /*P*/ // |
+        /*P*/ // return p_ushortGetLE(mPage, 2);
+        /*P*/ // ]
+    }
+
+    /**
+     * Set the undo log node top entry pointer. (same field as garbage)
+     */
+    void undoTop(int top) {
+        /*P*/ // [
+        mGarbage = top;
+        /*P*/ // |
+        /*P*/ // p_shortPutLE(mPage, 2, top);
+        /*P*/ // ]
+    }
+
+    /**
+     * Get the left segment tail pointer.
+     */
+    private int leftSegTail() {
+        /*P*/ // [
+        return mLeftSegTail;
+        /*P*/ // |
+        /*P*/ // return p_ushortGetLE(mPage, 4);
+        /*P*/ // ]
+    }
+
+    /**
+     * Set the left segment tail pointer.
+     */
+    private void leftSegTail(int tail) {
+        /*P*/ // [
+        mLeftSegTail = tail;
+        /*P*/ // |
+        /*P*/ // p_shortPutLE(mPage, 4, tail);
+        /*P*/ // ]
+    }
+
+    /**
+     * Get the right segment tail pointer.
+     */
+    private int rightSegTail() {
+        /*P*/ // [
+        return mRightSegTail;
+        /*P*/ // |
+        /*P*/ // return p_ushortGetLE(mPage, 6);
+        /*P*/ // ]
+    }
+
+    /**
+     * Set the right segment tail pointer.
+     */
+    private void rightSegTail(int tail) {
+        /*P*/ // [
+        mRightSegTail = tail;
+        /*P*/ // |
+        /*P*/ // p_shortPutLE(mPage, 6, tail);
+        /*P*/ // ]
+    }
+
+    /**
+     * Get the search vector start pointer.
+     */
+    int searchVecStart() {
+        /*P*/ // [
+        return mSearchVecStart;
+        /*P*/ // |
+        /*P*/ // return p_ushortGetLE(mPage, 8);
+        /*P*/ // ]
+    }
+
+    /**
+     * Set the search vector start pointer.
+     */
+    private void searchVecStart(int start) {
+        /*P*/ // [
+        mSearchVecStart = start;
+        /*P*/ // |
+        /*P*/ // p_shortPutLE(mPage, 8, start);
+        /*P*/ // ]
+    }
+
+    /**
+     * Get the search vector end pointer.
+     */
+    int searchVecEnd() {
+        /*P*/ // [
+        return mSearchVecEnd;
+        /*P*/ // |
+        /*P*/ // return p_ushortGetLE(mPage, 10);
+        /*P*/ // ]
+    }
+
+    /**
+     * Set the search vector end pointer.
+     */
+    private void searchVecEnd(int end) {
+        /*P*/ // [
+        mSearchVecEnd = end;
+        /*P*/ // |
+        /*P*/ // p_shortPutLE(mPage, 10, end);
+        /*P*/ // ]
     }
 
     /**
      * Caller must hold any latch.
      */
     boolean isLeaf() {
-        return mType < 0;
+        return type() < 0;
     }
 
     /**
-     * Caller must hold any latch.
+     * Caller must hold any latch. Returns true if node is any kind of internal node.
      */
     boolean isInternal() {
-        return (mType & 0x60) == 0x60;
+        return (type() & 0xe0) == 0x60;
     }
 
     /**
      * Caller must hold any latch.
      */
+    boolean isBottomInternal() {
+        return (type() & 0xf0) == 0x70;
+    }
+
+    /**
+     * Caller must hold any latch.
+     */
+    boolean isNonBottomInternal() {
+        return (type() & 0xf0) == 0x60;
+    }
+
+    /**
+     * Caller must hold any latch.
+     *
+     * @see #countNonGhostKeys
+     */
     int numKeys() {
-        return (mSearchVecEnd - mSearchVecStart + 2) >> 1;
+        return (searchVecEnd() - searchVecStart() + 2) >> 1;
     }
 
     /**
      * Caller must hold any latch.
      */
     boolean hasKeys() {
-        return mSearchVecEnd >= mSearchVecStart;
+        return searchVecEnd() >= searchVecStart();
     }
 
     /**
@@ -1023,14 +1085,14 @@ final class Node extends Latch implements DatabaseAccess {
      * node has no keys, return value is negative. Caller must hold any latch.
      */
     int highestKeyPos() {
-        return mSearchVecEnd - mSearchVecStart;
+        return searchVecEnd() - searchVecStart();
     }
 
     /**
      * Returns highest leaf or internal position. Caller must hold any latch.
      */
     int highestPos() {
-        int pos = mSearchVecEnd - mSearchVecStart;
+        int pos = searchVecEnd() - searchVecStart();
         if (!isLeaf()) {
             pos += 2;
         }
@@ -1043,7 +1105,7 @@ final class Node extends Latch implements DatabaseAccess {
      * hold any latch.
      */
     int highestLeafPos() {
-        return mSearchVecEnd - mSearchVecStart;
+        return searchVecEnd() - searchVecStart();
     }
 
     /**
@@ -1053,7 +1115,7 @@ final class Node extends Latch implements DatabaseAccess {
      * at position zero. Caller must hold any latch.
      */
     int highestInternalPos() {
-        return mSearchVecEnd - mSearchVecStart + 2;
+        return searchVecEnd() - searchVecStart() + 2;
     }
 
     /**
@@ -1067,16 +1129,43 @@ final class Node extends Latch implements DatabaseAccess {
      * Caller must hold any latch.
      */
     int availableLeafBytes() {
-        return mGarbage + mSearchVecStart - mSearchVecEnd
-            - mLeftSegTail + mRightSegTail + (1 - 2);
+        return garbage() + searchVecStart() - searchVecEnd()
+            - leftSegTail() + rightSegTail() + (1 - 2);
     }
 
     /**
      * Caller must hold any latch.
      */
     int availableInternalBytes() {
-        return mGarbage + 5 * (mSearchVecStart - mSearchVecEnd)
-            - mLeftSegTail + mRightSegTail + (1 - (5 * 2 + 8));
+        return garbage() + 5 * (searchVecStart() - searchVecEnd())
+            - leftSegTail() + rightSegTail() + (1 - (5 * 2 + 8));
+    }
+
+    /**
+     * Applicable only to leaf nodes. Caller must hold any latch.
+     */
+    int countNonGhostKeys() {
+        return countNonGhostKeys(searchVecStart(), searchVecEnd());
+    }
+
+    /**
+     * Applicable only to leaf nodes. Caller must hold any latch.
+     *
+     * @param lowPos 2-based search vector position (inclusive)
+     * @param highPos 2-based search vector position (inclusive)
+     */
+    int countNonGhostKeys(int lowPos, int highPos) {
+        final /*P*/ byte[] page = mPage;
+
+        int count = 0;
+        for (int i = lowPos; i <= highPos; i += 2) {
+            int loc = p_ushortGetLE(page, i);
+            if (p_byteGet(page, loc + keyLengthAtLoc(page, loc)) != -1) {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     /**
@@ -1097,9 +1186,9 @@ final class Node extends Latch implements DatabaseAccess {
 
     boolean shouldMerge(int availBytes) {
         return mSplit == null
-            & (((mType & (LOW_EXTREMITY | HIGH_EXTREMITY)) == 0
-                 & availBytes >= ((p_length(mPage) - TN_HEADER_SIZE) >> 1))
-                | !hasKeys());
+            && (((type() & (LOW_EXTREMITY | HIGH_EXTREMITY)) == 0
+                 && availBytes >= ((pageSize(mPage) - TN_HEADER_SIZE) >> 1))
+                || !hasKeys());
     }
 
     /**
@@ -1108,8 +1197,8 @@ final class Node extends Latch implements DatabaseAccess {
     int binarySearch(byte[] key) throws IOException {
         final /*P*/ byte[] page = mPage;
         final int keyLen = key.length;
-        int lowPos = mSearchVecStart;
-        int highPos = mSearchVecEnd;
+        int lowPos = searchVecStart();
+        int highPos = searchVecEnd();
 
         int lowMatch = 0;
         int highMatch = 0;
@@ -1179,11 +1268,11 @@ final class Node extends Latch implements DatabaseAccess {
                 highPos = midPos - 2;
                 highMatch = i;
             } else {
-                return midPos - mSearchVecStart;
+                return midPos - searchVecStart();
             }
         }
 
-        return ~(lowPos - mSearchVecStart);
+        return ~(lowPos - searchVecStart());
     }
 
     /**
@@ -1191,8 +1280,8 @@ final class Node extends Latch implements DatabaseAccess {
      * @return 2-based insertion pos, which is negative if key not found
      */
     int binarySearch(byte[] key, int midPos) throws IOException {
-        int lowPos = mSearchVecStart;
-        int highPos = mSearchVecEnd;
+        int lowPos = searchVecStart();
+        int highPos = searchVecEnd();
         if (lowPos > highPos) {
             return -1;
         }
@@ -1271,7 +1360,7 @@ final class Node extends Latch implements DatabaseAccess {
                     highPos = midPos - 2;
                     highMatch = i;
                 } else {
-                    return midPos - mSearchVecStart;
+                    return midPos - searchVecStart();
                 }
             }
 
@@ -1282,7 +1371,7 @@ final class Node extends Latch implements DatabaseAccess {
             midPos = ((lowPos + highPos) >> 1) & ~1;
         }
 
-        return ~(lowPos - mSearchVecStart);
+        return ~(lowPos - searchVecStart());
     }
 
     /**
@@ -1295,9 +1384,129 @@ final class Node extends Latch implements DatabaseAccess {
     /**
      * @param pos position as provided by binarySearch; must be positive
      */
+    int compareKey(int pos, byte[] rightKey) throws IOException {
+        final /*P*/ byte[] page = mPage;
+        int loc = p_ushortGetLE(page, searchVecStart() + pos);
+        int keyLen = p_byteGet(page, loc++);
+        if (keyLen >= 0) {
+            keyLen++;
+        } else {
+            int header = keyLen;
+            keyLen = ((keyLen & 0x3f) << 8) | p_ubyteGet(page, loc++);
+            if ((header & ENTRY_FRAGMENTED) != 0) {
+                // Note: An optimized version wouldn't need to copy the whole key.
+                byte[] leftKey = getDatabase().reconstructKey(page, loc, keyLen);
+                return compareUnsigned(leftKey, 0, leftKey.length, rightKey, 0, rightKey.length);
+            }
+        }
+        return p_compareKeysPageToArray(page, loc, keyLen, rightKey, 0, rightKey.length);
+    }
+
+    /**
+     * Compares two node keys, in place if possible.
+     *
+     * @param leftLoc absolute location of left key
+     * @param rightLoc absolute location of right key
+     */
+    static int compareKeys(Node left, int leftLoc, Node right, int rightLoc) throws IOException {
+        final /*P*/ byte[] leftPage = left.mPage;
+        final /*P*/ byte[] rightPage = right.mPage;
+
+        int leftLen = p_byteGet(leftPage, leftLoc++);
+        int rightLen = p_byteGet(rightPage, rightLoc++);
+
+        c1: { // break out of this scope when both keys are in the page
+            c2: { // break out of this scope when the left key is in the page
+                if (leftLen >= 0) {
+                    // Left key is tiny... break out and examine the right key.
+                    leftLen++;
+                    break c2;
+                }
+
+                int leftHeader = leftLen;
+                leftLen = ((leftLen & 0x3f) << 8) | p_ubyteGet(leftPage, leftLoc++);
+                if ((leftHeader & ENTRY_FRAGMENTED) == 0) {
+                    // Left key is medium... break out and examine the right key.
+                    break c2;
+                }
+
+                // Left key is fragmented...
+                // Note: An optimized version wouldn't need to copy the whole key.
+                byte[] leftKey = left.getDatabase().reconstructKey(leftPage, leftLoc, leftLen);
+
+                if (rightLen >= 0) {
+                    // Left key is fragmented, and right key is tiny.
+                    rightLen++;
+                } else {
+                    int rightHeader = rightLen;
+                    rightLen = ((rightLen & 0x3f) << 8) | p_ubyteGet(rightPage, rightLoc++);
+                    if ((rightHeader & ENTRY_FRAGMENTED) != 0) {
+                        // Right key is fragmented too.
+                        // Note: An optimized version wouldn't need to copy the whole key.
+                        byte[] rightKey = right.getDatabase()
+                            .reconstructKey(rightPage, rightLoc, rightLen);
+                        return compareUnsigned(leftKey, 0, leftKey.length,
+                                               rightKey, 0, rightKey.length);
+                    }
+                }
+
+                return -p_compareKeysPageToArray(rightPage, rightLoc, rightLen,
+                                                 leftKey, 0, leftKey.length);
+            } // end c2
+
+            if (rightLen >= 0) {
+                // Left key is tiny/medium, right key is tiny, and both fit in the page.
+                rightLen++;
+                break c1;
+            }
+
+            int rightHeader = rightLen;
+            rightLen = ((rightLen & 0x3f) << 8) | p_ubyteGet(rightPage, rightLoc++);
+            if ((rightHeader & ENTRY_FRAGMENTED) == 0) {
+                // Left key is tiny/medium, right key is medium, and both fit in the page.
+                break c1;
+            }
+
+            // Left key is tiny/medium, and right key is fragmented.
+            // Note: An optimized version wouldn't need to copy the whole key.
+            byte[] rightKey = right.getDatabase().reconstructKey(rightPage, rightLoc, rightLen);
+            return p_compareKeysPageToArray(leftPage, leftLoc, leftLen,
+                                            rightKey, 0, rightKey.length);
+        } // end c1
+
+        return p_compareKeysPageToPage(leftPage, leftLoc, leftLen, rightPage, rightLoc, rightLen);
+    }
+
+    /**
+     * @param pos position as provided by binarySearch; must be positive
+     * @param stats [0]: full length, [1]: number of pages (>0 if fragmented)
+     */
+    void retrieveKeyStats(int pos, long[] stats) throws IOException {
+        final /*P*/ byte[] page = mPage;
+        int loc = p_ushortGetLE(page, searchVecStart() + pos);
+
+        int keyLen = p_byteGet(page, loc++);
+        if (keyLen >= 0) {
+            keyLen++;
+        } else {
+            int header = keyLen;
+            keyLen = ((keyLen & 0x3f) << 8) | p_ubyteGet(page, loc++);
+            if ((header & ENTRY_FRAGMENTED) != 0) {
+                getDatabase().reconstruct(page, loc, keyLen, stats);
+                return;
+            }
+        }
+
+        stats[0] = keyLen;
+        stats[1] = 0;
+    }
+
+    /**
+     * @param pos position as provided by binarySearch; must be positive
+     */
     byte[] retrieveKey(int pos) throws IOException {
         final /*P*/ byte[] page = mPage;
-        return retrieveKeyAtLoc(this, page, p_ushortGetLE(page, mSearchVecStart + pos));
+        return retrieveKeyAtLoc(this, page, p_ushortGetLE(page, searchVecStart() + pos));
     }
 
     /**
@@ -1364,7 +1573,7 @@ final class Node extends Latch implements DatabaseAccess {
      */
     byte[] retrieveKeyCmp(int pos, byte[] limitKey, int limitMode) throws IOException {
         final /*P*/ byte[] page = mPage;
-        int loc = p_ushortGetLE(page, mSearchVecStart + pos);
+        int loc = p_ushortGetLE(page, searchVecStart() + pos);
         int keyLen = p_byteGet(page, loc++);
         if (keyLen >= 0) {
             keyLen++;
@@ -1374,7 +1583,7 @@ final class Node extends Latch implements DatabaseAccess {
 
             if ((header & ENTRY_FRAGMENTED) != 0) {
                 byte[] key = getDatabase().reconstructKey(page, loc, keyLen);
-                int cmp = compareKeys(key, limitKey);
+                int cmp = compareUnsigned(key, limitKey);
                 if (cmp == 0) {
                     return limitKey;
                 } else {
@@ -1432,13 +1641,13 @@ final class Node extends Latch implements DatabaseAccess {
      */
     private byte[] midKey(int lowPos, byte[] highKey) throws IOException {
         final /*P*/ byte[] lowPage = mPage;
-        int lowLoc = p_ushortGetLE(lowPage, mSearchVecStart + lowPos);
+        int lowLoc = p_ushortGetLE(lowPage, searchVecStart() + lowPos);
         int lowKeyLen = p_byteGet(lowPage, lowLoc);
         if (lowKeyLen < 0) {
             // Note: An optimized version wouldn't need to copy the whole key.
             return Utils.midKey(retrieveKeyAtLoc(lowPage, lowLoc), highKey);
         } else {
-            return p_midKeyLowPage(lowPage, lowLoc + 1, lowKeyLen + 1, highKey, 0, highKey.length);
+            return p_midKeyLowPage(lowPage, lowLoc + 1, lowKeyLen + 1, highKey, 0);
         }
     }
 
@@ -1449,14 +1658,13 @@ final class Node extends Latch implements DatabaseAccess {
      */
     private byte[] midKey(byte[] lowKey, int highPos) throws IOException {
         final /*P*/ byte[] highPage = mPage;
-        int highLoc = p_ushortGetLE(highPage, mSearchVecStart + highPos);
+        int highLoc = p_ushortGetLE(highPage, searchVecStart() + highPos);
         int highKeyLen = p_byteGet(highPage, highLoc);
         if (highKeyLen < 0) {
             // Note: An optimized version wouldn't need to copy the whole key.
             return Utils.midKey(lowKey, retrieveKeyAtLoc(highPage, highLoc));
         } else {
-            return p_midKeyHighPage(lowKey, 0, lowKey.length,
-                                    highPage, highLoc + 1, highKeyLen + 1);
+            return p_midKeyHighPage(lowKey, 0, lowKey.length, highPage, highLoc + 1);
         }
     }
 
@@ -1467,7 +1675,7 @@ final class Node extends Latch implements DatabaseAccess {
      */
     byte[] midKey(int lowPos, Node highNode, int highPos) throws IOException {
         final /*P*/ byte[] lowPage = mPage;
-        int lowLoc = p_ushortGetLE(lowPage, mSearchVecStart + lowPos);
+        int lowLoc = p_ushortGetLE(lowPage, searchVecStart() + lowPos);
         int lowKeyLen = p_byteGet(lowPage, lowLoc);
         if (lowKeyLen < 0) {
             // Note: An optimized version wouldn't need to copy the whole key.
@@ -1478,16 +1686,15 @@ final class Node extends Latch implements DatabaseAccess {
         lowKeyLen++;
 
         final /*P*/ byte[] highPage = highNode.mPage;
-        int highLoc = p_ushortGetLE(highPage, highNode.mSearchVecStart + highPos);
+        int highLoc = p_ushortGetLE(highPage, highNode.searchVecStart() + highPos);
         int highKeyLen = p_byteGet(highPage, highLoc);
         if (highKeyLen < 0) {
             // Note: An optimized version wouldn't need to copy the whole key.
             byte[] highKey = retrieveKeyAtLoc(highPage, highLoc);
-            return p_midKeyLowPage(lowPage, lowLoc, lowKeyLen, highKey, 0, highKey.length);
+            return p_midKeyLowPage(lowPage, lowLoc, lowKeyLen, highKey, 0);
         }
 
-        return p_midKeyLowHighPage(lowPage, lowLoc, lowKeyLen,
-                                   highPage, highLoc + 1, highKeyLen + 1);
+        return p_midKeyLowHighPage(lowPage, lowLoc, lowKeyLen, highPage, highLoc + 1);
     }
 
     /**
@@ -1496,9 +1703,45 @@ final class Node extends Latch implements DatabaseAccess {
      */
     byte[] hasLeafValue(int pos) {
         final /*P*/ byte[] page = mPage;
-        int loc = p_ushortGetLE(page, mSearchVecStart + pos);
+        int loc = p_ushortGetLE(page, searchVecStart() + pos);
         loc += keyLengthAtLoc(page, loc);
         return p_byteGet(page, loc) == -1 ? null : Cursor.NOT_LOADED;
+    }
+
+    /**
+     * @param pos position as provided by binarySearch; must be positive
+     * @param stats [0]: full length, [1]: number of pages (>0 if fragmented)
+     */
+    void retrieveLeafValueStats(int pos, long[] stats) throws IOException {
+        final /*P*/ byte[] page = mPage;
+        int loc = p_ushortGetLE(page, searchVecStart() + pos);
+        loc += keyLengthAtLoc(page, loc);
+
+        final int header = p_byteGet(page, loc++);
+
+        int len;
+        if (header >= 0) {
+            len = header;
+        } else {
+            if ((header & 0x20) == 0) {
+                len = 1 + (((header & 0x1f) << 8) | p_ubyteGet(page, loc++));
+            } else if (header != -1) {
+                len = 1 + (((header & 0x0f) << 16)
+                           | (p_ubyteGet(page, loc++) << 8) | p_ubyteGet(page, loc++));
+            } else {
+                // ghost
+                stats[0] = 0;
+                stats[1] = 0;
+                return;
+            }
+            if ((header & ENTRY_FRAGMENTED) != 0) {
+                getDatabase().reconstruct(page, loc, len, stats);
+                return;
+            }
+        }
+
+        stats[0] = len;
+        stats[1] = 0;
     }
 
     /**
@@ -1507,13 +1750,12 @@ final class Node extends Latch implements DatabaseAccess {
      */
     byte[] retrieveLeafValue(int pos) throws IOException {
         final /*P*/ byte[] page = mPage;
-        int loc = p_ushortGetLE(page, mSearchVecStart + pos);
+        int loc = p_ushortGetLE(page, searchVecStart() + pos);
         loc += keyLengthAtLoc(page, loc);
         return retrieveLeafValueAtLoc(this, page, loc);
     }
 
-    private static byte[] retrieveLeafValueAtLoc(DatabaseAccess dbAccess,
-                                                 /*P*/ byte[] page, int loc)
+    static byte[] retrieveLeafValueAtLoc(DatabaseAccess dbAccess, /*P*/ byte[] page, int loc)
         throws IOException
     {
         final int header = p_byteGet(page, loc++);
@@ -1553,7 +1795,7 @@ final class Node extends Latch implements DatabaseAccess {
      */
     void retrieveLeafEntry(int pos, TreeCursor cursor) throws IOException {
         final /*P*/ byte[] page = mPage;
-        int loc = p_ushortGetLE(page, mSearchVecStart + pos);
+        int loc = p_ushortGetLE(page, searchVecStart() + pos);
         int header = p_byteGet(page, loc++);
 
         int keyLen;
@@ -1590,7 +1832,7 @@ final class Node extends Latch implements DatabaseAccess {
      */
     boolean isFragmentedLeafValue(int pos) {
         final /*P*/ byte[] page = mPage;
-        int loc = p_ushortGetLE(page, mSearchVecStart + pos);
+        int loc = p_ushortGetLE(page, searchVecStart() + pos);
         loc += keyLengthAtLoc(page, loc);
         int header = p_byteGet(page, loc);
         return ((header & 0xc0) >= 0xc0) & (header < -1);
@@ -1607,11 +1849,11 @@ final class Node extends Latch implements DatabaseAccess {
      *
      * @param pos position as provided by binarySearch; must be positive
      */
-    void txnDeleteLeafEntry(Transaction txn, Tree tree, byte[] key, int keyHash, int pos)
+    void txnDeleteLeafEntry(LocalTransaction txn, Tree tree, byte[] key, int keyHash, int pos)
         throws IOException
     {
         final /*P*/ byte[] page = mPage;
-        final int entryLoc = p_ushortGetLE(page, mSearchVecStart + pos);
+        final int entryLoc = p_ushortGetLE(page, searchVecStart() + pos);
         int loc = entryLoc;
 
         // Skip the key.
@@ -1657,7 +1899,7 @@ final class Node extends Latch implements DatabaseAccess {
 
         // Replace value with ghost.
         p_bytePut(page, valueHeaderLoc, -1);
-        mGarbage += loc - valueHeaderLoc - 1;
+        garbage(garbage() + loc - valueHeaderLoc - 1);
 
         if (txn.mDurabilityMode != DurabilityMode.NO_REDO) {
             txn.redoStore(tree.mId, key, null);
@@ -1671,11 +1913,11 @@ final class Node extends Latch implements DatabaseAccess {
      *
      * @param pos position as provided by binarySearch; must be positive
      */
-    void txnPreUpdateLeafEntry(Transaction txn, Tree tree, byte[] key, int pos)
+    void txnPreUpdateLeafEntry(LocalTransaction txn, Tree tree, byte[] key, int pos)
         throws IOException
     {
         final /*P*/ byte[] page = mPage;
-        final int entryLoc = p_ushortGetLE(page, mSearchVecStart + pos);
+        final int entryLoc = p_ushortGetLE(page, searchVecStart() + pos);
         int loc = entryLoc;
 
         // Skip the key.
@@ -1726,7 +1968,32 @@ final class Node extends Latch implements DatabaseAccess {
      * @param pos position as provided by binarySearch; must be positive
      */
     long retrieveChildRefId(int pos) {
-        return p_uint48GetLE(mPage, mSearchVecEnd + 2 + (pos << 2));
+        return p_uint48GetLE(mPage, searchVecEnd() + 2 + (pos << 2));
+    }
+
+    /**
+     * Retrieves the count of entries for the child node at the given position, or negative if
+     * unknown. Counts are only applicable to bottom internal nodes, and are invalidated when
+     * the node is dirty.
+     *
+     * @param pos position as provided by binarySearch; must be positive
+     */
+    int retrieveChildEntryCount(int pos) {
+        return p_ushortGetLE(mPage, searchVecEnd() + (2 + 6) + (pos << 2)) - 1;
+    }
+
+    /**
+     * Stores the count of entries for the child node at the given position. Counts are only
+     * applicable to bottom internal nodes, and are invalidated when the node is dirty.
+     *
+     * @param pos position as provided by binarySearch; must be positive
+     * @param count 0..65534
+     * @see #countNonGhostKeys
+     */
+    void storeChildEntryCount(int pos, int count) {
+        if (count < 65535) { // safety check
+            p_shortPutLE(mPage, searchVecEnd() + (2 + 6) + (pos << 2), count + 1);
+        }
     }
 
     /**
@@ -1758,125 +2025,196 @@ final class Node extends Latch implements DatabaseAccess {
     }
 
     /**
+     * @param frame optional frame which is bound to this node; only used for rebalancing
      * @param pos complement of position as provided by binarySearch; must be positive
      * @param okey original key
      */
-    void insertLeafEntry(Tree tree, int pos, byte[] okey, byte[] value) throws IOException {
-        byte[] akey = okey;
-        int encodedKeyLen = calculateAllowedKeyLength(tree, okey);
-
-        if (encodedKeyLen < 0) {
-            // Key must be fragmented.
-            akey = tree.fragmentKey(okey);
-            encodedKeyLen = 2 + akey.length;
-        }
-
-        int encodedLen = encodedKeyLen + calculateLeafValueLength(value);
-
-        int vfrag;
-        if (encodedLen <= tree.mMaxEntrySize) {
-            vfrag = 0;
-        } else {
-            Database db = tree.mDatabase;
-            value = db.fragment(value, value.length, db.mMaxFragmentedEntrySize - encodedKeyLen);
-            if (value == null) {
-                throw new AssertionError();
-            }
-            encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
-            vfrag = ENTRY_FRAGMENTED;
-        }
-
-        int entryLoc = createLeafEntry(tree, pos, encodedLen);
-
-        if (entryLoc < 0) {
-            splitLeafAndCreateEntry(tree, okey, akey, vfrag, value, encodedLen, pos, true);
-        } else {
-            copyToLeafEntry(okey, akey, vfrag, value, entryLoc);
-        }
-    }
-
-    /**
-     * @param pos complement of position as provided by binarySearch; must be positive
-     * @param okey original key
-     */
-    void insertBlankLeafEntry(Tree tree, int pos, byte[] okey, long vlength) throws IOException {
-        byte[] akey = okey;
-        int encodedKeyLen = calculateAllowedKeyLength(tree, okey);
-
-        if (encodedKeyLen < 0) {
-            // Key must be fragmented.
-            akey = tree.fragmentKey(okey);
-            encodedKeyLen = 2 + akey.length;
-        }
-
-        long longEncodedLen = encodedKeyLen + calculateLeafValueLength(vlength);
-        int encodedLen;
-
-        int vfrag;
-        byte[] value;
-        if (longEncodedLen <= tree.mMaxEntrySize) {
-            vfrag = 0;
-            value = new byte[(int) vlength];
-            encodedLen = (int) longEncodedLen;
-        } else {
-            Database db = tree.mDatabase;
-            value = db.fragment(null, vlength, db.mMaxFragmentedEntrySize - encodedKeyLen);
-            if (value == null) {
-                throw new AssertionError();
-            }
-            encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
-            vfrag = ENTRY_FRAGMENTED;
-        }
-
-        int entryLoc = createLeafEntry(tree, pos, encodedLen);
-
-        if (entryLoc < 0) {
-            splitLeafAndCreateEntry(tree, okey, akey, vfrag, value, encodedLen, pos, true);
-        } else {
-            copyToLeafEntry(okey, akey, vfrag, value, entryLoc);
-        }
-    }
-
-    /**
-     * @param pos complement of position as provided by binarySearch; must be positive
-     * @param okey original key
-     */
-    void insertFragmentedLeafEntry(Tree tree, int pos, byte[] okey, byte[] value)
+    void insertLeafEntry(CursorFrame frame, Tree tree, int pos, byte[] okey, byte[] value)
         throws IOException
     {
+        final LocalDatabase db = tree.mDatabase;
+
         byte[] akey = okey;
-        int encodedKeyLen = calculateAllowedKeyLength(tree, okey);
+        int encodedKeyLen = calculateAllowedKeyLength(db, okey);
 
         if (encodedKeyLen < 0) {
             // Key must be fragmented.
-            akey = tree.fragmentKey(okey);
+            akey = db.fragmentKey(okey);
             encodedKeyLen = 2 + akey.length;
         }
 
-        int encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
+        try {
+            int encodedLen = encodedKeyLen + calculateLeafValueLength(value);
 
-        int entryLoc = createLeafEntry(tree, pos, encodedLen);
+            int vfrag;
+            if (encodedLen <= db.mMaxEntrySize) {
+                vfrag = 0;
+            } else {
+                value = db.fragment(value, value.length,
+                                    db.mMaxFragmentedEntrySize - encodedKeyLen);
+                if (value == null) {
+                    throw new AssertionError();
+                }
+                encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
+                vfrag = ENTRY_FRAGMENTED;
+            }
 
-        if (entryLoc < 0) {
-            splitLeafAndCreateEntry
-                (tree, okey, akey, ENTRY_FRAGMENTED, value, encodedLen, pos, true);
-        } else {
-            copyToLeafEntry(okey, akey, ENTRY_FRAGMENTED, value, entryLoc);
+            try {
+                int entryLoc = createLeafEntry(frame, tree, pos, encodedLen);
+
+                if (entryLoc < 0) {
+                    splitLeafAndCreateEntry(tree, okey, akey, vfrag, value, encodedLen, pos, true);
+                } else {
+                    copyToLeafEntry(okey, akey, vfrag, value, entryLoc);
+                }
+            } catch (Throwable e) {
+                if (vfrag == ENTRY_FRAGMENTED) {
+                    cleanupFragments(e, value);
+                }
+                throw e;
+            }
+        } catch (Throwable e) {
+            if (okey != akey) {
+                cleanupFragments(e, akey);
+            }
+            throw e;
         }
     }
 
     /**
+     * @param frame optional frame which is bound to this node; only used for rebalancing
+     * @param pos complement of position as provided by binarySearch; must be positive
+     * @param okey original key
+     */
+    void insertBlankLeafEntry(CursorFrame frame, Tree tree, int pos, byte[] okey, long vlength)
+        throws IOException
+    {
+        final LocalDatabase db = tree.mDatabase;
+
+        byte[] akey = okey;
+        int encodedKeyLen = calculateAllowedKeyLength(db, okey);
+
+        if (encodedKeyLen < 0) {
+            // Key must be fragmented.
+            akey = db.fragmentKey(okey);
+            encodedKeyLen = 2 + akey.length;
+        }
+
+        try {
+            long longEncodedLen = encodedKeyLen + calculateLeafValueLength(vlength);
+            int encodedLen;
+
+            int vfrag;
+            byte[] value;
+            if (longEncodedLen <= db.mMaxEntrySize) {
+                vfrag = 0;
+                value = new byte[(int) vlength];
+                encodedLen = (int) longEncodedLen;
+            } else {
+                value = db.fragment(null, vlength, db.mMaxFragmentedEntrySize - encodedKeyLen);
+                if (value == null) {
+                    throw new AssertionError();
+                }
+                encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
+                vfrag = ENTRY_FRAGMENTED;
+            }
+
+            try {
+                int entryLoc = createLeafEntry(frame, tree, pos, encodedLen);
+
+                if (entryLoc < 0) {
+                    splitLeafAndCreateEntry(tree, okey, akey, vfrag, value, encodedLen, pos, true);
+                } else {
+                    copyToLeafEntry(okey, akey, vfrag, value, entryLoc);
+                }
+            } catch (Throwable e) {
+                if (vfrag == ENTRY_FRAGMENTED) {
+                    cleanupFragments(e, value);
+                }
+                throw e;
+            }
+        } catch (Throwable e) {
+            if (okey != akey) {
+                cleanupFragments(e, akey);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * @param frame optional frame which is bound to this node; only used for rebalancing
+     * @param pos complement of position as provided by binarySearch; must be positive
+     * @param okey original key
+     */
+    void insertFragmentedLeafEntry(CursorFrame frame,
+                                   Tree tree, int pos, byte[] okey, byte[] value)
+        throws IOException
+    {
+        final LocalDatabase db = tree.mDatabase;
+
+        byte[] akey = okey;
+        int encodedKeyLen = calculateAllowedKeyLength(db, okey);
+
+        if (encodedKeyLen < 0) {
+            // Key must be fragmented.
+            akey = db.fragmentKey(okey);
+            encodedKeyLen = 2 + akey.length;
+        }
+
+        try {
+            int encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
+
+            int entryLoc = createLeafEntry(frame, tree, pos, encodedLen);
+
+            if (entryLoc < 0) {
+                splitLeafAndCreateEntry
+                    (tree, okey, akey, ENTRY_FRAGMENTED, value, encodedLen, pos, true);
+            } else {
+                copyToLeafEntry(okey, akey, ENTRY_FRAGMENTED, value, entryLoc);
+            }
+        } catch (Throwable e) {
+            if (okey != akey) {
+                cleanupFragments(e, akey);
+            }
+            throw e;
+        }
+    }
+
+    private void panic(Throwable cause) {
+        try {
+            getDatabase().close(cause);
+        } catch (Throwable e) {
+            // Ignore.
+        }
+    }
+
+    private void cleanupFragments(Throwable cause, byte[] fragmented) {
+        if (fragmented != null) {
+            /*P*/ byte[] copy = p_transfer(fragmented);
+            try {
+                getDatabase().deleteFragments(copy, 0, fragmented.length);
+            } catch (Throwable e) {
+                cause.addSuppressed(e);
+                panic(cause);
+            } finally {
+                p_delete(copy);
+            }
+        }
+    }
+
+    /**
+     * @param frame optional frame which is bound to this node; only used for rebalancing
      * @param pos complement of position as provided by binarySearch; must be positive
      * @return Location for newly allocated entry, already pointed to by search
      * vector, or negative if leaf must be split. Complement of negative value
      * is maximum space available.
      */
-    int createLeafEntry(Tree tree, int pos, final int encodedLen) {
-        int searchVecStart = mSearchVecStart;
-        int searchVecEnd = mSearchVecEnd;
+    int createLeafEntry(final CursorFrame frame, Tree tree, int pos, final int encodedLen) {
+        int searchVecStart = searchVecStart();
+        int searchVecEnd = searchVecEnd();
 
-        int leftSpace = searchVecStart - mLeftSegTail;
-        int rightSpace = mRightSegTail - searchVecEnd - 1;
+        int leftSpace = searchVecStart - leftSegTail();
+        int rightSpace = rightSegTail() - searchVecEnd - 1;
 
         final /*P*/ byte[] page = mPage;
 
@@ -1889,7 +2227,7 @@ final class Node extends Latch implements DatabaseAccess {
                 {
                     p_copy(page, searchVecStart, page, searchVecStart -= 2, pos);
                     pos += searchVecStart;
-                    mSearchVecStart = searchVecStart;
+                    searchVecStart(searchVecStart);
                     break alloc;
                 }
                 // Need to make space, but restore leftSpace value first.
@@ -1901,7 +2239,7 @@ final class Node extends Latch implements DatabaseAccess {
                 {
                     pos += searchVecStart;
                     p_copy(page, pos, page, pos + 2, (searchVecEnd += 2) - pos);
-                    mSearchVecEnd = searchVecEnd;
+                    searchVecEnd(searchVecEnd);
                     break alloc;
                 }
                 // Need to make space, but restore rightSpace value first.
@@ -1911,87 +2249,49 @@ final class Node extends Latch implements DatabaseAccess {
             // Compute remaining space surrounding search vector after insert completes.
             int remaining = leftSpace + rightSpace - encodedLen - 2;
 
-            if (mGarbage > remaining) {
-                compact: {
-                    // Do full compaction and free up the garbage, or else node must be split.
+            if (garbage() > remaining) {
+                // Do full compaction and free up the garbage, or else node must be split.
 
-                    if (mGarbage + remaining < 0) {
-                        // Node compaction won't make enough room, but attempt to rebalance
-                        // before splitting.
-
-                        TreeCursorFrame frame = mLastCursorFrame;
-                        if (frame == null || (frame = frame.mParentFrame) == null) {
-                            // No sibling nodes, so cannot rebalance.
-                            break compact;
-                        }
-
-                        // "Randomly" choose left or right node first.
-                        if ((mId & 1) == 0) {
-                            int result = tryRebalanceLeafLeft
-                                (tree, frame, pos, encodedLen, -remaining);
-                            if (result == 0) {
-                                // First rebalance attempt failed.
-                                result = tryRebalanceLeafRight
-                                    (tree, frame, pos, encodedLen, -remaining);
-                                if (result == 0) {
-                                    // Second rebalance attempt failed too, so split.
-                                    break compact;
-                                } else if (result > 0) {
-                                    return result;
-                                }
-                            } else if (result > 0) {
-                                return result;
-                            } else {
-                                pos += result;
-                            }
-                        } else {
-                            int result = tryRebalanceLeafRight
-                                (tree, frame, pos, encodedLen, -remaining);
-                            if (result == 0) {
-                                // First rebalance attempt failed.
-                                result = tryRebalanceLeafLeft
-                                    (tree, frame, pos, encodedLen, -remaining);
-                                if (result == 0) {
-                                    // Second rebalance attempt failed too, so split.
-                                    break compact;
-                                } else if (result > 0) {
-                                    return result;
-                                } else {
-                                    pos += result;
-                                }
-                            } else if (result > 0) {
-                                return result;
-                            }
-                        }
-                    }
-
+                if (garbage() + remaining >= 0) {
                     return compactLeaf(encodedLen, pos, true);
+                }
+
+                // Node compaction won't make enough room, but attempt to rebalance
+                // before splitting.
+
+                CursorFrame parentFrame;
+                if (frame != null && (parentFrame = frame.mParentFrame) != null) {
+                    int result = tryRebalanceLeaf(tree, parentFrame, pos, encodedLen, -remaining);
+                    if (result > 0) {
+                        // Rebalance worked.
+                        return result;
+                    }
                 }
 
                 // Determine max possible entry size allowed, accounting too for entry pointer,
                 // key length, and value length. Key and value length might only require only
                 // require 1 byte fields, but be safe and choose the larger size of 2.
-                int max = mGarbage + leftSpace + rightSpace - (2 + 2 + 2);
+                int max = garbage() + leftSpace + rightSpace - (2 + 2 + 2);
                 return max <= 0 ? -1 : ~max;
             }
 
             int vecLen = searchVecEnd - searchVecStart + 2;
             int newSearchVecStart;
 
-            if (remaining > 0 || (mRightSegTail & 1) != 0) {
+            if (remaining > 0 || (rightSegTail() & 1) != 0) {
                 // Re-center search vector, biased to the right, ensuring proper alignment.
-                newSearchVecStart = (mRightSegTail - vecLen + (1 - 2) - (remaining >> 1)) & ~1;
+                newSearchVecStart = (rightSegTail() - vecLen + (1 - 2) - (remaining >> 1)) & ~1;
 
                 // Allocate entry from left segment.
-                entryLoc = mLeftSegTail;
-                mLeftSegTail = entryLoc + encodedLen;
-            } else if ((mLeftSegTail & 1) == 0) {
+                entryLoc = leftSegTail();
+                leftSegTail(entryLoc + encodedLen);
+            } else if ((leftSegTail() & 1) == 0) {
                 // Move search vector left, ensuring proper alignment.
-                newSearchVecStart = mLeftSegTail + ((remaining >> 1) & ~1);
+                newSearchVecStart = leftSegTail() + ((remaining >> 1) & ~1);
 
                 // Allocate entry from right segment.
-                entryLoc = mRightSegTail - encodedLen + 1;
-                mRightSegTail = entryLoc - 1;
+                entryLoc = rightSegTail() - encodedLen + 1;
+                rightSegTail(entryLoc - 1);
             } else {
                 // Search vector is misaligned, so do full compaction.
                 return compactLeaf(encodedLen, pos, true);
@@ -2002,13 +2302,45 @@ final class Node extends Latch implements DatabaseAccess {
                      searchVecStart + pos, newSearchVecStart + pos + 2, vecLen - pos);
 
             pos += newSearchVecStart;
-            mSearchVecStart = newSearchVecStart;
-            mSearchVecEnd = newSearchVecStart + vecLen;
+            searchVecStart(newSearchVecStart);
+            searchVecEnd(newSearchVecStart + vecLen);
         }
 
         // Write pointer to new allocation.
         p_shortPutLE(page, pos, entryLoc);
         return entryLoc;
+    }
+
+    /**
+     * Attempt to make room in this node by moving entries to the left or right sibling
+     * node. First determines if moving entries to the sibling node is allowed and would free
+     * up enough space. Next, attempts to latch parent and child nodes without waiting,
+     * avoiding deadlocks.
+     *
+     * @param tree required
+     * @param parentFrame required
+     * @param pos position to insert into
+     * @param insertLen encoded length of entry to insert
+     * @param minAmount minimum amount of bytes to move to make room
+     * @return 0 if try failed, or entry location of re-used slot
+     */
+    private int tryRebalanceLeaf(Tree tree, CursorFrame parentFrame,
+                                 int pos, int insertLen, int minAmount)
+    {
+        int result;
+        // "Randomly" choose left or right node first.
+        if ((mId & 1) == 0) {
+            result = tryRebalanceLeafLeft(tree, parentFrame, pos, insertLen, minAmount);
+            if (result <= 0) {
+                result = tryRebalanceLeafRight(tree, parentFrame, pos, insertLen, minAmount);
+            }
+        } else {
+            result = tryRebalanceLeafRight(tree, parentFrame, pos, insertLen, minAmount);
+            if (result <= 0) {
+                result = tryRebalanceLeafLeft(tree, parentFrame, pos, insertLen, minAmount);
+            }
+        }
+        return result;
     }
 
     /**
@@ -2021,10 +2353,9 @@ final class Node extends Latch implements DatabaseAccess {
      * @param pos position to insert into; this position cannot move left
      * @param insertLen encoded length of entry to insert
      * @param minAmount minimum amount of bytes to move to make room
-     * @return 0 if try failed, or entry location of re-used slot, or negative 2-based position
-     * decrement if no slot was found
+     * @return 0 if try failed, or entry location of re-used slot
      */
-    private int tryRebalanceLeafLeft(Tree tree, TreeCursorFrame parentFrame,
+    private int tryRebalanceLeafLeft(Tree tree, CursorFrame parentFrame,
                                      int pos, int insertLen, int minAmount)
     {
         final /*P*/ byte[] rightPage = mPage;
@@ -2035,7 +2366,7 @@ final class Node extends Latch implements DatabaseAccess {
         int insertSlack = Integer.MAX_VALUE;
 
         check: {
-            int searchVecLoc = mSearchVecStart;
+            int searchVecLoc = searchVecStart();
             int searchVecEnd = searchVecLoc + pos - 2;
 
             // Note that loop doesn't examine last entry. At least one must remain.
@@ -2102,14 +2433,14 @@ final class Node extends Latch implements DatabaseAccess {
                 int leftAvail = left.availableLeafBytes();
                 if (leftAvail >= moveAmount) {
                     // Parent search key will be updated, so verify that it has room.
-                    int highPos = lastSearchVecLoc - mSearchVecStart;
+                    int highPos = lastSearchVecLoc - searchVecStart();
                     newKey = midKey(highPos - 2, this, highPos);
                     // Only attempt rebalance if new key doesn't need to be fragmented.
-                    newKeyLen = calculateAllowedKeyLength(tree, newKey);
+                    newKeyLen = calculateAllowedKeyLength(tree.mDatabase, newKey);
                     if (newKeyLen > 0) {
                         parentPage = parent.mPage;
                         parentKeyLoc = p_ushortGetLE
-                            (parentPage, parent.mSearchVecStart + childPos - 2);
+                            (parentPage, parent.searchVecStart() + childPos - 2);
                         parentKeyGrowth = newKeyLen - keyLengthAtLoc(parentPage, parentKeyLoc);
                         if (parentKeyGrowth <= 0 ||
                             parentKeyGrowth <= parent.availableInternalBytes())
@@ -2140,32 +2471,33 @@ final class Node extends Latch implements DatabaseAccess {
         // Update the parent key.
         if (parentKeyGrowth <= 0) {
             encodeNormalKey(newKey, parentPage, parentKeyLoc);
-            parent.mGarbage -= parentKeyGrowth;
+            parent.garbage(parent.garbage() - parentKeyGrowth);
         } else {
             parent.updateInternalKey(childPos - 2, parentKeyGrowth, newKey, newKeyLen);
         }
 
         int garbageAccum = 0;
-        int searchVecLoc = mSearchVecStart;
+        int searchVecLoc = searchVecStart();
         final int lastPos = lastSearchVecLoc - searchVecLoc;
 
         for (; searchVecLoc < lastSearchVecLoc; searchVecLoc += 2) {
             int entryLoc = p_ushortGetLE(rightPage, searchVecLoc);
             int encodedLen = leafEntryLengthAtLoc(rightPage, entryLoc);
-            int leftEntryLoc = left.createLeafEntry(tree, left.highestLeafPos() + 2, encodedLen);
+            int leftEntryLoc = left.createLeafEntry
+                (null, tree, left.highestLeafPos() + 2, encodedLen);
             // Note: Must access left page each time, since compaction can replace it.
             p_copy(rightPage, entryLoc, left.mPage, leftEntryLoc, encodedLen);
             garbageAccum += encodedLen;
         }
 
-        mGarbage += garbageAccum;
-        mSearchVecStart = lastSearchVecLoc;
+        garbage(garbage() + garbageAccum);
+        searchVecStart(lastSearchVecLoc);
 
         // Fix cursor positions or move them to the left node.
         final int leftEndPos = left.highestLeafPos() + 2;
-        for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
+        for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
             // Capture previous frame from linked list before changing the links.
-            TreeCursorFrame prev = frame.mPrevCousin;
+            CursorFrame prev = frame.mPrevCousin;
             int framePos = frame.mNodePos;
             int mask = framePos >> 31;
             int newPos = (framePos ^ mask) - lastPos;
@@ -2175,12 +2507,14 @@ final class Node extends Latch implements DatabaseAccess {
             // search there. Note that tryRebalanceLeafRight has an identical check, after
             // applying De Morgan's law. Because the chosen parent node is not strictly the
             // lowest from the right, a comparison must be made to the actual new parent node.
+            byte[] frameKey;
             if (newPos < 0 |
-                ((newPos == 0 & mask != 0) && compareKeys(frame.mNotFoundKey, newKey) < 0))
+                ((newPos == 0 & mask != 0) &&
+                 ((frameKey = frame.mNotFoundKey) != null &&
+                  compareUnsigned(frameKey, newKey) < 0)))
             {
-                frame.unbind();
-                frame.bind(left, (leftEndPos + newPos) ^ mask);
-                frame.mParentFrame.mNodePos -= 2;
+                frame.rebind(left, (leftEndPos + newPos) ^ mask);
+                frame.adjustParentPosition(-2);
             } else {
                 frame.mNodePos = newPos ^ mask;
             }
@@ -2190,17 +2524,13 @@ final class Node extends Latch implements DatabaseAccess {
         left.releaseExclusive();
         parent.releaseExclusive();
 
-        /* Not possible unless aggressive compaction is allowed.
-        if (insertLoc == 0) {
-            return -lastPos;
-        }
-        */
-
         // Expand search vector for inserted entry and write pointer to the re-used slot.
-        mGarbage -= insertLen;
+        garbage(garbage() - insertLen);
         pos -= lastPos;
-        p_copy(rightPage, mSearchVecStart, rightPage, mSearchVecStart -= 2, pos);
-        p_shortPutLE(rightPage, mSearchVecStart + pos, insertLoc);
+        int searchVecStart = searchVecStart();
+        p_copy(rightPage, searchVecStart, rightPage, searchVecStart -= 2, pos);
+        searchVecStart(searchVecStart);
+        p_shortPutLE(rightPage, searchVecStart + pos, insertLoc);
         return insertLoc;
     }
 
@@ -2214,9 +2544,9 @@ final class Node extends Latch implements DatabaseAccess {
      * @param pos position to insert into; this position cannot move right
      * @param insertLen encoded length of entry to insert
      * @param minAmount minimum amount of bytes to move to make room
-     * @return 0 if try failed, or entry location of re-used slot, or negative if no slot was found
+     * @return 0 if try failed, or entry location of re-used slot
      */
-    private int tryRebalanceLeafRight(Tree tree, TreeCursorFrame parentFrame,
+    private int tryRebalanceLeafRight(Tree tree, CursorFrame parentFrame,
                                       int pos, int insertLen, int minAmount)
     {
         final /*P*/ byte[] leftPage = mPage;
@@ -2227,8 +2557,8 @@ final class Node extends Latch implements DatabaseAccess {
         int insertSlack = Integer.MAX_VALUE;
 
         check: {
-            int searchVecStart = mSearchVecStart + pos;
-            int searchVecLoc = mSearchVecEnd;
+            int searchVecStart = searchVecStart() + pos;
+            int searchVecLoc = searchVecEnd();
 
             // Note that loop doesn't examine first entry. At least one must remain.
             for (; searchVecLoc > searchVecStart; searchVecLoc -= 2) {
@@ -2294,14 +2624,14 @@ final class Node extends Latch implements DatabaseAccess {
                 int rightAvail = right.availableLeafBytes();
                 if (rightAvail >= moveAmount) {
                     // Parent search key will be updated, so verify that it has room.
-                    int highPos = firstSearchVecLoc - mSearchVecStart;
+                    int highPos = firstSearchVecLoc - searchVecStart();
                     newKey = midKey(highPos - 2, this, highPos);
                     // Only attempt rebalance if new key doesn't need to be fragmented.
-                    newKeyLen = calculateAllowedKeyLength(tree, newKey);
+                    newKeyLen = calculateAllowedKeyLength(tree.mDatabase, newKey);
                     if (newKeyLen > 0) {
                         parentPage = parent.mPage;
                         parentKeyLoc = p_ushortGetLE
-                            (parentPage, parent.mSearchVecStart + childPos);
+                            (parentPage, parent.searchVecStart() + childPos);
                         parentKeyGrowth = newKeyLen - keyLengthAtLoc(parentPage, parentKeyLoc);
                         if (parentKeyGrowth <= 0 ||
                             parentKeyGrowth <= parent.availableInternalBytes())
@@ -2332,29 +2662,29 @@ final class Node extends Latch implements DatabaseAccess {
         // Update the parent key.
         if (parentKeyGrowth <= 0) {
             encodeNormalKey(newKey, parentPage, parentKeyLoc);
-            parent.mGarbage -= parentKeyGrowth;
+            parent.garbage(parent.garbage() - parentKeyGrowth);
         } else {
             parent.updateInternalKey(childPos, parentKeyGrowth, newKey, newKeyLen);
         }
 
         int garbageAccum = 0;
-        int searchVecLoc = mSearchVecEnd;
+        int searchVecLoc = searchVecEnd();
         final int moved = searchVecLoc - firstSearchVecLoc + 2;
 
         for (; searchVecLoc >= firstSearchVecLoc; searchVecLoc -= 2) {
             int entryLoc = p_ushortGetLE(leftPage, searchVecLoc);
             int encodedLen = leafEntryLengthAtLoc(leftPage, entryLoc);
-            int rightEntryLoc = right.createLeafEntry(tree, 0, encodedLen);
+            int rightEntryLoc = right.createLeafEntry(null, tree, 0, encodedLen);
             // Note: Must access right page each time, since compaction can replace it.
             p_copy(leftPage, entryLoc, right.mPage, rightEntryLoc, encodedLen);
             garbageAccum += encodedLen;
         }
 
-        mGarbage += garbageAccum;
-        mSearchVecEnd = firstSearchVecLoc - 2;
+        garbage(garbage() + garbageAccum);
+        searchVecEnd(firstSearchVecLoc - 2);
 
         // Fix cursor positions in the right node.
-        for (TreeCursorFrame frame = right.mLastCursorFrame; frame != null; ) {
+        for (CursorFrame frame = right.mLastCursorFrame; frame != null; ) {
             int framePos = frame.mNodePos;
             int mask = framePos >> 31;
             frame.mNodePos = ((framePos ^ mask) + moved) ^ mask;
@@ -2362,10 +2692,10 @@ final class Node extends Latch implements DatabaseAccess {
         }
 
         // Move affected cursor frames to the right node.
-        final int leftEndPos = firstSearchVecLoc - mSearchVecStart;
-        for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
+        final int leftEndPos = firstSearchVecLoc - searchVecStart();
+        for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
             // Capture previous frame from linked list before changing the links.
-            TreeCursorFrame prev = frame.mPrevCousin;
+            CursorFrame prev = frame.mPrevCousin;
             int framePos = frame.mNodePos;
             int mask = framePos >> 31;
             int newPos = (framePos ^ mask) - leftEndPos;
@@ -2376,12 +2706,14 @@ final class Node extends Latch implements DatabaseAccess {
             // tryRebalanceLeafLeft has an identical check, after applying De Morgan's law.
             // Because the chosen parent node is not strictly the lowest from the right, a
             // comparison must be made to the actual new parent node.
+            byte[] frameKey;
             if (newPos >= 0 &
-                ((newPos != 0 | mask == 0) || compareKeys(frame.mNotFoundKey, newKey) >= 0))
+                ((newPos != 0 | mask == 0) ||
+                 ((frameKey = frame.mNotFoundKey) != null &&
+                  compareUnsigned(frameKey, newKey) >= 0)))
             {
-                frame.unbind();
-                frame.bind(right, newPos ^ mask);
-                frame.mParentFrame.mNodePos += 2;
+                frame.rebind(right, newPos ^ mask);
+                frame.adjustParentPosition(+2);
             }
             frame = prev;
         }
@@ -2389,29 +2721,26 @@ final class Node extends Latch implements DatabaseAccess {
         right.releaseExclusive();
         parent.releaseExclusive();
 
-        /* Not possible unless aggressive compaction is allowed.
-        if (insertLoc == 0) {
-            return -1;
-        }
-        */
-
         // Expand search vector for inserted entry and write pointer to the re-used slot.
-        mGarbage -= insertLen;
-        pos += mSearchVecStart;
-        p_copy(leftPage, pos, leftPage, pos + 2, (mSearchVecEnd += 2) - pos);
+        garbage(garbage() - insertLen);
+        pos += searchVecStart();
+        int newSearchVecEnd = searchVecEnd() + 2;
+        p_copy(leftPage, pos, leftPage, pos + 2, newSearchVecEnd - pos);
+        searchVecEnd(newSearchVecEnd);
         p_shortPutLE(leftPage, pos, insertLoc);
         return insertLoc;
     }
 
     /**
      * Insert into an internal node following a child node split. This parent node and child
-     * node must have an exclusive latch held. Parent and child latch are always released, even
-     * if an exception is thrown.
+     * node must have an exclusive latch held. Child latch is always released, and an exception
+     * releases the parent latch too.
      *
+     * @param frame optional frame which is bound to this node; only used for rebalancing
      * @param keyPos position to insert split key
      * @param splitChild child node which split
      */
-    void insertSplitChildRef(Tree tree, int keyPos, Node splitChild)
+    void insertSplitChildRef(final CursorFrame frame, Tree tree, int keyPos, Node splitChild)
         throws IOException
     {
         final Split split = splitChild.mSplit;
@@ -2432,29 +2761,35 @@ final class Node extends Latch implements DatabaseAccess {
             }
 
             // Positions of frames higher than split key need to be incremented.
-            for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
-                int framePos = frame.mNodePos;
-                if (framePos > keyPos) {
-                    frame.mNodePos = framePos + 2;
+            for (CursorFrame f = mLastCursorFrame; f != null; ) {
+                int fPos = f.mNodePos;
+                if (fPos > keyPos) {
+                    f.mNodePos = fPos + 2;
                 }
-                frame = frame.mPrevCousin;
+                f = f.mPrevCousin;
             }
 
             // Positions of frames equal to split key are in the split itself. Only
             // frames for the right split need to be incremented.
-            for (TreeCursorFrame childFrame = rightChild.mLastCursorFrame; childFrame != null; ) {
-                TreeCursorFrame frame = childFrame.mParentFrame;
-                if (frame.mNode != this) {
-                    throw new AssertionError("Invalid cursor frame parent: " + frame.mNode
-                                             + ", " + this + ", " + newChild);
-                }
-                frame.mNodePos += 2;
+            for (CursorFrame childFrame = rightChild.mLastCursorFrame; childFrame != null; ) {
+                childFrame.adjustParentPosition(+2);
                 childFrame = childFrame.mPrevCousin;
             }
 
-            // FIXME: IOException caused by call to splitInternal; frames are all wrong
-            InResult result = createInternalEntry
-                (tree, keyPos, split.splitKeyEncodedLength(), newChildPos << 3, true);
+            // Note: Invocation of createInternalEntry may cause splitInternal to be called,
+            // which in turn might throw a recoverable exception. State changes can be undone
+            // by decrementing the incremented frame positions, and then by undoing the
+            // rebindSplitFrames call. However, this would create an orphaned child node.
+            // Panicking the database is the safest option.
+
+            InResult result = new InResult();
+            try {
+                createInternalEntry(frame, result, tree, keyPos, split.splitKeyEncodedLength(),
+                                    newChildPos << 3, true);
+            } catch (Throwable e) {
+                panic(e);
+                throw e;
+            }
 
             // Write new child id.
             p_longPutLE(result.mPage, result.mNewChildLoc, newChild.mId);
@@ -2492,21 +2827,24 @@ final class Node extends Latch implements DatabaseAccess {
      * node and child node must have an exclusive latch held. Child latch is
      * released, unless an exception is thrown.
      *
+     * @param frame optional frame which is bound to this node; only used for rebalancing
+     * @param result return result stored here; if node was split, key and entry loc is -1 if
+     * new key was promoted to parent
      * @param keyPos 2-based position
      * @param newChildPos 8-based position
      * @param allowSplit true if this internal node can be split as a side-effect
-     * @return result; if node was split, key and entry loc is -1 if new key was promoted to parent
      * @throws AssertionError if entry must be split to make room but split is not allowed
      */
-    private InResult createInternalEntry(Tree tree, int keyPos, int encodedLen,
-                                         int newChildPos, boolean allowSplit)
+    private void createInternalEntry(final CursorFrame frame, InResult result,
+                                     Tree tree, int keyPos, int encodedLen,
+                                     int newChildPos, boolean allowSplit)
         throws IOException
     {
-        int searchVecStart = mSearchVecStart;
-        int searchVecEnd = mSearchVecEnd;
+        int searchVecStart = searchVecStart();
+        int searchVecEnd = searchVecEnd();
 
-        int leftSpace = searchVecStart - mLeftSegTail;
-        int rightSpace = mRightSegTail - searchVecEnd
+        int leftSpace = searchVecStart - leftSegTail();
+        int rightSpace = rightSegTail() - searchVecEnd
             - ((searchVecEnd - searchVecStart) << 2) - 17;
 
         /*P*/ byte[] page = mPage;
@@ -2525,9 +2863,9 @@ final class Node extends Latch implements DatabaseAccess {
                     p_copy(page, searchVecStart + keyPos,
                            page, searchVecStart + keyPos - 8,
                            searchVecEnd - searchVecStart + 2 - keyPos + newChildPos);
-                    mSearchVecStart = searchVecStart -= 10;
+                    searchVecStart(searchVecStart -= 10);
                     keyPos += searchVecStart;
-                    mSearchVecEnd = searchVecEnd -= 8;
+                    searchVecEnd(searchVecEnd -= 8);
                     newChildPos += searchVecEnd + 2;
                     break alloc;
                 }
@@ -2544,7 +2882,7 @@ final class Node extends Latch implements DatabaseAccess {
                     (entryLoc = allocPageEntry(encodedLen, leftSpace, rightSpace)) >= 0)
                 {
                     p_copy(page, searchVecStart, page, searchVecStart -= 2, keyPos);
-                    mSearchVecStart = searchVecStart;
+                    searchVecStart(searchVecStart);
                     keyPos += searchVecStart;
                     p_copy(page, searchVecEnd + newChildPos + 2,
                            page, searchVecEnd + newChildPos + (2 + 8),
@@ -2561,26 +2899,29 @@ final class Node extends Latch implements DatabaseAccess {
             // Compute remaining space surrounding search vector after insert completes.
             int remaining = leftSpace + rightSpace - encodedLen - 10;
 
-            if (mGarbage > remaining) {
+            if (garbage() > remaining) {
                 compact: {
                     // Do full compaction and free up the garbage, or else node must be split.
 
-                    if ((mGarbage + remaining) < 0) {
+                    if ((garbage() + remaining) < 0) {
                         // Node compaction won't make enough room, but attempt to rebalance
                         // before splitting.
 
-                        TreeCursorFrame frame = mLastCursorFrame;
-                        if (frame == null || (frame = frame.mParentFrame) == null) {
+                        CursorFrame parentFrame;
+                        if (frame == null || (parentFrame = frame.mParentFrame) == null) {
                             // No sibling nodes, so cannot rebalance.
                             break compact;
                         }
                         
                         // "Randomly" choose left or right node first.
                         if ((mId & 1) == 0) {
-                            int adjust = tryRebalanceInternalLeft(tree, frame, keyPos, -remaining);
+                            int adjust = tryRebalanceInternalLeft
+                                (tree, parentFrame, keyPos, -remaining);
                             if (adjust == 0) {
                                 // First rebalance attempt failed.
-                                if (!tryRebalanceInternalRight(tree, frame, keyPos, -remaining)) {
+                                if (!tryRebalanceInternalRight
+                                    (tree, parentFrame, keyPos, -remaining))
+                                {
                                     // Second rebalance attempt failed too, so split.
                                     break compact;
                                 }
@@ -2588,9 +2929,12 @@ final class Node extends Latch implements DatabaseAccess {
                                 keyPos -= adjust;
                                 newChildPos -= (adjust << 2);
                             }
-                        } else if (!tryRebalanceInternalRight(tree, frame, keyPos, -remaining)) {
+                        } else if (!tryRebalanceInternalRight
+                                   (tree, parentFrame, keyPos, -remaining))
+                        {
                             // First rebalance attempt failed.
-                            int adjust = tryRebalanceInternalLeft(tree, frame, keyPos, -remaining);
+                            int adjust = tryRebalanceInternalLeft
+                                (tree, parentFrame, keyPos, -remaining);
                             if (adjust == 0) {
                                 // Second rebalance attempt failed too, so split.
                                 break compact;
@@ -2601,7 +2945,8 @@ final class Node extends Latch implements DatabaseAccess {
                         }
                     }
 
-                    return compactInternal(encodedLen, keyPos, newChildPos);
+                    compactInternal(result, encodedLen, keyPos, newChildPos);
+                    return;
                 }
 
                 // Node is full, so split it.
@@ -2611,31 +2956,33 @@ final class Node extends Latch implements DatabaseAccess {
                 }
 
                 // No side-effects if an IOException is thrown here.
-                return splitInternal(tree, encodedLen, keyPos, newChildPos);
+                splitInternal(result, tree, encodedLen, keyPos, newChildPos);
+                return;
             }
 
             int vecLen = searchVecEnd - searchVecStart + 2;
             int childIdsLen = (vecLen << 2) + 8;
             int newSearchVecStart;
 
-            if (remaining > 0 || (mRightSegTail & 1) != 0) {
+            if (remaining > 0 || (rightSegTail() & 1) != 0) {
                 // Re-center search vector, biased to the right, ensuring proper alignment.
                 newSearchVecStart =
-                    (mRightSegTail - vecLen - childIdsLen + (1 - 10) - (remaining >> 1)) & ~1;
+                    (rightSegTail() - vecLen - childIdsLen + (1 - 10) - (remaining >> 1)) & ~1;
 
                 // Allocate entry from left segment.
-                entryLoc = mLeftSegTail;
-                mLeftSegTail = entryLoc + encodedLen;
-            } else if ((mLeftSegTail & 1) == 0) {
+                entryLoc = leftSegTail();
+                leftSegTail(entryLoc + encodedLen);
+            } else if ((leftSegTail() & 1) == 0) {
                 // Move search vector left, ensuring proper alignment.
-                newSearchVecStart = mLeftSegTail + ((remaining >> 1) & ~1);
+                newSearchVecStart = leftSegTail() + ((remaining >> 1) & ~1);
 
                 // Allocate entry from right segment.
-                entryLoc = mRightSegTail - encodedLen + 1;
-                mRightSegTail = entryLoc - 1;
+                entryLoc = rightSegTail() - encodedLen + 1;
+                rightSegTail(entryLoc - 1);
             } else {
                 // Search vector is misaligned, so do full compaction.
-                return compactInternal(encodedLen, keyPos, newChildPos);
+                compactInternal(result, encodedLen, keyPos, newChildPos);
+                return;
             }
 
             int newSearchVecEnd = newSearchVecStart + vecLen;
@@ -2656,19 +3003,16 @@ final class Node extends Latch implements DatabaseAccess {
 
             keyPos += newSearchVecStart;
             newChildPos += newSearchVecEnd + 2;
-            mSearchVecStart = newSearchVecStart;
-            mSearchVecEnd = newSearchVecEnd;
+            searchVecStart(newSearchVecStart);
+            searchVecEnd(newSearchVecEnd);
         }
 
         // Write pointer to key entry.
         p_shortPutLE(page, keyPos, entryLoc);
 
-        InResult result = new InResult();
         result.mPage = page;
         result.mNewChildLoc = newChildPos;
         result.mEntryLoc = entryLoc;
-
-        return result;
     }
 
     /**
@@ -2682,7 +3026,7 @@ final class Node extends Latch implements DatabaseAccess {
      * @param minAmount minimum amount of bytes to move to make room
      * @return 2-based position increment; 0 if try failed
      */
-    private int tryRebalanceInternalLeft(Tree tree, TreeCursorFrame parentFrame,
+    private int tryRebalanceInternalLeft(Tree tree, CursorFrame parentFrame,
                                          int keyPos, int minAmount)
     {
         final Node parent = parentFrame.tryAcquireExclusive();
@@ -2709,7 +3053,7 @@ final class Node extends Latch implements DatabaseAccess {
         final int lastSearchVecLoc;
 
         check: {
-            int searchVecLoc = mSearchVecStart;
+            int searchVecLoc = searchVecStart();
             int searchVecEnd = searchVecLoc + keyPos - 2;
 
             // Note that loop doesn't examine last entry. At least one must remain.
@@ -2726,7 +3070,7 @@ final class Node extends Latch implements DatabaseAccess {
                     // Leftmost key to move comes from the parent, and first moved key in the
                     // right node does not affect left node growth.
                     leftGrowth -= len;
-                    keyLoc = p_ushortGetLE(parentPage, parent.mSearchVecStart + childPos - 2);
+                    keyLoc = p_ushortGetLE(parentPage, parent.searchVecStart() + childPos - 2);
                     leftGrowth += keyLengthAtLoc(parentPage, keyLoc) + (2 + 8);
 
                     break check;
@@ -2765,7 +3109,7 @@ final class Node extends Latch implements DatabaseAccess {
                 // Parent search key will be updated, so verify that it has room.
                 searchKeyLoc = p_ushortGetLE(rightPage, lastSearchVecLoc);
                 searchKeyLen = keyLengthAtLoc(rightPage, searchKeyLoc);
-                parentKeyLoc = p_ushortGetLE(parentPage, parent.mSearchVecStart + childPos - 2);
+                parentKeyLoc = p_ushortGetLE(parentPage, parent.searchVecStart() + childPos - 2);
                 parentKeyLen = keyLengthAtLoc(parentPage, parentKeyLoc);
                 parentKeyGrowth = searchKeyLen - parentKeyLen;
                 if (parentKeyGrowth <= 0 || parentKeyGrowth <= parent.availableInternalBytes()) {
@@ -2789,14 +3133,14 @@ final class Node extends Latch implements DatabaseAccess {
         }
 
         int garbageAccum = searchKeyLen;
-        int searchVecLoc = mSearchVecStart;
+        int searchVecLoc = searchVecStart();
         final int moved = lastSearchVecLoc - searchVecLoc + 2;
 
         try {
             // Leftmost key to move comes from the parent.
             int pos = left.highestInternalPos();
-            InResult result = left.createInternalEntry
-                (tree, pos, parentKeyLen, (pos + 2) << 2, false);
+            InResult result = new InResult();
+            left.createInternalEntry(null, result, tree, pos, parentKeyLen, (pos + 2) << 2, false);
             // Note: Must access left page each time, since compaction can replace it.
             p_copy(parentPage, parentKeyLoc, left.mPage, result.mEntryLoc, parentKeyLen);
 
@@ -2805,7 +3149,8 @@ final class Node extends Latch implements DatabaseAccess {
                 int keyLoc = p_ushortGetLE(rightPage, searchVecLoc);
                 int encodedLen = keyLengthAtLoc(rightPage, keyLoc);
                 pos = left.highestInternalPos();
-                result = left.createInternalEntry(tree, pos, encodedLen, (pos + 2) << 2, false);
+                left.createInternalEntry
+                    (null, result, tree, pos, encodedLen, (pos + 2) << 2, false);
                 // Note: Must access left page each time, since compaction can replace it.
                 p_copy(rightPage, keyLoc, left.mPage, result.mEntryLoc, encodedLen);
                 garbageAccum += encodedLen;
@@ -2818,7 +3163,7 @@ final class Node extends Latch implements DatabaseAccess {
         // Update the parent key after moving it to the left node.
         if (parentKeyGrowth <= 0) {
             p_copy(rightPage, searchKeyLoc, parentPage, parentKeyLoc, searchKeyLen);
-            parent.mGarbage -= parentKeyGrowth;
+            parent.garbage(parent.garbage() - parentKeyGrowth);
         } else {
             parent.updateInternalKeyEncoded
                 (childPos - 2, parentKeyGrowth, rightPage, searchKeyLoc, searchKeyLen);
@@ -2826,28 +3171,27 @@ final class Node extends Latch implements DatabaseAccess {
 
         // Move encoded child pointers.
         {
-            int start = mSearchVecEnd + 2;
+            int start = searchVecEnd() + 2;
             int len = moved << 2;
-            int end = left.mSearchVecEnd;
-            end = end + ((end - left.mSearchVecStart) << 2) + (2 + 16) - len;
+            int end = left.searchVecEnd();
+            end = end + ((end - left.searchVecStart()) << 2) + (2 + 16) - len;
             p_copy(rightPage, start, left.mPage, end, len);
             p_copy(rightPage, start + len, rightPage, start, (start - lastSearchVecLoc) << 2);
         }
 
-        mGarbage += garbageAccum;
-        mSearchVecStart = lastSearchVecLoc + 2;
+        garbage(garbage() + garbageAccum);
+        searchVecStart(lastSearchVecLoc + 2);
 
         // Fix cursor positions or move them to the left node.
         final int leftEndPos = left.highestInternalPos() + 2;
-        for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
+        for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
             // Capture previous frame from linked list before changing the links.
-            TreeCursorFrame prev = frame.mPrevCousin;
+            CursorFrame prev = frame.mPrevCousin;
             int framePos = frame.mNodePos;
             int newPos = framePos - moved;
             if (newPos < 0) {
-                frame.unbind();
-                frame.bind(left, leftEndPos + newPos);
-                frame.mParentFrame.mNodePos -= 2;
+                frame.rebind(left, leftEndPos + newPos);
+                frame.adjustParentPosition(-2);
             } else {
                 frame.mNodePos = newPos;
             }
@@ -2870,7 +3214,7 @@ final class Node extends Latch implements DatabaseAccess {
      * @param keyPos position to insert into; this position cannot move right
      * @param minAmount minimum amount of bytes to move to make room
      */
-    private boolean tryRebalanceInternalRight(Tree tree, TreeCursorFrame parentFrame,
+    private boolean tryRebalanceInternalRight(Tree tree, CursorFrame parentFrame,
                                               int keyPos, int minAmount)
     {
         final Node parent = parentFrame.tryAcquireExclusive();
@@ -2897,8 +3241,8 @@ final class Node extends Latch implements DatabaseAccess {
         final int firstSearchVecLoc;
 
         check: {
-            int searchVecStart = mSearchVecStart + keyPos;
-            int searchVecLoc = mSearchVecEnd;
+            int searchVecStart = searchVecStart() + keyPos;
+            int searchVecLoc = searchVecEnd();
 
             // Note that loop doesn't examine first entry. At least one must remain.
             for (; searchVecLoc > searchVecStart; searchVecLoc -= 2) {
@@ -2914,7 +3258,7 @@ final class Node extends Latch implements DatabaseAccess {
                     // Rightmost key to move comes from the parent, and first moved key in the
                     // left node does not affect right node growth.
                     rightGrowth -= len;
-                    keyLoc = p_ushortGetLE(parentPage, parent.mSearchVecStart + childPos);
+                    keyLoc = p_ushortGetLE(parentPage, parent.searchVecStart() + childPos);
                     rightGrowth += keyLengthAtLoc(parentPage, keyLoc) + (2 + 8);
 
                     break check;
@@ -2953,7 +3297,7 @@ final class Node extends Latch implements DatabaseAccess {
                 // Parent search key will be updated, so verify that it has room.
                 searchKeyLoc = p_ushortGetLE(leftPage, firstSearchVecLoc);
                 searchKeyLen = keyLengthAtLoc(leftPage, searchKeyLoc);
-                parentKeyLoc = p_ushortGetLE(parentPage, parent.mSearchVecStart + childPos);
+                parentKeyLoc = p_ushortGetLE(parentPage, parent.searchVecStart() + childPos);
                 parentKeyLen = keyLengthAtLoc(parentPage, parentKeyLoc);
                 parentKeyGrowth = searchKeyLen - parentKeyLen;
                 if (parentKeyGrowth <= 0 || parentKeyGrowth <= parent.availableInternalBytes()) {
@@ -2977,12 +3321,13 @@ final class Node extends Latch implements DatabaseAccess {
         }
 
         int garbageAccum = searchKeyLen;
-        int searchVecLoc = mSearchVecEnd;
+        int searchVecLoc = searchVecEnd();
         final int moved = searchVecLoc - firstSearchVecLoc + 2;
 
         try {
             // Rightmost key to move comes from the parent.
-            InResult result = right.createInternalEntry(tree, 0, parentKeyLen, 0, false);
+            InResult result = new InResult();
+            right.createInternalEntry(null, result, tree, 0, parentKeyLen, 0, false);
             // Note: Must access right page each time, since compaction can replace it.
             p_copy(parentPage, parentKeyLoc, right.mPage, result.mEntryLoc, parentKeyLen);
 
@@ -2990,7 +3335,7 @@ final class Node extends Latch implements DatabaseAccess {
             for (; searchVecLoc > firstSearchVecLoc; searchVecLoc -= 2) {
                 int keyLoc = p_ushortGetLE(leftPage, searchVecLoc);
                 int encodedLen = keyLengthAtLoc(leftPage, keyLoc);
-                result = right.createInternalEntry(tree, 0, encodedLen, 0, false);
+                right.createInternalEntry(null, result, tree, 0, encodedLen, 0, false);
                 // Note: Must access right page each time, since compaction can replace it.
                 p_copy(leftPage, keyLoc, right.mPage, result.mEntryLoc, encodedLen);
                 garbageAccum += encodedLen;
@@ -3003,7 +3348,7 @@ final class Node extends Latch implements DatabaseAccess {
         // Update the parent key after moving it to the right node.
         if (parentKeyGrowth <= 0) {
             p_copy(leftPage, searchKeyLoc, parentPage, parentKeyLoc, searchKeyLen);
-            parent.mGarbage -= parentKeyGrowth;
+            parent.garbage(parent.garbage() - parentKeyGrowth);
         } else {
             parent.updateInternalKeyEncoded
                 (childPos, parentKeyGrowth, leftPage, searchKeyLoc, searchKeyLen);
@@ -3011,31 +3356,30 @@ final class Node extends Latch implements DatabaseAccess {
 
         // Move encoded child pointers.
         {
-            int start = mSearchVecEnd + 2;
-            int len = ((start - mSearchVecStart) << 2) + 8 - (moved << 2);
+            int start = searchVecEnd() + 2;
+            int len = ((start - searchVecStart()) << 2) + 8 - (moved << 2);
             p_copy(leftPage, start, leftPage, start - moved, len);
-            p_copy(leftPage, start + len, right.mPage, right.mSearchVecEnd + 2, moved << 2);
+            p_copy(leftPage, start + len, right.mPage, right.searchVecEnd() + 2, moved << 2);
         }
 
-        mGarbage += garbageAccum;
-        mSearchVecEnd = firstSearchVecLoc - 2;
+        garbage(garbage() + garbageAccum);
+        searchVecEnd(firstSearchVecLoc - 2);
 
         // Fix cursor positions in the right node.
-        for (TreeCursorFrame frame = right.mLastCursorFrame; frame != null; ) {
+        for (CursorFrame frame = right.mLastCursorFrame; frame != null; ) {
             frame.mNodePos += moved;
             frame = frame.mPrevCousin;
         }
 
         // Move affected cursor frames to the right node.
-        final int adjust = firstSearchVecLoc - mSearchVecStart + 4;
-        for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
+        final int adjust = firstSearchVecLoc - searchVecStart() + 4;
+        for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
             // Capture previous frame from linked list before changing the links.
-            TreeCursorFrame prev = frame.mPrevCousin;
+            CursorFrame prev = frame.mPrevCousin;
             int newPos = frame.mNodePos - adjust;
             if (newPos >= 0) {
-                frame.unbind();
-                frame.bind(right, newPos);
-                frame.mParentFrame.mNodePos += 2;
+                frame.rebind(right, newPos);
+                frame.adjustParentPosition(+2);
             }
             frame = prev;
         }
@@ -3053,11 +3397,11 @@ final class Node extends Latch implements DatabaseAccess {
      * @return latched sibling
      */
     private Node rebindSplitFrames(Split split) {
-        final Node sibling = split.latchSibling();
+        final Node sibling = split.latchSiblingEx();
         try {
-            for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
+            for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
                 // Capture previous frame from linked list before changing the links.
-                TreeCursorFrame prev = frame.mPrevCousin;
+                CursorFrame prev = frame.mPrevCousin;
                 split.rebindFrame(frame, sibling);
                 frame = prev;
             }
@@ -3069,12 +3413,15 @@ final class Node extends Latch implements DatabaseAccess {
     }
 
     /**
+     * @param frame optional frame which is bound to this node; only used for rebalancing
      * @param pos position as provided by binarySearch; must be positive
      * @param vfrag 0 or ENTRY_FRAGMENTED
      */
-    void updateLeafValue(Tree tree, int pos, int vfrag, byte[] value) throws IOException {
+    void updateLeafValue(CursorFrame frame, Tree tree, int pos, int vfrag, byte[] value)
+        throws IOException
+    {
         /*P*/ byte[] page = mPage;
-        final int searchVecStart = mSearchVecStart;
+        final int searchVecStart = searchVecStart();
 
         final int start;
         final int keyLen;
@@ -3117,7 +3464,7 @@ final class Node extends Latch implements DatabaseAccess {
             if (valueLen > len) {
                 // Old entry is too small, and so it becomes garbage.
                 keyLen = valueHeaderLoc - start;
-                garbage = mGarbage + loc + len - start;
+                garbage = garbage() + loc + len - start;
                 break quick;
             }
 
@@ -3133,8 +3480,8 @@ final class Node extends Latch implements DatabaseAccess {
                     }
                 }
             } else {
-                mGarbage += loc + len - copyToLeafValue
-                    (page, vfrag, value, valueHeaderLoc) - valueLen;
+                garbage(garbage() + loc + len - copyToLeafValue
+                        (page, vfrag, value, valueHeaderLoc) - valueLen);
             }
 
             return;
@@ -3143,18 +3490,20 @@ final class Node extends Latch implements DatabaseAccess {
         // What follows is similar to createLeafEntry method, except the search
         // vector doesn't grow.
 
-        int searchVecEnd = mSearchVecEnd;
+        int searchVecEnd = searchVecEnd();
 
-        int leftSpace = searchVecStart - mLeftSegTail;
-        int rightSpace = mRightSegTail - searchVecEnd - 1;
+        int leftSpace = searchVecStart - leftSegTail();
+        int rightSpace = rightSegTail() - searchVecEnd - 1;
+
+        final int vfragOriginal = vfrag;
 
         int encodedLen;
         if (vfrag != 0) {
             encodedLen = keyLen + calculateFragmentedValueLength(value);
         } else {
+            LocalDatabase db = tree.mDatabase;
             encodedLen = keyLen + calculateLeafValueLength(value);
-            if (encodedLen > tree.mMaxEntrySize) {
-                Database db = tree.mDatabase;
+            if (encodedLen > db.mMaxEntrySize) {
                 value = db.fragment(value, value.length, db.mMaxFragmentedEntrySize - keyLen);
                 if (value == null) {
                     throw new AssertionError();
@@ -3165,7 +3514,7 @@ final class Node extends Latch implements DatabaseAccess {
         }
 
         int entryLoc;
-        alloc: {
+        alloc: try {
             if ((entryLoc = allocPageEntry(encodedLen, leftSpace, rightSpace)) >= 0) {
                 pos += searchVecStart;
                 break alloc;
@@ -3178,14 +3527,14 @@ final class Node extends Latch implements DatabaseAccess {
                 // Do full compaction and free up the garbage, or split the node.
 
                 byte[][] akeyRef = new byte[1][];
-                int loc = p_ushortGetLE(page, searchVecStart + pos);
-                boolean isOriginal = retrieveActualKeyAtLoc(page, loc, akeyRef);
+                boolean isOriginal = retrieveActualKeyAtLoc(page, start, akeyRef);
                 byte[] akey = akeyRef[0];
 
                 if ((garbage + remaining) < 0) {
                     if (mSplit == null) {
+                        // TODO: use frame for rebalancing
                         // Node is full, so split it.
-                        byte[] okey = isOriginal ? akey : retrieveKeyAtLoc(this, page, loc);
+                        byte[] okey = isOriginal ? akey : retrieveKeyAtLoc(this, page, start);
                         splitLeafAndCreateEntry
                             (tree, okey, akey, vfrag, value, encodedLen, pos, false);
                         return;
@@ -3193,13 +3542,13 @@ final class Node extends Latch implements DatabaseAccess {
 
                     // Node is already split, and so value is too large.
                     if (vfrag != 0) {
-                        // FIXME: Can this happen?
+                        // TODO: Can this happen?
                         throw new DatabaseException("Fragmented entry doesn't fit");
                     }
-                    Database db = tree.mDatabase;
+                    LocalDatabase db = tree.mDatabase;
                     int max = Math.min(db.mMaxFragmentedEntrySize,
                                        garbage + leftSpace + rightSpace);
-                    value = db.fragment(value, value.length, max);
+                    value = db.fragment(value, value.length, max - keyLen);
                     if (value == null) {
                         throw new AssertionError();
                     }
@@ -3207,7 +3556,7 @@ final class Node extends Latch implements DatabaseAccess {
                     vfrag = ENTRY_FRAGMENTED;
                 }
 
-                mGarbage = garbage;
+                garbage(garbage);
                 entryLoc = compactLeaf(encodedLen, pos, false);
                 page = mPage;
                 entryLoc = isOriginal ? encodeNormalKey(akey, page, entryLoc)
@@ -3219,20 +3568,20 @@ final class Node extends Latch implements DatabaseAccess {
             int vecLen = searchVecEnd - searchVecStart + 2;
             int newSearchVecStart;
 
-            if (remaining > 0 || (mRightSegTail & 1) != 0) {
+            if (remaining > 0 || (rightSegTail() & 1) != 0) {
                 // Re-center search vector, biased to the right, ensuring proper alignment.
-                newSearchVecStart = (mRightSegTail - vecLen + (1 - 0) - (remaining >> 1)) & ~1;
+                newSearchVecStart = (rightSegTail() - vecLen + (1 - 0) - (remaining >> 1)) & ~1;
 
                 // Allocate entry from left segment.
-                entryLoc = mLeftSegTail;
-                mLeftSegTail = entryLoc + encodedLen;
-            } else if ((mLeftSegTail & 1) == 0) {
+                entryLoc = leftSegTail();
+                leftSegTail(entryLoc + encodedLen);
+            } else if ((leftSegTail() & 1) == 0) {
                 // Move search vector left, ensuring proper alignment.
-                newSearchVecStart = mLeftSegTail + ((remaining >> 1) & ~1);
+                newSearchVecStart = leftSegTail() + ((remaining >> 1) & ~1);
 
                 // Allocate entry from right segment.
-                entryLoc = mRightSegTail - encodedLen + 1;
-                mRightSegTail = entryLoc - 1;
+                entryLoc = rightSegTail() - encodedLen + 1;
+                rightSegTail(entryLoc - 1);
             } else {
                 // Search vector is misaligned, so do full compaction.
                 byte[][] akeyRef = new byte[1][];
@@ -3240,7 +3589,7 @@ final class Node extends Latch implements DatabaseAccess {
                 boolean isOriginal = retrieveActualKeyAtLoc(page, loc, akeyRef);
                 byte[] akey = akeyRef[0];
 
-                mGarbage = garbage;
+                garbage(garbage);
                 entryLoc = compactLeaf(encodedLen, pos, false);
                 page = mPage;
                 entryLoc = isOriginal ? encodeNormalKey(akey, page, entryLoc)
@@ -3252,8 +3601,13 @@ final class Node extends Latch implements DatabaseAccess {
             p_copy(page, searchVecStart, page, newSearchVecStart, vecLen);
 
             pos += newSearchVecStart;
-            mSearchVecStart = newSearchVecStart;
-            mSearchVecEnd = newSearchVecStart + vecLen - 2;
+            searchVecStart(newSearchVecStart);
+            searchVecEnd(newSearchVecStart + vecLen - 2);
+        } catch (Throwable e) {
+            if (vfrag == ENTRY_FRAGMENTED && vfragOriginal != ENTRY_FRAGMENTED) {
+                cleanupFragments(e, value);
+            }
+            throw e;
         }
 
         // Copy existing key, and then copy value.
@@ -3261,7 +3615,7 @@ final class Node extends Latch implements DatabaseAccess {
         copyToLeafValue(page, vfrag, value, entryLoc + keyLen);
         p_shortPutLE(page, pos, entryLoc);
 
-        mGarbage = garbage;
+        garbage(garbage);
     }
 
     /**
@@ -3299,16 +3653,16 @@ final class Node extends Latch implements DatabaseAccess {
      * @return entryLoc
      */
     int doUpdateInternalKey(int pos, final int growth, final int encodedLen) {
-        int garbage = mGarbage + encodedLen - growth;
+        int garbage = garbage() + encodedLen - growth;
 
         // What follows is similar to createInternalEntry method, except the search
         // vector doesn't grow.
 
-        int searchVecStart = mSearchVecStart;
-        int searchVecEnd = mSearchVecEnd;
+        int searchVecStart = searchVecStart();
+        int searchVecEnd = searchVecEnd();
 
-        int leftSpace = searchVecStart - mLeftSegTail;
-        int rightSpace = mRightSegTail - searchVecEnd
+        int leftSpace = searchVecStart - leftSegTail();
+        int rightSpace = rightSegTail() - searchVecEnd
             - ((searchVecEnd - searchVecStart) << 2) - 17;
 
         int entryLoc;
@@ -3335,21 +3689,21 @@ final class Node extends Latch implements DatabaseAccess {
                 int childIdsLen = (vecLen << 2) + 8;
                 int newSearchVecStart;
 
-                if (remaining > 0 || (mRightSegTail & 1) != 0) {
+                if (remaining > 0 || (rightSegTail() & 1) != 0) {
                     // Re-center search vector, biased to the right, ensuring proper alignment.
                     newSearchVecStart =
-                        (mRightSegTail - vecLen - childIdsLen + (1 - 0) - (remaining >> 1)) & ~1;
+                        (rightSegTail() - vecLen - childIdsLen + (1 - 0) - (remaining >> 1)) & ~1;
 
                     // Allocate entry from left segment.
-                    entryLoc = mLeftSegTail;
-                    mLeftSegTail = entryLoc + encodedLen;
-                } else if ((mLeftSegTail & 1) == 0) {
+                    entryLoc = leftSegTail();
+                    leftSegTail(entryLoc + encodedLen);
+                } else if ((leftSegTail() & 1) == 0) {
                     // Move search vector left, ensuring proper alignment.
-                    newSearchVecStart = mLeftSegTail + ((remaining >> 1) & ~1);
+                    newSearchVecStart = leftSegTail() + ((remaining >> 1) & ~1);
 
                     // Allocate entry from right segment.
-                    entryLoc = mRightSegTail - encodedLen + 1;
-                    mRightSegTail = entryLoc - 1;
+                    entryLoc = rightSegTail() - encodedLen + 1;
+                    rightSegTail(entryLoc - 1);
                 } else {
                     // Search vector is misaligned, so do full compaction.
                     break makeRoom;
@@ -3359,22 +3713,26 @@ final class Node extends Latch implements DatabaseAccess {
                 p_copy(page, searchVecStart, page, newSearchVecStart, vecLen + childIdsLen);
 
                 pos += newSearchVecStart;
-                mSearchVecStart = newSearchVecStart;
-                mSearchVecEnd = newSearchVecStart + vecLen - 2;
+                searchVecStart(newSearchVecStart);
+                searchVecEnd(newSearchVecStart + vecLen - 2);
 
                 break alloc;
             }
 
             // This point is reached for making room via node compaction.
 
-            mGarbage = garbage;
-            return compactInternal(encodedLen, pos, Integer.MIN_VALUE).mEntryLoc;
+            garbage(garbage);
+
+            InResult result = new InResult();
+            compactInternal(result, encodedLen, pos, Integer.MIN_VALUE);
+
+            return result.mEntryLoc;
         }
 
         // Point to entry. Caller must copy the key to the location.
         p_shortPutLE(mPage, pos, entryLoc);
 
-        mGarbage = garbage;
+        garbage(garbage);
 
         return entryLoc;
     }
@@ -3383,34 +3741,35 @@ final class Node extends Latch implements DatabaseAccess {
      * @param pos position as provided by binarySearch; must be positive
      */
     void updateChildRefId(int pos, long id) {
-        p_longPutLE(mPage, mSearchVecEnd + 2 + (pos << 2), id);
+        p_longPutLE(mPage, searchVecEnd() + 2 + (pos << 2), id);
     }
 
     /**
      * @param pos position as provided by binarySearch; must be positive
      */
     void deleteLeafEntry(int pos) throws IOException {
-        final /*P*/ byte[] page = mPage;
+        /*P*/ byte[] page = mPage;
+        int entryLoc = p_ushortGetLE(page, searchVecStart() + pos);
+        finishDeleteLeafEntry(pos, doDeleteLeafEntry(page, entryLoc) - entryLoc);
+    }
 
-        int searchVecStart = mSearchVecStart;
-        final int entryLoc = p_ushortGetLE(page, searchVecStart + pos);
-
+    /**
+     * @param loc start location in page
+     * @return location just after end of cleared entry
+     */
+    private int doDeleteLeafEntry(/*P*/ byte[] page, int loc) throws IOException {
         // Note: Similar to leafEntryLengthAtLoc and retrieveLeafValueAtLoc.
 
-        int loc = entryLoc;
-
-        {
-            int keyLen = p_byteGet(page, loc++);
-            if (keyLen >= 0) {
-                loc += keyLen + 1;
-            } else {
-                int header = keyLen;
-                keyLen = ((keyLen & 0x3f) << 8) | p_ubyteGet(page, loc++);
-                if ((header & ENTRY_FRAGMENTED) != 0) {
-                    getDatabase().deleteFragments(page, loc, keyLen);
-                }
-                loc += keyLen;
+        int keyLen = p_byteGet(page, loc++);
+        if (keyLen >= 0) {
+            loc += keyLen + 1;
+        } else {
+            int header = keyLen;
+            keyLen = ((keyLen & 0x3f) << 8) | p_ubyteGet(page, loc++);
+            if ((header & ENTRY_FRAGMENTED) != 0) {
+                getDatabase().deleteFragments(page, loc, keyLen);
             }
+            loc += keyLen;
         }
 
         int header = p_byteGet(page, loc++);
@@ -3433,27 +3792,53 @@ final class Node extends Latch implements DatabaseAccess {
             loc += len;
         }
 
-        doDeleteLeafEntry(pos, loc - entryLoc);
+        return loc;
     }
 
-    void doDeleteLeafEntry(int pos, int entryLen) {
+    /**
+     * Finish the delete by updating garbage size and adjusting search vector.
+     */
+    void finishDeleteLeafEntry(int pos, int entryLen) {
         // Increment garbage by the size of the encoded entry.
-        mGarbage += entryLen;
+        garbage(garbage() + entryLen);
 
         /*P*/ byte[] page = mPage;
-        int searchVecStart = mSearchVecStart;
-        int searchVecEnd = mSearchVecEnd;
+        int searchVecStart = searchVecStart();
+        int searchVecEnd = searchVecEnd();
 
         if (pos < ((searchVecEnd - searchVecStart + 2) >> 1)) {
             // Shift left side of search vector to the right.
             p_copy(page, searchVecStart, page, searchVecStart += 2, pos);
-            mSearchVecStart = searchVecStart;
+            searchVecStart(searchVecStart);
         } else {
             // Shift right side of search vector to the left.
             pos += searchVecStart;
             p_copy(page, pos + 2, page, pos, searchVecEnd - pos);
-            mSearchVecEnd = searchVecEnd - 2;
+            searchVecEnd(searchVecEnd - 2);
         }
+    }
+
+    /**
+     * Fixes all bound cursors after a delete. Node must be latched exclusively.
+     *
+     * @param pos positive position of entry that was deleted
+     * @param key not-found key to set for cursors at given position
+     */
+    void postDelete(int pos, byte[] key) {
+        int newPos = ~pos;
+        CursorFrame frame = mLastCursorFrame;
+        do {
+            int framePos = frame.mNodePos;
+            if (framePos == pos) {
+                frame.mNodePos = newPos;
+                frame.mNotFoundKey = key;
+            } else if (framePos > pos) {
+                frame.mNodePos = framePos - 2;
+            } else if (framePos < newPos) {
+                // Position is a complement, so add instead of subtract.
+                frame.mNodePos = framePos + 2;
+            }
+        } while ((frame = frame.mPrevCousin) != null);
     }
 
     /**
@@ -3469,32 +3854,31 @@ final class Node extends Latch implements DatabaseAccess {
         tree.mDatabase.prepareToDelete(rightNode);
 
         final /*P*/ byte[] rightPage = rightNode.mPage;
-        final int searchVecEnd = rightNode.mSearchVecEnd;
+        final int searchVecEnd = rightNode.searchVecEnd();
         final int leftEndPos = leftNode.highestLeafPos() + 2;
 
-        int searchVecStart = rightNode.mSearchVecStart;
+        int searchVecStart = rightNode.searchVecStart();
         while (searchVecStart <= searchVecEnd) {
             int entryLoc = p_ushortGetLE(rightPage, searchVecStart);
             int encodedLen = leafEntryLengthAtLoc(rightPage, entryLoc);
             int leftEntryLoc = leftNode.createLeafEntry
-                (tree, leftNode.highestLeafPos() + 2, encodedLen);
+                (null, tree, leftNode.highestLeafPos() + 2, encodedLen);
             // Note: Must access left page each time, since compaction can replace it.
             p_copy(rightPage, entryLoc, leftNode.mPage, leftEntryLoc, encodedLen);
             searchVecStart += 2;
         }
 
         // All cursors in the right node must be moved to the left node.
-        for (TreeCursorFrame frame = rightNode.mLastCursorFrame; frame != null; ) {
+        for (CursorFrame frame = rightNode.mLastCursorFrame; frame != null; ) {
             // Capture previous frame from linked list before changing the links.
-            TreeCursorFrame prev = frame.mPrevCousin;
+            CursorFrame prev = frame.mPrevCousin;
             int framePos = frame.mNodePos;
-            frame.unbind();
-            frame.bind(leftNode, framePos + (framePos < 0 ? (-leftEndPos) : leftEndPos));
+            frame.rebind(leftNode, framePos + (framePos < 0 ? (-leftEndPos) : leftEndPos));
             frame = prev;
         }
 
         // If right node was high extremity, left node now is.
-        leftNode.mType |= rightNode.mType & HIGH_EXTREMITY;
+        leftNode.type((byte) (leftNode.type() | (rightNode.type() & HIGH_EXTREMITY)));
 
         tree.mDatabase.deleteNode(rightNode);
     }
@@ -3518,28 +3902,30 @@ final class Node extends Latch implements DatabaseAccess {
 
         // Create space to absorb parent key.
         int leftEndPos = leftNode.highestInternalPos();
-        InResult result = leftNode.createInternalEntry
-            (tree, leftEndPos, parentLen, (leftEndPos += 2) << 2, false);
+        InResult result = new InResult();
+        leftNode.createInternalEntry
+            (null, result, tree, leftEndPos, parentLen, (leftEndPos += 2) << 2, false);
 
         // Copy child id associated with parent key.
         final /*P*/ byte[] rightPage = rightNode.mPage;
-        int rightChildIdsLoc = rightNode.mSearchVecEnd + 2;
+        int rightChildIdsLoc = rightNode.searchVecEnd() + 2;
         p_copy(rightPage, rightChildIdsLoc, result.mPage, result.mNewChildLoc, 8);
         rightChildIdsLoc += 8;
 
         // Write parent key.
         p_copy(parentPage, parentLoc, result.mPage, result.mEntryLoc, parentLen);
 
-        final int searchVecEnd = rightNode.mSearchVecEnd;
+        final int searchVecEnd = rightNode.searchVecEnd();
 
-        int searchVecStart = rightNode.mSearchVecStart;
+        int searchVecStart = rightNode.searchVecStart();
         while (searchVecStart <= searchVecEnd) {
             int entryLoc = p_ushortGetLE(rightPage, searchVecStart);
             int encodedLen = keyLengthAtLoc(rightPage, entryLoc);
 
             // Allocate entry for left node.
             int pos = leftNode.highestInternalPos();
-            result = leftNode.createInternalEntry(tree, pos, encodedLen, (pos + 2) << 2, false);
+            leftNode.createInternalEntry
+                (null, result, tree, pos, encodedLen, (pos + 2) << 2, false);
 
             // Copy child id.
             p_copy(rightPage, rightChildIdsLoc, result.mPage, result.mNewChildLoc, 8);
@@ -3552,17 +3938,16 @@ final class Node extends Latch implements DatabaseAccess {
         }
 
         // All cursors in the right node must be moved to the left node.
-        for (TreeCursorFrame frame = rightNode.mLastCursorFrame; frame != null; ) {
+        for (CursorFrame frame = rightNode.mLastCursorFrame; frame != null; ) {
             // Capture previous frame from linked list before changing the links.
-            TreeCursorFrame prev = frame.mPrevCousin;
+            CursorFrame prev = frame.mPrevCousin;
             int framePos = frame.mNodePos;
-            frame.unbind();
-            frame.bind(leftNode, leftEndPos + framePos);
+            frame.rebind(leftNode, leftEndPos + framePos);
             frame = prev;
         }
 
         // If right node was high extremity, left node now is.
-        leftNode.mType |= rightNode.mType & HIGH_EXTREMITY;
+        leftNode.type((byte) (leftNode.type() | (rightNode.type() & HIGH_EXTREMITY)));
 
         tree.mDatabase.deleteNode(rightNode);
     }
@@ -3574,7 +3959,7 @@ final class Node extends Latch implements DatabaseAccess {
      */
     void deleteRightChildRef(int childPos) {
         // Fix affected cursors.
-        for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
+        for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
             int framePos = frame.mNodePos;
             if (framePos >= childPos) {
                 frame.mNodePos = framePos - 2;
@@ -3592,7 +3977,7 @@ final class Node extends Latch implements DatabaseAccess {
      */
     void deleteLeftChildRef(int childPos) {
         // Fix affected cursors.
-        for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
+        for (CursorFrame frame = mLastCursorFrame; frame != null; ) {
             int framePos = frame.mNodePos;
             if (framePos > childPos) {
                 frame.mNodePos = framePos - 2;
@@ -3611,16 +3996,16 @@ final class Node extends Latch implements DatabaseAccess {
     private void deleteChildRef(int childPos) {
         final /*P*/ byte[] page = mPage;
         int keyPos = childPos == 0 ? 0 : (childPos - 2);
-        int searchVecStart = mSearchVecStart;
+        int searchVecStart = searchVecStart();
 
         int entryLoc = p_ushortGetLE(page, searchVecStart + keyPos);
         // Increment garbage by the size of the encoded entry.
-        mGarbage += keyLengthAtLoc(page, entryLoc);
+        garbage(garbage() + keyLengthAtLoc(page, entryLoc));
 
         // Rescale for long ids as encoded in page.
         childPos <<= 2;
 
-        int searchVecEnd = mSearchVecEnd;
+        int searchVecEnd = searchVecEnd();
 
         // Remove search vector entry (2 bytes) and remove child id entry
         // (8 bytes). Determine which shift operations minimize movement.
@@ -3630,7 +4015,7 @@ final class Node extends Latch implements DatabaseAccess {
                    page, searchVecStart + keyPos + (2 + 8),
                    searchVecEnd - searchVecStart - keyPos + childPos);
             p_copy(page, searchVecStart, page, searchVecStart += 10, keyPos);
-            mSearchVecEnd = searchVecEnd + 8;
+            searchVecEnd(searchVecEnd + 8);
         } else {
             // Shift child ids left by 8, shift search vector right by 2.
             p_copy(page, searchVecEnd + childPos + (2 + 8),
@@ -3639,67 +4024,140 @@ final class Node extends Latch implements DatabaseAccess {
             p_copy(page, searchVecStart, page, searchVecStart += 2, keyPos);
         }
 
-        mSearchVecStart = searchVecStart;
+        searchVecStart(searchVecStart);
     }
 
     /**
-     * Delete this non-leaf root node, after all keys have been deleted. The
-     * state of the lone child is swapped with this root node, and the child
-     * node is repurposed into a stub root node. The old page used by the child
-     * node is deleted. This design allows active cursors to still function
-     * normally until they can unbind.
+     * Delete this non-leaf root node, after all keys have been deleted. Caller must hold
+     * exclusive latches for root node, lone child, and stub. Caller must also ensure that both
+     * nodes are not splitting. All latches are released, even if an exception is thrown.
      *
-     * <p>Caller must hold exclusive latches for root node and lone child.
-     * Caller must also ensure that both nodes are not splitting. No latches
-     * are released by this method.
+     * @param stub frames bound to root node move here
      */
-    void rootDelete(Tree tree, Node child) throws IOException {
-        /*P*/ byte[] page = mPage;
-        TreeCursorFrame lastCursorFrame = mLastCursorFrame;
+    void rootDelete(Tree tree, Node child, Node stub) throws IOException {
+        try {
+            tree.mDatabase.prepareToDelete(child);
 
-        tree.mDatabase.prepareToDelete(child);
-        long toDelete = child.mId;
-        int toDeleteState = child.mCachedState;
+            try {
+                doRootDelete(tree, child, stub);
+            } catch (Throwable e) {
+                child.releaseExclusive();
+                throw e;
+            }
 
+            // The node can be deleted earlier in the method, but doing it here might prevent
+            // corruption if an unexpected exception occurs.
+            tree.mDatabase.deleteNode(child);
+        } finally {
+            stub.releaseExclusive();
+            releaseExclusive();
+        }
+    }
+
+    private void doRootDelete(Tree tree, Node child, Node stub) throws IOException {
+        /*P*/ byte[] oldRootPage = mPage;
+
+        /*P*/ // [
         mPage = child.mPage;
-        byte stubType = mType;
-        mType = child.mType;
-        mGarbage = child.mGarbage;
-        mLeftSegTail = child.mLeftSegTail;
-        mRightSegTail = child.mRightSegTail;
-        mSearchVecStart = child.mSearchVecStart;
-        mSearchVecEnd = child.mSearchVecEnd;
-        mLastCursorFrame = child.mLastCursorFrame;
+        type(child.type());
+        garbage(child.garbage());
+        leftSegTail(child.leftSegTail());
+        rightSegTail(child.rightSegTail());
+        searchVecStart(child.searchVecStart());
+        searchVecEnd(child.searchVecEnd());
+        /*P*/ // |
+        /*P*/ // if (tree.mDatabase.mFullyMapped) {
+        /*P*/ //     // Page cannot change, so copy it instead.
+        /*P*/ //     p_copy(child.mPage, 0, oldRootPage, 0, tree.mDatabase.pageSize());
+        /*P*/ //     oldRootPage = child.mPage;
+        /*P*/ // } else {
+        /*P*/ //     mPage = child.mPage;
+        /*P*/ // }
+        /*P*/ // ]
 
-        // Repurpose the child node into a stub root node. Stub is assigned a
-        // reserved id (1) and a clean cached state. It cannot be marked dirty,
-        // but it can be evicted when all cursors have unbound from it.
-        tree.mDatabase.mTreeNodeMap.remove(child, NodeMap.hash(toDelete));
-        child.mPage = page;
-        child.mId = STUB_ID;
-        child.mCachedState = CACHED_CLEAN;
-        child.mType = stubType;
-        child.clearEntries();
-        child.mLastCursorFrame = lastCursorFrame;
-        // Search vector also needs to point to root.
-        p_longPutLE(page, child.mSearchVecEnd + 2, this.mId);
+        // Lock the last frames, preventing concurrent unbinding of those frames...
+        CursorFrame lock = new CursorFrame();
+        CursorFrame childLastFrame = child.lockLastFrame(lock);
+        CursorFrame thisLastFrame = this.lockLastFrame(lock);
 
-        // Fix cursor bindings for this, the real root node.
-        for (TreeCursorFrame frame = mLastCursorFrame; frame != null; ) {
-            frame.mNode = this;
-            frame = frame.mPrevCousin;
+        // ...now they can be moved around...
+
+        // 1. Frames from child move to this node, the root.
+        if (!CursorFrame.cLastUpdater.compareAndSet(this, thisLastFrame, childLastFrame)) {
+            throw new AssertionError();
         }
-        // Fix cursor bindings for the stub root node.
-        for (TreeCursorFrame frame = lastCursorFrame; frame != null; ) {
-            frame.mNode = child;
-            frame = frame.mPrevCousin;
+        // 2. Frames of child node are cleared.
+        if (!CursorFrame.cLastUpdater.compareAndSet(child, childLastFrame, null)) {
+            throw new AssertionError();
+        }
+        // 3. Frames from empty root move to the stub.
+        if (!CursorFrame.cLastUpdater.compareAndSet(stub, null, thisLastFrame)) {
+            throw new AssertionError();
         }
 
-        tree.addStub(child, toDelete);
+        this.fixFrameBindings(lock, childLastFrame); // Note: frames were moved
+        stub.fixFrameBindings(lock, thisLastFrame);
 
-        // The page can be deleted earlier in the method, but doing it here
-        // might prevent corruption if an unexpected exception occurs.
-        tree.mDatabase.deletePage(toDelete, toDeleteState);
+        // Old page is moved to child, to be recycled after caller deletes the child.
+        /*P*/ // [
+        child.mPage = oldRootPage;
+        /*P*/ // |
+        /*P*/ // if (tree.mDatabase.mFullyMapped) {
+        /*P*/ //     // Must use a special reserved page because existing one will be recycled.
+        /*P*/ //     child.mPage = p_nonTreePage();
+        /*P*/ // } else {
+        /*P*/ //     child.mPage = oldRootPage;
+        /*P*/ // }
+        /*P*/ // ]
+    }
+
+    /**
+     * Lock the last frame, for use by the rootDelete method.
+     */
+    private CursorFrame lockLastFrame(CursorFrame lock) {
+        while (true) {
+            CursorFrame last = mLastCursorFrame;
+            CursorFrame lockResult = last.tryLock(lock);
+            if (lockResult == last) {
+                return last;
+            }
+            if (lockResult != null) {
+                last.unlock(lockResult);
+            }
+            // Must keep trying against the last cursor frame instead of iterating to the
+            // previous frame. The lock attempt failed because of a concurrent unbind, but the
+            // last cursor frame reference might not have been updated yet. Assertions in the
+            // doRootDelete method further verify that the locked frame is in fact the last,
+            // with a compareAndSet call.
+        }
+    }
+
+    /**
+     * Bind all the frames of this node, to this node, for use by the rootDelete method. Frame
+     * locks are released as a side-effect.
+     *
+     * @param frame last frame, locked; is unlocked with itself
+     */
+    private void fixFrameBindings(final CursorFrame lock, CursorFrame frame) {
+        CursorFrame lockResult = frame;
+        while (true) {
+            Node existing = frame.mNode;
+            if (existing != null) {
+                if (existing == this) {
+                    throw new AssertionError();
+                }
+                frame.mNode = this;
+            }
+
+            CursorFrame prev = frame.tryLockPrevious(lock);
+            frame.unlock(lockResult);
+            if (prev == null) {
+                return;
+            }
+
+            lockResult = frame;
+            frame = prev;
+        }
     }
 
     private static final int SMALL_KEY_LIMIT = 128;
@@ -3708,14 +4166,14 @@ final class Node extends Latch implements DatabaseAccess {
      * Calculate encoded key length, including header. Returns -1 if key is too large and must
      * be fragmented.
      */
-    private static int calculateAllowedKeyLength(Tree tree, byte[] key) {
+    private static int calculateAllowedKeyLength(LocalDatabase db, byte[] key) {
         int len = key.length - 1;
         if ((len & ~(SMALL_KEY_LIMIT - 1)) == 0) {
             // Always safe because minimum node size is 512 bytes.
             return len + 2;
         } else {
             len++;
-            return len > tree.mMaxKeySize ? -1 : len + 2;
+            return len > db.mMaxKeySize ? -1 : len + 2;
         }
     }
 
@@ -3798,12 +4256,12 @@ final class Node extends Latch implements DatabaseAccess {
         final int entryLoc;
         if (encodedLen <= leftSpace && leftSpace >= rightSpace) {
             // Allocate entry from left segment.
-            entryLoc = mLeftSegTail;
-            mLeftSegTail = entryLoc + encodedLen;
+            entryLoc = leftSegTail();
+            leftSegTail(entryLoc + encodedLen);
         } else if (encodedLen <= rightSpace) {
             // Allocate entry from right segment.
-            entryLoc = mRightSegTail - encodedLen + 1;
-            mRightSegTail = entryLoc - 1;
+            entryLoc = rightSegTail() - encodedLen + 1;
+            rightSegTail(entryLoc - 1);
         } else {
             // No room.
             return -1;
@@ -3868,9 +4326,9 @@ final class Node extends Latch implements DatabaseAccess {
     private int compactLeaf(int encodedLen, int pos, boolean forInsert) {
         /*P*/ byte[] page = mPage;
 
-        int searchVecLoc = mSearchVecStart;
+        int searchVecLoc = searchVecStart();
         // Size of search vector, possibly with new entry.
-        int newSearchVecSize = mSearchVecEnd - searchVecLoc + 2;
+        int newSearchVecSize = searchVecEnd() - searchVecLoc + 2;
         if (forInsert) {
             newSearchVecSize += 2;
         }
@@ -3879,18 +4337,22 @@ final class Node extends Latch implements DatabaseAccess {
         // Determine new location of search vector, with room to grow on both ends.
         int newSearchVecStart;
         // Capacity available to search vector after compaction.
-        int searchVecCap = mGarbage + mRightSegTail + 1 - mLeftSegTail - encodedLen;
-        newSearchVecStart = p_length(page) - (((searchVecCap + newSearchVecSize) >> 1) & ~1);
+        int searchVecCap = garbage() + rightSegTail() + 1 - leftSegTail() - encodedLen;
+        newSearchVecStart = pageSize(page) - (((searchVecCap + newSearchVecSize) >> 1) & ~1);
 
         // Copy into a fresh buffer.
 
         int destLoc = TN_HEADER_SIZE;
         int newSearchVecLoc = newSearchVecStart;
         int newLoc = 0;
-        final int searchVecEnd = mSearchVecEnd;
+        final int searchVecEnd = searchVecEnd();
 
-        Database db = getDatabase();
+        LocalDatabase db = getDatabase();
         /*P*/ byte[] dest = db.removeSparePage();
+
+        /*P*/ // [|
+        /*P*/ // p_intPutLE(dest, 0, type() & 0xff); // set type, reserved byte, and garbage
+        /*P*/ // ]
 
         for (; searchVecLoc <= searchVecEnd; searchVecLoc += 2, newSearchVecLoc += 2) {
             if (searchVecLoc == pos) {
@@ -3908,20 +4370,46 @@ final class Node extends Latch implements DatabaseAccess {
             destLoc += len;
         }
 
-        // Recycle old page buffer.
+        /*P*/ // [
+        // Recycle old page buffer and swap in compacted page.
         db.addSparePage(page);
+        mPage = dest;
+        garbage(0);
+        /*P*/ // |
+        /*P*/ // if (db.mFullyMapped) {
+        /*P*/ //     // Copy compacted entries to original page and recycle spare page buffer.
+        /*P*/ //     p_copy(dest, 0, page, 0, pageSize(page));
+        /*P*/ //     db.addSparePage(dest);
+        /*P*/ //     dest = page;
+        /*P*/ // } else {
+        /*P*/ //     // Recycle old page buffer and swap in compacted page.
+        /*P*/ //     db.addSparePage(page);
+        /*P*/ //     mPage = dest;
+        /*P*/ // }
+        /*P*/ // ]
 
         // Write pointer to new allocation.
         p_shortPutLE(dest, newLoc == 0 ? newSearchVecLoc : newLoc, destLoc);
 
-        mPage = dest;
-        mGarbage = 0;
-        mLeftSegTail = destLoc + encodedLen;
-        mRightSegTail = p_length(dest) - 1;
-        mSearchVecStart = newSearchVecStart;
-        mSearchVecEnd = newSearchVecStart + newSearchVecSize - 2;
+        leftSegTail(destLoc + encodedLen);
+        rightSegTail(pageSize(dest) - 1);
+        searchVecStart(newSearchVecStart);
+        searchVecEnd(newSearchVecStart + newSearchVecSize - 2);
 
         return destLoc;
+    }
+
+    private void cleanupSplit(Throwable cause, Node newNode, Split split) {
+        if (split != null) {
+            cleanupFragments(cause, split.fragmentedKey());
+        }
+
+        try {
+            getDatabase().deleteNode(newNode);
+        } catch (Throwable e) {
+            cause.addSuppressed(e);
+            panic(cause);
+        }
     }
 
     /**
@@ -3950,33 +4438,34 @@ final class Node extends Latch implements DatabaseAccess {
 
         /*P*/ byte[] page = mPage;
 
-        if (page == p_empty()) {
+        if (page == p_closedTreePage()) {
             // Node is a closed tree root.
             throw new ClosedIndexException();
         }
 
         Node newNode = tree.mDatabase.allocDirtyNode(NodeUsageList.MODE_UNEVICTABLE);
-        tree.mDatabase.mTreeNodeMap.put(newNode);
-        newNode.mGarbage = 0;
+        tree.mDatabase.nodeMapPut(newNode);
 
         /*P*/ byte[] newPage = newNode.mPage;
+
+        /*P*/ // [
+        newNode.garbage(0);
+        /*P*/ // |
+        /*P*/ // p_intPutLE(newPage, 0, 0); // set type (fixed later), reserved byte, and garbage
+        /*P*/ // ]
 
         if (forInsert && pos == 0) {
             // Inserting into left edge of node, possibly because inserts are
             // descending. Split into new left node, but only the new entry
             // goes into the new node.
 
-            Split split;
+            Split split = null;
             try {
                 split = newSplitLeft(newNode);
                 // Choose an appropriate middle key for suffix compression.
                 setSplitKey(tree, split, midKey(okey, 0));
             } catch (Throwable e) {
-                try {
-                    tree.mDatabase.deleteNode(newNode, true);
-                } catch (Throwable e2) {
-                    e.addSuppressed(e2);
-                }
+                cleanupSplit(e, newNode, split);
                 throw e;
             }
 
@@ -3984,22 +4473,22 @@ final class Node extends Latch implements DatabaseAccess {
 
             // Position search vector at extreme left, allowing new entries to
             // be placed in a natural descending order.
-            newNode.mLeftSegTail = TN_HEADER_SIZE;
-            newNode.mSearchVecStart = TN_HEADER_SIZE;
-            newNode.mSearchVecEnd = TN_HEADER_SIZE;
+            newNode.leftSegTail(TN_HEADER_SIZE);
+            newNode.searchVecStart(TN_HEADER_SIZE);
+            newNode.searchVecEnd(TN_HEADER_SIZE);
 
-            int destLoc = p_length(newPage) - encodedLen;
+            int destLoc = pageSize(newPage) - encodedLen;
             newNode.copyToLeafEntry(okey, akey, vfrag, value, destLoc);
             p_shortPutLE(newPage, TN_HEADER_SIZE, destLoc);
 
-            newNode.mRightSegTail = destLoc - 1;
+            newNode.rightSegTail(destLoc - 1);
             newNode.releaseExclusive();
 
             return;
         }
 
-        final int searchVecStart = mSearchVecStart;
-        final int searchVecEnd = mSearchVecEnd;
+        final int searchVecStart = searchVecStart();
+        final int searchVecEnd = searchVecEnd();
 
         pos += searchVecStart;
 
@@ -4008,17 +4497,13 @@ final class Node extends Latch implements DatabaseAccess {
             // ascending. Split into new right node, but only the new entry
             // goes into the new node.
 
-            Split split;
+            Split split = null;
             try {
                 split = newSplitRight(newNode);
                 // Choose an appropriate middle key for suffix compression.
                 setSplitKey(tree, split, midKey(pos - searchVecStart - 2, okey));
             } catch (Throwable e) {
-                try {
-                    tree.mDatabase.deleteNode(newNode, true);
-                } catch (Throwable e2) {
-                    e.addSuppressed(e2);
-                }
+                cleanupSplit(e, newNode, split);
                 throw e;
             }
 
@@ -4026,13 +4511,15 @@ final class Node extends Latch implements DatabaseAccess {
 
             // Position search vector at extreme right, allowing new entries to
             // be placed in a natural ascending order.
-            newNode.mRightSegTail = p_length(newPage) - 1;
-            newNode.mSearchVecStart = newNode.mSearchVecEnd = p_length(newPage) - 2;
+            newNode.rightSegTail(pageSize(newPage) - 1);
+            int newSearchVecStart = pageSize(newPage) - 2;
+            newNode.searchVecStart(newSearchVecStart);
+            newNode.searchVecEnd(newSearchVecStart);
 
             newNode.copyToLeafEntry(okey, akey, vfrag, value, TN_HEADER_SIZE);
-            p_shortPutLE(newPage, p_length(newPage) - 2, TN_HEADER_SIZE);
+            p_shortPutLE(newPage, pageSize(newPage) - 2, TN_HEADER_SIZE);
 
-            newNode.mLeftSegTail = TN_HEADER_SIZE + encodedLen;
+            newNode.leftSegTail(TN_HEADER_SIZE + encodedLen);
             newNode.releaseExclusive();
 
             return;
@@ -4043,7 +4530,7 @@ final class Node extends Latch implements DatabaseAccess {
 
         int garbageAccum = 0;
         int newLoc = 0;
-        int newAvail = p_length(newPage) - TN_HEADER_SIZE;
+        int newAvail = pageSize(newPage) - TN_HEADER_SIZE;
 
         // Guess which way to split by examining search position. This doesn't take into
         // consideration the variable size of the entries. If the guess is wrong, the new
@@ -4052,7 +4539,7 @@ final class Node extends Latch implements DatabaseAccess {
         if ((pos - searchVecStart) < (searchVecEnd - pos)) {
             // Split into new left node.
 
-            int destLoc = p_length(newPage);
+            int destLoc = pageSize(newPage);
             int newSearchVecLoc = TN_HEADER_SIZE;
 
             int searchVecLoc = searchVecStart;
@@ -4095,24 +4582,26 @@ final class Node extends Latch implements DatabaseAccess {
                 avail += entryLen + 2;
             }
 
-            newNode.mLeftSegTail = TN_HEADER_SIZE;
-            newNode.mSearchVecStart = TN_HEADER_SIZE;
-            newNode.mSearchVecEnd = newSearchVecLoc - 2;
+            newNode.leftSegTail(TN_HEADER_SIZE);
+            newNode.searchVecStart(TN_HEADER_SIZE);
+            newNode.searchVecEnd(newSearchVecLoc - 2);
 
             // Prune off the left end of this node.
-            final int originalStart = mSearchVecStart;
-            final int originalGarbage = mGarbage;
-            mSearchVecStart = searchVecLoc;
-            mGarbage += garbageAccum;
+            final int originalStart = searchVecStart();
+            final int originalGarbage = garbage();
+            searchVecStart(searchVecLoc);
+            garbage(originalGarbage + garbageAccum);
 
-            Split split;
+            byte[] fv = null;
             try {
-                split = newSplitLeft(newNode);
+                // Assign early, to signal to updateLeafValue that it should fragment a large
+                // value instead of attempting to double split the node.
+                mSplit = newSplitLeft(newNode);
 
                 if (newLoc == 0) {
                     // Unable to insert new entry into left node. Insert it
                     // into the right node, which should have space now.
-                    storeIntoSplitLeaf(tree, okey, akey, vfrag, value, encodedLen, forInsert);
+                    fv = storeIntoSplitLeaf(tree, okey, akey, vfrag, value, encodedLen, forInsert);
                 } else {
                     // Create new entry and point to it.
                     destLoc -= encodedLen;
@@ -4121,27 +4610,23 @@ final class Node extends Latch implements DatabaseAccess {
                 }
 
                 // Choose an appropriate middle key for suffix compression.
-                setSplitKey(tree, split, newNode.midKey(newNode.highestKeyPos(), this, 0));
+                setSplitKey(tree, mSplit, newNode.midKey(newNode.highestKeyPos(), this, 0));
 
-                newNode.mRightSegTail = destLoc - 1;
+                newNode.rightSegTail(destLoc - 1);
                 newNode.releaseExclusive();
             } catch (Throwable e) {
-                mSearchVecStart = originalStart;
-                mGarbage = originalGarbage;
-                try {
-                    tree.mDatabase.deleteNode(newNode, true);
-                } catch (Throwable e2) {
-                    e.addSuppressed(e2);
-                }
+                searchVecStart(originalStart);
+                garbage(originalGarbage);
+                cleanupFragments(e, fv);
+                cleanupSplit(e, newNode, mSplit);
+                mSplit = null;
                 throw e;
             }
-
-            mSplit = split;
         } else {
             // Split into new right node.
 
             int destLoc = TN_HEADER_SIZE;
-            int newSearchVecLoc = p_length(newPage) - 2;
+            int newSearchVecLoc = pageSize(newPage) - 2;
 
             int searchVecLoc = searchVecEnd;
             for (; newAvail > avail; searchVecLoc -= 2, newSearchVecLoc -= 2) {
@@ -4190,24 +4675,26 @@ final class Node extends Latch implements DatabaseAccess {
                 avail += entryLen + 2;
             }
 
-            newNode.mRightSegTail = p_length(newPage) - 1;
-            newNode.mSearchVecStart = newSearchVecLoc + 2;
-            newNode.mSearchVecEnd = p_length(newPage) - 2;
+            newNode.rightSegTail(pageSize(newPage) - 1);
+            newNode.searchVecStart(newSearchVecLoc + 2);
+            newNode.searchVecEnd(pageSize(newPage) - 2);
 
             // Prune off the right end of this node.
-            final int originalEnd = mSearchVecEnd;
-            final int originalGarbage = mGarbage;
-            mSearchVecEnd = searchVecLoc;
-            mGarbage += garbageAccum;
+            final int originalEnd = searchVecEnd();
+            final int originalGarbage = garbage();
+            searchVecEnd(searchVecLoc);
+            garbage(originalGarbage + garbageAccum);
 
-            Split split;
+            byte[] fv = null;
             try {
-                split = newSplitRight(newNode);
+                // Assign early, to signal to updateLeafValue that it should fragment a large
+                // value instead of attempting to double split the node.
+                mSplit = newSplitRight(newNode);
 
                 if (newLoc == 0) {
                     // Unable to insert new entry into new right node. Insert
                     // it into the left node, which should have space now.
-                    storeIntoSplitLeaf(tree, okey, akey, vfrag, value, encodedLen, forInsert);
+                    fv = storeIntoSplitLeaf(tree, okey, akey, vfrag, value, encodedLen, forInsert);
                 } else {
                     // Create new entry and point to it.
                     newNode.copyToLeafEntry(okey, akey, vfrag, value, destLoc);
@@ -4216,34 +4703,35 @@ final class Node extends Latch implements DatabaseAccess {
                 }
 
                 // Choose an appropriate middle key for suffix compression.
-                setSplitKey(tree, split, this.midKey(this.highestKeyPos(), newNode, 0));
+                setSplitKey(tree, mSplit, this.midKey(this.highestKeyPos(), newNode, 0));
 
-                newNode.mLeftSegTail = destLoc;
+                newNode.leftSegTail(destLoc);
                 newNode.releaseExclusive();
             } catch (Throwable e) {
-                mSearchVecEnd = originalEnd;
-                mGarbage = originalGarbage;
-                try {
-                    tree.mDatabase.deleteNode(newNode, true);
-                } catch (Throwable e2) {
-                    e.addSuppressed(e2);
-                }
+                searchVecEnd(originalEnd);
+                garbage(originalGarbage);
+                cleanupFragments(e, fv);
+                cleanupSplit(e, newNode, mSplit);
+                mSplit = null;
                 throw e;
             }
-
-            mSplit = split;
         }
     }
 
     /**
-     * Store an entry into a node which has just been split and has room.
+     * Store an entry into a node which has just been split and has room. If for update, caller
+     * must ensure that the mSplit field has been set. It doesn't need to be fully filled in
+     * yet, however. The updateLeafValue checks if the mSplit field has been set to prevent
+     * double splitting.
      *
      * @param okey original key
      * @param akey key to actually store
      * @param vfrag 0 or ENTRY_FRAGMENTED
+     * @return non-null if value got fragmented
      */
-    private void storeIntoSplitLeaf(Tree tree, byte[] okey, byte[] akey, int vfrag, byte[] value,
-                                    int encodedLen, boolean forInsert)
+    private byte[] storeIntoSplitLeaf(Tree tree, byte[] okey, byte[] akey,
+                                      int vfrag, byte[] value,
+                                      int encodedLen, boolean forInsert)
         throws IOException
     {
         int pos = binarySearch(okey);
@@ -4251,38 +4739,44 @@ final class Node extends Latch implements DatabaseAccess {
             if (pos >= 0) {
                 throw new AssertionError("Key exists");
             }
-            int entryLoc = createLeafEntry(tree, ~pos, encodedLen);
+            int entryLoc = createLeafEntry(null, tree, ~pos, encodedLen);
+            byte[] result = null;
             while (entryLoc < 0) {
                 if (vfrag != 0) {
-                    // FIXME: Can this happen?
+                    // TODO: Can this happen?
                     throw new DatabaseException("Fragmented entry doesn't fit");
                 }
-                Database db = tree.mDatabase;
+                LocalDatabase db = tree.mDatabase;
                 int max = Math.min(~entryLoc, db.mMaxFragmentedEntrySize);
                 int encodedKeyLen = calculateKeyLength(akey);
                 value = db.fragment(value, value.length, max - encodedKeyLen);
                 if (value == null) {
                     throw new AssertionError();
                 }
+                result = value;
                 vfrag = ENTRY_FRAGMENTED;
                 encodedLen = encodedKeyLen + calculateFragmentedValueLength(value);
-                entryLoc = createLeafEntry(tree, ~pos, encodedLen);
+                entryLoc = createLeafEntry(null, tree, ~pos, encodedLen);
             }
             copyToLeafEntry(okey, akey, vfrag, value, entryLoc);
+            return result;
         } else {
             if (pos < 0) {
                 throw new AssertionError("Key not found");
             }
-            updateLeafValue(tree, pos, vfrag, value);
+            updateLeafValue(null, tree, pos, vfrag, value);
+            return null;
         }
     }
 
     /**
+     * @param result split result stored here; key and entry loc is -1 if new key was promoted
+     * to parent
      * @throws IOException if new node could not be allocated; no side-effects
-     * @return split result; key and entry loc is -1 if new key was promoted to parent
      */
-    private InResult splitInternal(final Tree tree, final int encodedLen,
-                                   final int keyPos, final int newChildPos)
+    private void splitInternal(final InResult result,
+                               final Tree tree, final int encodedLen,
+                               final int keyPos, final int newChildPos)
         throws IOException
     {
         if (mSplit != null) {
@@ -4293,20 +4787,39 @@ final class Node extends Latch implements DatabaseAccess {
         // new entry is more likely to go into the new node. This distributes the cost of
         // the split by postponing compaction of this node.
 
-        final /*P*/ byte[] page = mPage;
-
         // Alloc early in case an exception is thrown.
-        final Database db = getDatabase();
-        final Node newNode = db.allocDirtyNode(NodeUsageList.MODE_UNEVICTABLE);
-        db.mTreeNodeMap.put(newNode);
-        newNode.mGarbage = 0;
+
+        final LocalDatabase db = getDatabase();
+
+        Node newNode;
+        try {
+            newNode = db.allocDirtyNode(NodeUsageList.MODE_UNEVICTABLE);
+        } catch (DatabaseFullException e) {
+            // Internal node splits are critical. If a child node reference cannot be inserted,
+            // then it would be orphaned. Try allocating again without any capacity limit, or
+            // else the caller must panic the database.
+            db.capacityLimitOverride(-1);
+            try {
+                newNode = db.allocDirtyNode(NodeUsageList.MODE_UNEVICTABLE);
+            } finally {
+                db.capacityLimitOverride(0);
+            }
+        }
+
+        db.nodeMapPut(newNode);
 
         final /*P*/ byte[] newPage = newNode.mPage;
 
-        final InResult result = new InResult();
+        /*P*/ // [
+        newNode.garbage(0);
+        /*P*/ // |
+        /*P*/ // p_intPutLE(newPage, 0, 0); // set type (fixed later), reserved byte, and garbage
+        /*P*/ // ]
 
-        final int searchVecStart = mSearchVecStart;
-        final int searchVecEnd = mSearchVecEnd;
+        final /*P*/ byte[] page = mPage;
+
+        final int searchVecStart = searchVecStart();
+        final int searchVecEnd = searchVecEnd();
 
         if ((searchVecEnd - searchVecStart) == 2 && keyPos == 2) {
             // Node has two keys and the key to insert should go in the middle. The new key
@@ -4319,11 +4832,7 @@ final class Node extends Latch implements DatabaseAccess {
             try {
                 split = newSplitLeft(newNode);
             } catch (Throwable e) {
-                try {
-                    db.deleteNode(newNode, true);
-                } catch (Throwable e2) {
-                    e.addSuppressed(e2);
-                }
+                cleanupSplit(e, newNode, null);
                 throw e;
             }
 
@@ -4336,7 +4845,7 @@ final class Node extends Latch implements DatabaseAccess {
             // Assume a large key will be inserted later, so arrange it with room: entry at far
             // left and search vector at far right.
             p_copy(page, leftKeyLoc, newPage, TN_HEADER_SIZE, leftKeyLen);
-            int leftSearchVecStart = p_length(newPage) - (2 + 8 + 8);
+            int leftSearchVecStart = pageSize(newPage) - (2 + 8 + 8);
             p_shortPutLE(newPage, leftSearchVecStart, TN_HEADER_SIZE);
 
             if (newChildPos == 8) {
@@ -4355,22 +4864,24 @@ final class Node extends Latch implements DatabaseAccess {
             // Copy one or two left existing child ids to left node (newChildPos is 8 or 16).
             p_copy(page, searchVecEnd + 2, newPage, leftSearchVecStart + 2, newChildPos);
 
-            newNode.mLeftSegTail = TN_HEADER_SIZE + leftKeyLen;
-            newNode.mRightSegTail = leftSearchVecStart + (2 + 8 + 8 - 1);
-            newNode.mSearchVecStart = leftSearchVecStart;
-            newNode.mSearchVecEnd = leftSearchVecStart;
+            newNode.leftSegTail(TN_HEADER_SIZE + leftKeyLen);
+            newNode.rightSegTail(leftSearchVecStart + (2 + 8 + 8 - 1));
+            newNode.searchVecStart(leftSearchVecStart);
+            newNode.searchVecEnd(leftSearchVecStart);
             newNode.releaseExclusive();
 
             // Prune off the left end of this node by shifting vector towards child ids.
             p_copy(page, searchVecEnd, page, searchVecEnd + 8, 2);
-            mSearchVecStart = mSearchVecEnd = searchVecEnd + 8;
+            int newSearchVecStart = searchVecEnd + 8;
+            searchVecStart(newSearchVecStart);
+            searchVecEnd(newSearchVecStart);
 
-            mGarbage += leftKeyLen;
+            garbage(garbage() + leftKeyLen);
 
             // Caller must set the split key.
             mSplit = split;
 
-            return result;
+            return;
         }
 
         result.mPage = newPage;
@@ -4392,14 +4903,14 @@ final class Node extends Latch implements DatabaseAccess {
         // +2: right
         int splitSide = (keyPos < (searchVecEnd - searchVecStart - keyPos)) ? -1 : 1;
 
-        Split split;
+        Split split = null;
         doSplit: while (true) {
             garbageAccum = 0;
             newKeyLoc = 0;
 
             // Amount of bytes used in unsplit node, including the page header.
             int size = 5 * (searchVecEnd - searchVecStart) + (1 + 8 + 8)
-                + mLeftSegTail + p_length(page) - mRightSegTail - mGarbage;
+                + leftSegTail() + pageSize(page) - rightSegTail() - garbage();
 
             int newSize = TN_HEADER_SIZE;
 
@@ -4414,7 +4925,7 @@ final class Node extends Latch implements DatabaseAccess {
                 // don't attempt to properly center the new search vector. Instead,
                 // minimize fragmentation to ensure that split is successful.
 
-                int destLoc = p_length(newPage);
+                int destLoc = pageSize(newPage);
                 int newSearchVecLoc = TN_HEADER_SIZE;
 
                 int searchVecLoc = searchVecStart;
@@ -4424,7 +4935,7 @@ final class Node extends Latch implements DatabaseAccess {
                         newSearchVecLoc += 2;
                         // Reserve slot in vector for new entry and account for size increase.
                         newSize += encodedLen + (2 + 8);
-                        if (newSize > p_length(newPage)) {
+                        if (newSize > pageSize(newPage)) {
                             // New entry doesn't fit.
                             if (splitSide == -1) {
                                 // Guessed wrong; do over on left side.
@@ -4450,7 +4961,7 @@ final class Node extends Latch implements DatabaseAccess {
                     // account for this.
                     garbageAccum += entryLen;
 
-                    boolean full = size < TN_HEADER_SIZE | newSize > p_length(newPage);
+                    boolean full = size < TN_HEADER_SIZE | newSize > pageSize(newPage);
 
                     if (full || newSize >= size) {
                         // New node has accumlated enough entries...
@@ -4461,11 +4972,7 @@ final class Node extends Latch implements DatabaseAccess {
                                 split = newSplitLeft(newNode);
                                 setSplitKey(tree, split, retrieveKeyAtLoc(page, entryLoc));
                             } catch (Throwable e) {
-                                try {
-                                    db.deleteNode(newNode, true);
-                                } catch (Throwable e2) {
-                                    e.addSuppressed(e2);
-                                }
+                                cleanupSplit(e, newNode, split);
                                 throw e;
                             }
                             break;
@@ -4504,17 +5011,19 @@ final class Node extends Latch implements DatabaseAccess {
                            newPage, newSearchVecLoc + newChildPos + 8, tailChildIdsLen);
                 }
 
-                newNode.mLeftSegTail = TN_HEADER_SIZE;
-                newNode.mRightSegTail = destLoc - encodedLen - 1;
-                newNode.mSearchVecStart = TN_HEADER_SIZE;
-                newNode.mSearchVecEnd = newSearchVecLoc - 2;
+                newNode.leftSegTail(TN_HEADER_SIZE);
+                newNode.rightSegTail(destLoc - encodedLen - 1);
+                newNode.searchVecStart(TN_HEADER_SIZE);
+                newNode.searchVecEnd(newSearchVecLoc - 2);
                 newNode.releaseExclusive();
 
                 // Prune off the left end of this node by shifting vector towards child ids.
                 int shift = (searchVecLoc - searchVecStart) << 2;
                 int len = searchVecEnd - searchVecLoc + 2;
-                p_copy(page, searchVecLoc, page, mSearchVecStart = searchVecLoc + shift, len);
-                mSearchVecEnd = searchVecEnd + shift;
+                int newSearchVecStart = searchVecLoc + shift;
+                p_copy(page, searchVecLoc, page, newSearchVecStart, len);
+                searchVecStart(newSearchVecStart);
+                searchVecEnd(searchVecEnd + shift);
             } else {
                 // Split into new right node.
 
@@ -4522,7 +5031,7 @@ final class Node extends Latch implements DatabaseAccess {
                 // make room for child ids and copy them in place.
 
                 int destLoc = TN_HEADER_SIZE;
-                int newSearchVecLoc = p_length(newPage);
+                int newSearchVecLoc = pageSize(newPage);
 
                 int searchVecLoc = searchVecEnd + 2;
                 moveEntries: while (true) {
@@ -4531,7 +5040,7 @@ final class Node extends Latch implements DatabaseAccess {
                         newKeyLoc = newSearchVecLoc;
                         // Reserve slot in vector for new entry and account for size increase.
                         newSize += encodedLen + (2 + 8);
-                        if (newSize > p_length(newPage)) {
+                        if (newSize > pageSize(newPage)) {
                             // New entry doesn't fit.
                             if (splitSide == 1) {
                                 // Guessed wrong; do over on left side.
@@ -4557,7 +5066,7 @@ final class Node extends Latch implements DatabaseAccess {
                     // account for this.
                     garbageAccum += entryLen;
 
-                    boolean full = size < TN_HEADER_SIZE | newSize > p_length(newPage);
+                    boolean full = size < TN_HEADER_SIZE | newSize > pageSize(newPage);
 
                     if (full || newSize >= size) {
                         // New node has accumlated enough entries...
@@ -4568,11 +5077,7 @@ final class Node extends Latch implements DatabaseAccess {
                                 split = newSplitRight(newNode);
                                 setSplitKey(tree, split, retrieveKeyAtLoc(page, entryLoc));
                             } catch (Throwable e) {
-                                try {
-                                    db.deleteNode(newNode, true);
-                                } catch (Throwable e2) {
-                                    e.addSuppressed(e2);
-                                }
+                                cleanupSplit(e, newNode, split);
                                 throw e;
                             }
                             break moveEntries;
@@ -4601,9 +5106,9 @@ final class Node extends Latch implements DatabaseAccess {
 
                 // Move new search vector to make room for child ids and be centered between
                 // the segments.
-                int newVecLen = p_length(page) - newSearchVecLoc;
+                int newVecLen = pageSize(page) - newSearchVecLoc;
                 {
-                    int highestLoc = p_length(newPage) - (5 * newVecLen) - 8;
+                    int highestLoc = pageSize(newPage) - (5 * newVecLen) - 8;
                     int midLoc = ((destLoc + encodedLen + highestLoc + 1) >> 1) & ~1;
                     p_copy(newPage, newSearchVecLoc, newPage, midLoc, newVecLen);
                     newKeyLoc -= newSearchVecLoc - midLoc;
@@ -4629,35 +5134,36 @@ final class Node extends Latch implements DatabaseAccess {
                            newPage, newDestLoc + 8, tailChildIdsLen);
                 }
 
-                newNode.mLeftSegTail = destLoc + encodedLen;
-                newNode.mRightSegTail = p_length(newPage) - 1;
-                newNode.mSearchVecStart = newSearchVecLoc;
-                newNode.mSearchVecEnd = newSearchVecEnd;
+                newNode.leftSegTail(destLoc + encodedLen);
+                newNode.rightSegTail(pageSize(newPage) - 1);
+                newNode.searchVecStart(newSearchVecLoc);
+                newNode.searchVecEnd(newSearchVecEnd);
                 newNode.releaseExclusive();
 
                 // Prune off the right end of this node by shifting vector towards child ids.
                 int len = searchVecLoc - searchVecStart;
-                p_copy(page, searchVecStart, page, mSearchVecStart = searchVecEnd + 2 - len, len);
+                int newSearchVecStart = searchVecEnd + 2 - len;
+                p_copy(page, searchVecStart, page, newSearchVecStart, len);
+                searchVecStart(newSearchVecStart);
             }
 
             break;
         } // end doSplit
 
-        mGarbage += garbageAccum;
+        garbage(garbage() + garbageAccum);
         mSplit = split;
 
         // Write pointer to key entry.
         p_shortPutLE(newPage, newKeyLoc, result.mEntryLoc);
-
-        return result;
     }
 
     private void setSplitKey(Tree tree, Split split, byte[] fullKey) throws IOException {
         byte[] actualKey = fullKey;
 
-        if (calculateAllowedKeyLength(tree, fullKey) < 0) {
+        LocalDatabase db = tree.mDatabase;
+        if (calculateAllowedKeyLength(db, fullKey) < 0) {
             // Key must be fragmented.
-            actualKey = tree.fragmentKey(fullKey);
+            actualKey = db.fragmentKey(fullKey);
         }
 
         split.setKey(fullKey, actualKey);
@@ -4669,24 +5175,25 @@ final class Node extends Latch implements DatabaseAccess {
      * after compaction. Space is allocated for new entry, and the search
      * vector points to it.
      *
+     * @param result return result stored here
      * @param encodedLen length of new entry to allocate
      * @param keyPos normalized search vector position of key to insert/update
      * @param childPos normalized search vector position of child node id to insert; pass
      * MIN_VALUE if updating
      */
-    private InResult compactInternal(int encodedLen, int keyPos, int childPos) {
+    private void compactInternal(InResult result, int encodedLen, int keyPos, int childPos) {
         /*P*/ byte[] page = mPage;
 
-        int searchVecLoc = mSearchVecStart;
+        int searchVecLoc = searchVecStart();
         keyPos += searchVecLoc;
         // Size of search vector, possibly with new entry.
-        int newSearchVecSize = mSearchVecEnd - searchVecLoc + (2 + 2) + (childPos >> 30);
+        int newSearchVecSize = searchVecEnd() - searchVecLoc + (2 + 2) + (childPos >> 30);
 
         // Determine new location of search vector, with room to grow on both ends.
         int newSearchVecStart;
         // Capacity available to search vector after compaction.
-        int searchVecCap = mGarbage + mRightSegTail + 1 - mLeftSegTail - encodedLen;
-        newSearchVecStart = p_length(page) -
+        int searchVecCap = garbage() + rightSegTail() + 1 - leftSegTail() - encodedLen;
+        newSearchVecStart = pageSize(page) -
             (((searchVecCap + newSearchVecSize + ((newSearchVecSize + 2) << 2)) >> 1) & ~1);
 
         // Copy into a fresh buffer.
@@ -4694,10 +5201,14 @@ final class Node extends Latch implements DatabaseAccess {
         int destLoc = TN_HEADER_SIZE;
         int newSearchVecLoc = newSearchVecStart;
         int newLoc = 0;
-        final int searchVecEnd = mSearchVecEnd;
+        final int searchVecEnd = searchVecEnd();
 
-        Database db = getDatabase();
+        LocalDatabase db = getDatabase();
         /*P*/ byte[] dest = db.removeSparePage();
+
+        /*P*/ // [|
+        /*P*/ // p_intPutLE(dest, 0, type() & 0xff); // set type, reserved byte, and garbage
+        /*P*/ // ]
 
         for (; searchVecLoc <= searchVecEnd; searchVecLoc += 2, newSearchVecLoc += 2) {
             if (searchVecLoc == keyPos) {
@@ -4722,8 +5233,8 @@ final class Node extends Latch implements DatabaseAccess {
             }
 
             // Copy child ids, and leave room for inserted child id.
-            p_copy(page, mSearchVecEnd + 2, dest, newSearchVecLoc, childPos);
-            p_copy(page, mSearchVecEnd + 2 + childPos,
+            p_copy(page, searchVecEnd() + 2, dest, newSearchVecLoc, childPos);
+            p_copy(page, searchVecEnd() + 2 + childPos,
                    dest, newSearchVecLoc + childPos + 8,
                    (newSearchVecSize << 2) - childPos);
         } else {
@@ -4732,28 +5243,38 @@ final class Node extends Latch implements DatabaseAccess {
             }
 
             // Copy child ids.
-            p_copy(page, mSearchVecEnd + 2, dest, newSearchVecLoc, (newSearchVecSize << 2) + 8);
+            p_copy(page, searchVecEnd() + 2, dest, newSearchVecLoc, (newSearchVecSize << 2) + 8);
         }
 
-        // Recycle old page buffer.
+        /*P*/ // [
+        // Recycle old page buffer and swap in compacted page.
         db.addSparePage(page);
+        mPage = dest;
+        garbage(0);
+        /*P*/ // |
+        /*P*/ // if (db.mFullyMapped) {
+        /*P*/ //     // Copy compacted entries to original page and recycle spare page buffer.
+        /*P*/ //     p_copy(dest, 0, page, 0, pageSize(page));
+        /*P*/ //     db.addSparePage(dest);
+        /*P*/ //     dest = page;
+        /*P*/ // } else {
+        /*P*/ //     // Recycle old page buffer and swap in compacted page.
+        /*P*/ //     db.addSparePage(page);
+        /*P*/ //     mPage = dest;
+        /*P*/ // }
+        /*P*/ // ]
 
         // Write pointer to key entry.
         p_shortPutLE(dest, newLoc, destLoc);
 
-        mPage = dest;
-        mGarbage = 0;
-        mLeftSegTail = destLoc + encodedLen;
-        mRightSegTail = p_length(dest) - 1;
-        mSearchVecStart = newSearchVecStart;
-        mSearchVecEnd = newSearchVecLoc - 2;
+        leftSegTail(destLoc + encodedLen);
+        rightSegTail(pageSize(dest) - 1);
+        searchVecStart(newSearchVecStart);
+        searchVecEnd(newSearchVecLoc - 2);
 
-        InResult result = new InResult();
         result.mPage = dest;
         result.mNewChildLoc = newSearchVecLoc + childPos;
         result.mEntryLoc = destLoc;
-
-        return result;
     }
 
     /**
@@ -4769,16 +5290,16 @@ final class Node extends Latch implements DatabaseAccess {
     private Split newSplitLeft(Node newNode) {
         Split split = new Split(false, newNode);
         // New left node cannot be a high extremity, and this node cannot be a low extremity.
-        newNode.mType = (byte) (mType & ~HIGH_EXTREMITY);
-        mType &= ~LOW_EXTREMITY;
+        newNode.type((byte) (type() & ~HIGH_EXTREMITY));
+        type((byte) (type() & ~LOW_EXTREMITY));
         return split;
     }
 
     private Split newSplitRight(Node newNode) {
         Split split = new Split(true, newNode);
         // New right node cannot be a low extremity, and this node cannot be a high extremity.
-        newNode.mType = (byte) (mType & ~LOW_EXTREMITY);
-        mType &= ~HIGH_EXTREMITY;
+        newNode.type((byte) (type() & ~LOW_EXTREMITY));
+        type((byte) (type() & ~HIGH_EXTREMITY));
         return split;
     }
 
@@ -4786,42 +5307,88 @@ final class Node extends Latch implements DatabaseAccess {
      * Count the number of cursors bound to this node.
      */
     long countCursors() {
-        long count = 0;
+        // Attempt an exclusive latch to prevent frames from being visited multiple times due
+        // to recycling.
+        if (tryAcquireExclusive()) {
+            long count = 0;
+            try {
+                CursorFrame frame = mLastCursorFrame;
+                while (frame != null) {
+                    count++;
+                    frame = frame.mPrevCousin;
+                }
+            } finally {
+                releaseExclusive();
+            }
+            return count;
+        }
+
+        // Iterate over the frames using a lock coupling strategy. Frames which are being
+        // concurrently removed are skipped over. A shared latch is required to prevent
+        // observing an in-flight split, which breaks iteration due to rebinding.
 
         acquireShared();
         try {
-            TreeCursorFrame frame = mLastCursorFrame;
-            while (frame != null) {
-                count++;
+            CursorFrame frame = mLastCursorFrame;
+
+            if (frame == null) {
+                return 0;
+            }
+
+            CursorFrame lock = new CursorFrame();
+            CursorFrame lockResult;
+
+            while (true) {
+                lockResult = frame.tryLock(lock);
+                if (lockResult != null) {
+                    break;
+                }
                 frame = frame.mPrevCousin;
+                if (frame == null) {
+                    return 0;
+                }
+            }
+
+            long count = 1;
+
+            while (true) {
+                CursorFrame prev = frame.tryLockPrevious(lock);
+                frame.unlock(lockResult);
+                if (prev == null) {
+                    return count;
+                }
+                count++;
+                lockResult = frame;
+                frame = prev;
             }
         } finally {
             releaseShared();
         }
-
-        return count;
     }
 
     /**
      * No latches are acquired by this method -- it is only used for debugging.
      */
     @Override
+    @SuppressWarnings("fallthrough")
     public String toString() {
         String prefix;
 
-        switch (mType) {
+        switch (type()) {
         case TYPE_UNDO_LOG:
             return "UndoNode: {id=" + mId +
                 ", cachedState=" + mCachedState +
-                ", topEntry=" + mGarbage +
+                ", topEntry=" + garbage() +
                 ", lowerNodeId=" + + p_longGetLE(mPage, 4) +
-                ", lockState=" + super.toString() +
+                ", latchState=" + super.toString() +
                 '}';
+            /*P*/ // [
         case TYPE_FRAGMENT:
             return "FragmentNode: {id=" + mId +
                 ", cachedState=" + mCachedState +
-                ", lockState=" + super.toString() +
+                ", latchState=" + super.toString() +
                 '}';
+            /*P*/ // ]
         case TYPE_TN_IN:
         case (TYPE_TN_IN | LOW_EXTREMITY):
         case (TYPE_TN_IN | HIGH_EXTREMITY):
@@ -4839,7 +5406,7 @@ final class Node extends Latch implements DatabaseAccess {
             if (!isLeaf()) {
                 return "Node: {id=" + mId +
                     ", cachedState=" + mCachedState +
-                    ", lockState=" + super.toString() +
+                    ", latchState=" + super.toString() +
                     '}';
             }
             // Fallthrough...
@@ -4852,8 +5419,8 @@ final class Node extends Latch implements DatabaseAccess {
             ", cachedState=" + mCachedState +
             ", isSplit=" + (mSplit != null) +
             ", availableBytes=" + availableBytes() +
-            ", extremity=" + (mType & (LOW_EXTREMITY | HIGH_EXTREMITY)) +
-            ", lockState=" + super.toString() +
+            ", extremity=0b" + Integer.toString((type() & (LOW_EXTREMITY | HIGH_EXTREMITY)), 2) +
+            ", latchState=" + super.toString() +
             '}';
     }
 
@@ -4864,34 +5431,34 @@ final class Node extends Latch implements DatabaseAccess {
      *
      * @return false if should stop
      */
-    boolean verifyTreeNode(int level, VerificationObserver observer) {
-        int type = mType & ~(LOW_EXTREMITY | HIGH_EXTREMITY);
+    boolean verifyTreeNode(int level, VerificationObserver observer) throws IOException {
+        int type = type() & ~(LOW_EXTREMITY | HIGH_EXTREMITY);
         if (type != TYPE_TN_IN && type != TYPE_TN_BIN && !isLeaf()) {
             return verifyFailed(level, observer, "Not a tree node: " + type);
         }
 
         final /*P*/ byte[] page = mPage;
 
-        if (mLeftSegTail < TN_HEADER_SIZE) {
-            return verifyFailed(level, observer, "Left segment tail: " + mLeftSegTail);
+        if (leftSegTail() < TN_HEADER_SIZE) {
+            return verifyFailed(level, observer, "Left segment tail: " + leftSegTail());
         }
 
-        if (mSearchVecStart < mLeftSegTail) {
-            return verifyFailed(level, observer, "Search vector start: " + mSearchVecStart);
+        if (searchVecStart() < leftSegTail()) {
+            return verifyFailed(level, observer, "Search vector start: " + searchVecStart());
         }
 
-        if (mSearchVecEnd < (mSearchVecStart - 2)) {
-            return verifyFailed(level, observer, "Search vector end: " + mSearchVecEnd);
+        if (searchVecEnd() < (searchVecStart() - 2)) {
+            return verifyFailed(level, observer, "Search vector end: " + searchVecEnd());
         }
 
-        if (mRightSegTail < mSearchVecEnd || mRightSegTail > (p_length(page) - 1)) {
-            return verifyFailed(level, observer, "Right segment tail: " + mRightSegTail);
+        if (rightSegTail() < searchVecEnd() || rightSegTail() > (pageSize(page) - 1)) {
+            return verifyFailed(level, observer, "Right segment tail: " + rightSegTail());
         }
 
         if (!isLeaf()) {
-            int childIdsStart = mSearchVecEnd + 2;
-            int childIdsEnd = childIdsStart + ((childIdsStart - mSearchVecStart) << 2) + 8;
-            if (childIdsEnd > (mRightSegTail + 1)) {
+            int childIdsStart = searchVecEnd() + 2;
+            int childIdsEnd = childIdsStart + ((childIdsStart - searchVecStart()) << 2) + 8;
+            if (childIdsEnd > (rightSegTail() + 1)) {
                 return verifyFailed(level, observer, "Child ids end: " + childIdsEnd);
             }
 
@@ -4899,7 +5466,7 @@ final class Node extends Latch implements DatabaseAccess {
 
             for (int i = childIdsStart; i < childIdsEnd; i += 8) {
                 long childId = p_uint48GetLE(page, i);
-                if (childId < 0 || childId == 0 || childId == 1) {
+                if (mId > 1 && childId <= 1) { // stubs don't have a valid child id
                     return verifyFailed(level, observer, "Illegal child id: " + childId);
                 }
                 LHashTable.IntEntry e = childIds.insert(childId);
@@ -4910,18 +5477,18 @@ final class Node extends Latch implements DatabaseAccess {
             }
         }
 
-        int used = TN_HEADER_SIZE + mRightSegTail + 1 - mLeftSegTail;
+        int used = TN_HEADER_SIZE + rightSegTail() + 1 - leftSegTail();
 
         int largeValueCount = 0;
 
         int lastKeyLoc = 0;
-        int lastKeyLen = 0;
 
-        for (int i = mSearchVecStart; i <= mSearchVecEnd; i += 2) {
-            int loc = p_ushortGetLE(page, i);
+        for (int i = searchVecStart(); i <= searchVecEnd(); i += 2) {
+            final int keyLoc = p_ushortGetLE(page, i);
+            int loc = keyLoc;
 
-            if (loc < TN_HEADER_SIZE || loc >= p_length(page) ||
-                (loc >= mLeftSegTail && loc <= mRightSegTail))
+            if (loc < TN_HEADER_SIZE || loc >= pageSize(page) ||
+                (loc >= leftSegTail() && loc <= rightSegTail()))
             {
                 return verifyFailed(level, observer, "Entry location: " + loc);
             }
@@ -4941,20 +5508,18 @@ final class Node extends Latch implements DatabaseAccess {
                 return verifyFailed(level, observer, "Key location out of bounds");
             }
 
-            if (loc + keyLen > p_length(page)) {
+            if (loc + keyLen > pageSize(page)) {
                 return verifyFailed(level, observer, "Key end location: " + (loc + keyLen));
             }
 
             if (lastKeyLoc != 0) {
-                int result = p_compareKeysPageToPage(page, lastKeyLoc, lastKeyLen,
-                                                     page, loc, keyLen);
+                int result = compareKeys(this, lastKeyLoc, this, keyLoc);
                 if (result >= 0) {
                     return verifyFailed(level, observer, "Key order: " + result);
                 }
             }
 
-            lastKeyLoc = loc;
-            lastKeyLoc = keyLen;
+            lastKeyLoc = keyLoc;
 
             if (isLeaf()) value: {
                 int len;
@@ -4980,16 +5545,16 @@ final class Node extends Latch implements DatabaseAccess {
                 } catch (IndexOutOfBoundsException e) {
                     return verifyFailed(level, observer, "Value location out of bounds");
                 }
-                if (loc + len > p_length(page)) {
+                if (loc + len > pageSize(page)) {
                     return verifyFailed(level, observer, "Value end location: " + (loc + len));
                 }
             }
         }
 
-        int garbage = p_length(page) - used;
+        int garbage = pageSize(page) - used;
 
-        if (mGarbage != garbage) {
-            return verifyFailed(level, observer, "Garbage: " + mGarbage + " != " + garbage);
+        if (garbage() != garbage && mId > 1) { // exclude stubs
+            return verifyFailed(level, observer, "Garbage: " + garbage() + " != " + garbage);
         }
 
         int entryCount = numKeys();

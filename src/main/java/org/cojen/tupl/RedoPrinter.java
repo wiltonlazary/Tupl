@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -179,6 +179,6 @@ class RedoPrinter implements RedoVisitor {
     }
 
     private String toDateTime(long timestamp) {
-        return new java.util.Date(timestamp).toString();
+        return java.time.Instant.ofEpochMilli(timestamp).toString();
     }
 }

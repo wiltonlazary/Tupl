@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2013-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -84,14 +84,12 @@ final class TrimmedCursor implements Cursor {
 
     @Override
     public int compareKeyTo(byte[] rkey) {
-        byte[] lkey = mKey;
-        return Utils.compareKeys(lkey, 0, lkey.length, rkey, 0, rkey.length);
+        return mSource.compareKeyTo(mView.applyPrefix(rkey));
     }
 
     @Override
     public int compareKeyTo(byte[] rkey, int offset, int length) {
-        byte[] lkey = mKey;
-        return Utils.compareKeys(lkey, 0, lkey.length, rkey, offset, length);
+        return mSource.compareKeyTo(mView.applyPrefix(rkey, offset, length));
     }
 
     @Override
@@ -110,6 +108,12 @@ final class TrimmedCursor implements Cursor {
     public LockResult skip(long amount) throws IOException {
         mKey = null;
         return mSource.skip(amount);
+    }
+
+    @Override
+    public LockResult skip(long amount, byte[] limitKey, boolean inclusive) throws IOException {
+        mKey = null;
+        return mSource.skip(amount, limitKey, inclusive);
     }
 
     @Override
@@ -197,6 +201,11 @@ final class TrimmedCursor implements Cursor {
     }
 
     @Override
+    public LockResult lock() throws IOException {
+        return mSource.lock();
+    }
+
+    @Override
     public LockResult load() throws IOException {
         return mSource.load();
     }
@@ -207,9 +216,16 @@ final class TrimmedCursor implements Cursor {
     }
 
     @Override
+    public void commit(byte[] value) throws IOException {
+        mSource.commit(value);
+    }
+
+    /*
+    @Override
     public Stream newStream() {
         return new TrimmedStream(mView, mSource.newStream());
     }
+    */
 
     @Override
     public Cursor copy() {

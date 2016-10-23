@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,10 +18,7 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
-import java.util.BitSet;
-
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.LongConsumer;
 
 import org.cojen.tupl.io.CauseCloseable;
 
@@ -31,18 +28,10 @@ import org.cojen.tupl.io.CauseCloseable;
  * @see NonPageDb
  */
 abstract class PageDb implements CauseCloseable {
-    final ReentrantReadWriteLock mCommitLock;
+    final CommitLock mCommitLock;
 
     PageDb() {
-        // Need to use a reentrant lock instead of a latch to simplify the
-        // logic for persisting in-flight undo logs during a checkpoint. Pages
-        // might need to be allocated during this time, and so reentrancy is
-        // required to avoid deadlock. Ideally, lock should be fair in order
-        // for exclusive lock request to de-prioritize itself by timing out and
-        // retrying. See Database.checkpoint. Being fair slows down overall
-        // performance, because it increases the cost of acquiring the shared
-        // lock. For this reason, it isn't fair.
-        mCommitLock = new ReentrantReadWriteLock(false);
+        mCommitLock = new CommitLock();
     }
 
     /**
@@ -61,7 +50,7 @@ abstract class PageDb implements CauseCloseable {
      * @param mode NodeUsageList.MODE_UNEVICTABLE | MODE_NO_EVICT
      * @return node with id assigned
      */
-    public abstract Node allocLatchedNode(Database db, int mode) throws IOException;
+    public abstract Node allocLatchedNode(LocalDatabase db, int mode) throws IOException;
 
     /**
      * Returns the fixed size of all pages in the store, in bytes.
@@ -69,6 +58,12 @@ abstract class PageDb implements CauseCloseable {
     public abstract int pageSize();
 
     public abstract long pageCount() throws IOException;
+
+    public abstract void pageLimit(long limit);
+
+    public abstract long pageLimit();
+
+    public abstract void pageLimitOverride(long limit);
 
     /**
      * Returns a snapshot of additional store stats.
@@ -85,28 +80,13 @@ abstract class PageDb implements CauseCloseable {
     }
 
     /**
-     * Returns a BitSet where each clear bit indicates a free page.
-     */
-    public abstract BitSet tracePages() throws IOException;
-
-    /**
      * Reads a page without locking. Caller must ensure that a deleted page
      * is not read during or after a commit.
      *
      * @param id page id to read
-     * @param buf receives read data
+     * @param page receives read data
      */
-    public abstract void readPage(long id, /*P*/ byte[] buf) throws IOException;
-
-    /**
-     * Reads a page without locking. Caller must ensure that a deleted page
-     * is not read during or after a commit.
-     *
-     * @param id page id to read
-     * @param buf receives read data
-     * @param offset offset into data buffer
-     */
-    public abstract void readPage(long id, /*P*/ byte[] buf, int offset) throws IOException;
+    public abstract void readPage(long id, /*P*/ byte[] page) throws IOException;
 
     /**
      * Allocates a page to be written to.
@@ -121,28 +101,20 @@ abstract class PageDb implements CauseCloseable {
      * deleted, but it remains readable until after a commit.
      *
      * @param id previously allocated page id
-     * @param buf data to write
+     * @param page data to write
      */
-    public abstract void writePage(long id, /*P*/ byte[] buf) throws IOException;
+    public abstract void writePage(long id, /*P*/ byte[] page) throws IOException;
 
     /**
-     * Writes to an allocated page, but doesn't commit it. A written page is
-     * immediately readable even if not committed. An uncommitted page can be
-     * deleted, but it remains readable until after a commit.
+     * Same as writePage, except that the given buffer might be altered and a replacement might
+     * be returned. Caller must not alter the original buffer if a replacement was provided,
+     * and the contents of the replacement are undefined.
      *
      * @param id previously allocated page id
-     * @param buf data to write
-     * @param offset offset into data buffer
+     * @param page data to write; implementation might alter the contents
+     * @return replacement buffer, or same instance if replacement was not performed
      */
-    public abstract void writePage(long id, /*P*/ byte[] buf, int offset) throws IOException;
-
-    /**
-     * If supported, copies a page into the cache, but does not write it. Cached copy is
-     * removed when read again, unless evicted sooner.
-     *
-     * @param id previously allocated page id
-     */
-    public abstract void cachePage(long id, /*P*/ byte[] buf) throws IOException;
+    public abstract /*P*/ byte[] evictPage(long id, /*P*/ byte[] page) throws IOException;
 
     /**
      * If supported, copies a page into the cache, but does not write it. Cached copy is
@@ -150,7 +122,7 @@ abstract class PageDb implements CauseCloseable {
      *
      * @param id previously allocated page id
      */
-    public abstract void cachePage(long id, /*P*/ byte[] buf, int offset) throws IOException;
+    public abstract void cachePage(long id, /*P*/ byte[] page) throws IOException;
 
     /**
      * If supported, removes a page from the cache.
@@ -178,19 +150,31 @@ abstract class PageDb implements CauseCloseable {
      */
     public abstract long allocatePages(long pageCount) throws IOException;
 
-    /**
-     * Access the shared commit lock, which prevents commits while held.
-     */
-    public Lock sharedCommitLock() {
-        return mCommitLock.readLock();
+    public long directPagePointer(long id) throws IOException {
+        throw new UnsupportedOperationException();
+    }
+
+    public long dirtyPage(long id) throws IOException {
+        throw new UnsupportedOperationException();
+    }
+
+    public long copyPage(long srcId, long dstId) throws IOException {
+        throw new UnsupportedOperationException();
     }
 
     /**
-     * Access the exclusive commit lock, which is acquired by the commit method.
+     * Access the commit lock, which prevents commits while held shared.
      */
-    public Lock exclusiveCommitLock() {
-        return mCommitLock.writeLock();
+    public CommitLock commitLock() {
+        return mCommitLock;
     }
+
+    /**
+     * Scan all durable free pages, passing them to the given consumer.
+     *
+     * @param dst destination for scanned page ids
+     */
+    public abstract void scanFreeList(LongConsumer dst) throws IOException;
 
     /**
      * Caller must ensure that at most one compaction is in progress and that no checkpoints
@@ -232,6 +216,12 @@ abstract class PageDb implements CauseCloseable {
     public abstract boolean compactionEnd() throws IOException;
 
     /**
+     * Must be called after compactionEnd, and after running a checkpoint, to reclaim pages in
+     * the reserve list. Otherwise, the pages are reclaimed when restarting the database.
+     */
+    public abstract void compactionReclaim() throws IOException;
+
+    /**
      * Called after compaction, to actually shrink the file.
      *
      * @return false if nothing was truncated
@@ -244,15 +234,18 @@ abstract class PageDb implements CauseCloseable {
     public abstract int extraCommitDataOffset();
 
     /**
-     * Durably commits all writes and deletes to the underlying device.
+     * Durably commits all writes and deletes to the underlying device. Caller must hold commit
+     * lock.
      *
      * @param resume true if resuming an aborted commit
      * @param header must be page size
-     * @param callback optional callback to run during commit
+     * @param callback optional callback to run during commit, which can release the exclusive
+     * lock at any time
      */
     public abstract void commit(boolean resume, /*P*/ byte[] header, CommitCallback callback)
         throws IOException;
 
+    @FunctionalInterface
     public static interface CommitCallback {
         /**
          * Write all allocated pages which should be committed. Extra header data provided is

@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2013-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,12 +19,19 @@ package org.cojen.tupl.io;
 import org.cojen.tupl.CorruptDatabaseException;
 
 import java.io.Closeable;
+import java.io.EOFException;
+import java.io.InputStream;
 import java.io.IOException;
+
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 
 import java.lang.reflect.Method;
 
 import java.nio.Buffer;
 
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -34,7 +41,148 @@ import java.util.Map;
  * @author Brian S O'Neill
  */
 public class Utils {
+    private static final MethodHandle cCompareUnsigned_1; // basic form
+    private static final MethodHandle cCompareUnsigned_2; // offset/length form
+    private static final MethodHandle cCompareUnsigned_3; // start/end form
+
+    static {
+        MethodType type = MethodType.methodType(int.class, byte[].class, byte[].class);
+        MethodHandle method = findFastCompareMethod("compareUnsigned", type);
+        if (method == null) {
+            method = findLocalCompareMethod("doCompareUnsigned", type);
+        }
+        cCompareUnsigned_1 = method;
+
+        type = MethodType.methodType
+            (int.class, byte[].class, int.class, int.class, byte[].class, int.class, int.class);
+        method = findFastCompareMethod("compareUnsigned", type);
+        if (method == null) {
+            cCompareUnsigned_2 = findLocalCompareMethod("doCompareUnsigned", type);
+            cCompareUnsigned_3 = null; // won't be used
+        } else {
+            // Use an adapter to fix handling of length paramaters.
+            cCompareUnsigned_2 = findLocalCompareMethod("compareUnsignedAdapter", type);
+            cCompareUnsigned_3 = method;
+        }
+    }
+
+    private static MethodHandle findFastCompareMethod(String name, MethodType type) {
+        try {
+            return MethodHandles.publicLookup().findStatic(Arrays.class, name, type);
+        } catch (NoSuchMethodException | IllegalAccessException e) {
+            return null;
+        }
+    }
+
+    private static MethodHandle findLocalCompareMethod(String name, MethodType type) {
+        try {
+            return MethodHandles.lookup().findStatic(Utils.class, name, type);
+        } catch (Exception e2) {
+            throw rethrow(e2);
+        }
+    }
+
     protected Utils() {
+    }
+
+    /**
+     * Performs a lexicographical comparison between two unsigned byte arrays.
+     *
+     * @return negative if 'a' is less, zero if equal, greater than zero if greater
+     */
+    public static int compareUnsigned(byte[] a, byte[] b) {
+        try {
+            return (int) cCompareUnsigned_1.invokeExact(a, b);
+        } catch (Throwable e) {
+            throw rethrow(e);
+        }
+    }
+
+    /**
+     * Performs a lexicographical comparison between two unsigned byte arrays.
+     *
+     * @param a array 'a'
+     * @param aoff array 'a' offset
+     * @param alen array 'a' length
+     * @param b array 'b'
+     * @param boff array 'b' offset
+     * @param blen array 'b' length
+     * @return negative if 'a' is less, zero if equal, greater than zero if greater
+     */
+    public static int compareUnsigned(byte[] a, int aoff, int alen, byte[] b, int boff, int blen) {
+        try {
+            return (int) cCompareUnsigned_2.invokeExact(a, aoff, alen, b, boff, blen);
+        } catch (Throwable e) {
+            throw rethrow(e);
+        }
+    }
+
+    private static int doCompareUnsigned(byte[] a, byte[] b) {
+        return doCompareUnsigned(a, 0, a.length, b, 0, b.length);
+    }
+
+    private static int doCompareUnsigned(byte[] a, int aoff, int alen,
+                                         byte[] b, int boff, int blen)
+    {
+        int minLen = Math.min(alen, blen);
+        for (int i=0; i<minLen; i++) {
+            byte ab = a[aoff + i];
+            byte bb = b[boff + i];
+            if (ab != bb) {
+                return (ab & 0xff) - (bb & 0xff);
+            }
+        }
+        return alen - blen;
+    }
+
+    /**
+     * Adapts the offset/length form to work with the start/end form.
+     */
+    private static int compareUnsignedAdapter(byte[] a, int aoff, int alen,
+                                              byte[] b, int boff, int blen)
+        throws Throwable
+    {
+        return (int) cCompareUnsigned_3.invokeExact(a, aoff, aoff + alen, b, boff, boff + blen);
+    }
+
+    /**
+     * Adds one to an unsigned integer, represented as a byte array. If
+     * overflowed, value in byte array is 0x00, 0x00, 0x00...
+     *
+     * @param value unsigned integer to increment
+     * @param start inclusive index
+     * @param end exclusive index
+     * @return false if overflowed
+     */
+    public static boolean increment(byte[] value, final int start, int end) {
+        while (--end >= start) {
+            if (++value[end] != 0) {
+                // No carry bit, so done adding.
+                return true;
+            }
+        }
+        // This point is reached upon overflow.
+        return false;
+    }
+
+    /**
+     * Subtracts one from an unsigned integer, represented as a byte array. If
+     * overflowed, value in byte array is 0xff, 0xff, 0xff...
+     *
+     * @param value unsigned integer to decrement
+     * @param start inclusive index
+     * @param end exclusive index
+     * @return false if overflowed
+     */
+    public static boolean decrement(byte[] value, final int start, int end) {
+        while (--end >= start) {
+            if (--value[end] != -1) {
+                // No borrow bit, so done subtracting.
+                return true;
+            }
+        }
+        // This point is reached upon overflow.
+        return false;
     }
 
     /**
@@ -283,6 +431,25 @@ public class Utils {
                      ((b[offset + 7]       ) << 24))              ) << 32);
     }
 
+    /**
+     * Fully reads the required length of bytes, throwing an EOFException if the end of stream
+     * is reached too soon.
+     */
+    public static void readFully(InputStream in, byte[] b, int off, int len) throws IOException {
+        if (len > 0) {
+            while (true) {
+                int amt = in.read(b, off, len);
+                if (amt <= 0) {
+                    throw new EOFException();
+                }
+                if ((len -= amt) <= 0) {
+                    break;
+                }
+                off += amt;
+            }
+        }
+    }
+
     private static volatile boolean cDeleteUnsupported;
 
     /**
@@ -348,17 +515,15 @@ public class Utils {
                     }
                 }
 
-                closer = new Thread() {
-                    public void run() {
-                        try {
-                            close(resource, cause);
-                        } catch (IOException e2) {
-                            // Ignore.
-                        } finally {
-                            unregister(resource);
-                        }
+                closer = new Thread(() -> {
+                    try {
+                        close(resource, cause);
+                    } catch (IOException e2) {
+                        // Ignore.
+                    } finally {
+                        unregister(resource);
                     }
-                };
+                });
 
                 cCloseThreads.put(resource, closer);
             }

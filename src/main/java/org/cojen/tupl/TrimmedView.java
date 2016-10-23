@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2013-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -45,6 +45,11 @@ final class TrimmedView implements View {
     }
 
     @Override
+    public long count(byte[] lowKey, byte[] highKey) throws IOException {
+        return mSource.count(lowKey, highKey);
+    }
+
+    @Override
     public byte[] load(Transaction txn, byte[] key) throws IOException {
         return mSource.load(txn, applyPrefix(key));
     }
@@ -87,6 +92,13 @@ final class TrimmedView implements View {
     }
 
     @Override
+    public LockResult tryLockShared(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        return mSource.tryLockShared(txn, applyPrefix(key), nanosTimeout);
+    }
+
+    @Override
     public final LockResult lockShared(Transaction txn, byte[] key)
         throws LockFailureException, ViewConstraintException
     {
@@ -94,10 +106,24 @@ final class TrimmedView implements View {
     }
 
     @Override
+    public LockResult tryLockUpgradable(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        return mSource.tryLockUpgradable(txn, applyPrefix(key), nanosTimeout);
+    }
+
+    @Override
     public final LockResult lockUpgradable(Transaction txn, byte[] key)
         throws LockFailureException, ViewConstraintException
     {
         return mSource.lockUpgradable(txn, applyPrefix(key));
+    }
+
+    @Override
+    public LockResult tryLockExclusive(Transaction txn, byte[] key, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        return mSource.tryLockExclusive(txn, applyPrefix(key), nanosTimeout);
     }
 
     @Override
@@ -112,10 +138,12 @@ final class TrimmedView implements View {
         return mSource.lockCheck(txn, applyPrefix(key));
     }
 
+    /*
     @Override
     public Stream newStream() {
         return new TrimmedStream(this, mSource.newStream());
     }
+    */
 
     @Override
     public View viewGe(byte[] key) {
@@ -164,13 +192,15 @@ final class TrimmedView implements View {
     }
 
     byte[] applyPrefix(byte[] key) {
-        if (key == null) {
-            throw new NullPointerException("Key is null");
-        }
+        return applyPrefix(key, 0, key.length);
+    }
+
+    byte[] applyPrefix(byte[] key, int offset, int length) {
+        Utils.keyCheck(key);
         byte[] prefix = mPrefix;
-        byte[] full = new byte[prefix.length + key.length];
+        byte[] full = new byte[prefix.length + length];
         System.arraycopy(prefix, 0, full, 0, prefix.length);
-        System.arraycopy(key, 0, full, prefix.length, key.length);
+        System.arraycopy(key, offset, full, prefix.length, length);
         return full;
     }
 }

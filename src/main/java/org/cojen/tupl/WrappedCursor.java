@@ -1,5 +1,5 @@
 /*
- *  Copyright 2013 Brian S O'Neill
+ *  Copyright 2013-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,8 +20,7 @@ import java.io.IOException;
 
 /**
  * Abstract wrapper around another cursor. Subclass must implement the {@link #copy copy}
- * method, and it should also override the {@link #store store} and {@link #newStream
- * newStream} methods.
+ * method, and it should also override the {@link #store store} and method.
  *
  * @author Brian S O'Neill
  */
@@ -132,6 +131,14 @@ public abstract class WrappedCursor<C extends Cursor> implements Cursor {
      * {@inheritDoc}
      */
     @Override
+    public LockResult skip(long amount, byte[] limitKey, boolean inclusive) throws IOException {
+        return source.skip(amount, limitKey, inclusive);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
     public LockResult next() throws IOException {
         return source.next();
     }
@@ -236,6 +243,14 @@ public abstract class WrappedCursor<C extends Cursor> implements Cursor {
      * {@inheritDoc}
      */
     @Override
+    public LockResult lock() throws IOException {
+        return source.lock();
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
     public LockResult load() throws IOException {
         return source.load();
     }
@@ -249,12 +264,22 @@ public abstract class WrappedCursor<C extends Cursor> implements Cursor {
     }
 
     /**
+     * Always throws UnmodifiableViewException by default.
+     */
+    @Override
+    public void commit(byte[] value) throws IOException {
+        throw new UnmodifiableViewException();
+    }
+
+    /**
      * Returns an unmodifiable stream by default.
      */
+    /*
     @Override
     public Stream newStream() {
         return new UnmodifiableStream(source.newStream());
     }
+    */
 
     /**
      * {@inheritDoc}

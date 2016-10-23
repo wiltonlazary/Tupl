@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,7 +19,11 @@ package org.cojen.tupl;
 import java.io.IOException;
 
 import java.util.Arrays;
-import java.util.BitSet;
+
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+
+import java.util.function.LongConsumer;
 
 import static org.cojen.tupl.PageOps.*;
 
@@ -33,7 +37,8 @@ final class NonPageDb extends PageDb {
     private final int mPageSize;
     private final PageCache mCache;
 
-    private long mAllocId;
+    private final AtomicLong mAllocId;
+    private final LongAdder mFreePageCount;
 
     /**
      * @param cache optional
@@ -42,7 +47,8 @@ final class NonPageDb extends PageDb {
         mPageSize = pageSize;
         mCache = cache;
         // Next assigned id is 2, the first legal identifier.
-        mAllocId = 1;
+        mAllocId = new AtomicLong(1);
+        mFreePageCount = new LongAdder();
     }
 
     @Override
@@ -60,12 +66,13 @@ final class NonPageDb extends PageDb {
     }
 
     @Override
-    public Node allocLatchedNode(Database db, int mode) throws IOException {
-        Node node = db.allocLatchedNode(Utils.randomSeed(), mode);
+    public Node allocLatchedNode(LocalDatabase db, int mode) throws IOException {
+        Node node = db.allocLatchedNode(Utils.cheapRandom(), mode);
         long nodeId = node.mId;
         if (nodeId < 0) {
             // Recycle the id.
             nodeId = -nodeId;
+            mFreePageCount.decrement();
         } else {
             nodeId = allocPage();
         }
@@ -84,62 +91,67 @@ final class NonPageDb extends PageDb {
     }
 
     @Override
+    public void pageLimit(long limit) {
+        // Ignored.
+    }
+
+    @Override
+    public long pageLimit() {
+        // No explicit limit.
+        return -1;
+    }
+
+    @Override
+    public void pageLimitOverride(long limit) {
+        // Ignored.
+    }
+
+    @Override
     public Stats stats() {
-        return new Stats();
+        Stats stats = new Stats();
+        stats.freePages = Math.max(0, mFreePageCount.sum());
+        stats.totalPages = Math.max(stats.freePages, mAllocId.get());
+        return stats;
     }
 
     @Override
-    public BitSet tracePages() throws IOException {
-        return new BitSet();
-    }
-
-    @Override
-    public void readPage(long id, /*P*/ byte[] buf) throws IOException {
-        readPage(id, buf, 0);
-    }
-
-    @Override
-    public void readPage(long id, /*P*/ byte[] buf, int offset) throws IOException {
+    public void readPage(long id, /*P*/ byte[] page) throws IOException {
         PageCache cache = mCache;
-        if (cache == null || !cache.remove(id, buf, offset, p_length(buf))) {
+        if (cache == null || !cache.remove(id, page, 0, pageSize())) {
             fail(false);
         }
     }
 
     @Override
-    public synchronized long allocPage() throws IOException {
+    public long allocPage() throws IOException {
         // Cached nodes and fragmented values always require unique identifiers.
-        long id = mAllocId + 1;
+        long id = mAllocId.incrementAndGet();
         if (id > 0x0000_ffff_ffff_ffffL) {
             // Identifier is limited to 48-bit range.
+            mAllocId.decrementAndGet();
             throw new DatabaseFullException();
         }
-        mAllocId = id;
         return id;
     }
 
     @Override
-    public void writePage(long id, /*P*/ byte[] buf) throws IOException {
-        writePage(id, buf, 0);
-    }
-
-    @Override
-    public void writePage(long id, /*P*/ byte[] buf, int offset) throws IOException {
+    public void writePage(long id, /*P*/ byte[] page) throws IOException {
         PageCache cache = mCache;
-        if (cache == null || !cache.add(id, buf, offset, p_length(buf), false)) {
+        if (cache == null || !cache.add(id, page, 0, false)) {
             fail(true);
         }
     }
 
     @Override
-    public void cachePage(long id, /*P*/ byte[] buf) throws IOException {
-        cachePage(id, buf, 0);
+    public /*P*/ byte[] evictPage(long id, /*P*/ byte[] page) throws IOException {
+        writePage(id, page);
+        return page;
     }
 
     @Override
-    public void cachePage(long id, /*P*/ byte[] buf, int offset) throws IOException {
+    public void cachePage(long id, /*P*/ byte[] page) throws IOException {
         PageCache cache = mCache;
-        if (cache != null && !cache.add(id, buf, offset, p_length(buf), false)) {
+        if (cache != null && !cache.add(id, page, 0, false)) {
             fail(false);
         }
     }
@@ -155,17 +167,24 @@ final class NonPageDb extends PageDb {
     @Override
     public void deletePage(long id) throws IOException {
         uncachePage(id);
+        mFreePageCount.increment();
     }
 
     @Override
     public void recyclePage(long id) throws IOException {
-        uncachePage(id);
+        deletePage(id);
     }
 
     @Override
     public long allocatePages(long pageCount) throws IOException {
         // Do nothing.
         return 0;
+    }
+
+    @Override
+    public void scanFreeList(LongConsumer dst) throws IOException {
+        // No durable pages to scan.
+        return;
     }
 
     @Override
@@ -186,6 +205,10 @@ final class NonPageDb extends PageDb {
     @Override
     public boolean compactionEnd() throws IOException {
         return false;
+    }
+
+    @Override
+    public void compactionReclaim() throws IOException {
     }
 
     @Override

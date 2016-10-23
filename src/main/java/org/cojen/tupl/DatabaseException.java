@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -62,6 +62,13 @@ public class DatabaseException extends IOException {
      * Applicable to timeout exceptions.
      */
     TimeUnit getUnit() {
+        return null;
+    }
+
+    /*
+     * Applicable to timeout exceptions.
+     */
+    Object getOwnerAttachment() {
         return null;
     }
 

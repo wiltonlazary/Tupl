@@ -1,5 +1,5 @@
 /*
- *  Copyright 2012-2013 Brian S O'Neill
+ *  Copyright 2012-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -708,6 +708,270 @@ public class ViewTest {
         }
         c.reset();
         assertEquals(60, i);
+    }
+
+    @Test
+    public void prefixCompare() throws Exception {
+        Index ix = fill();
+
+        View view = ix.viewPrefix("key-".getBytes(), 4);
+
+        {
+            byte[] lastKey = null;
+
+            Cursor c = view.newCursor(null);
+            for (c.first(); c.key() != null; c.next()) {
+                if (lastKey != null) {
+                    int result = c.compareKeyTo(lastKey);
+                    assertTrue(result > 0);
+                }
+                lastKey = c.key();
+            }
+        }
+
+        {
+            byte[] lastKey = null;
+
+            Cursor c = view.newCursor(null);
+            for (c.last(); c.key() != null; c.previous()) {
+                if (lastKey != null) {
+                    int result = c.compareKeyTo(lastKey);
+                    assertTrue(result < 0);
+                }
+                lastKey = c.key();
+            }
+        }
+
+        view = view.viewReverse();
+
+        {
+            byte[] lastKey = null;
+
+            Cursor c = view.newCursor(null);
+            for (c.first(); c.key() != null; c.next()) {
+                if (lastKey != null) {
+                    int result = c.compareKeyTo(lastKey);
+                    assertTrue(result > 0);
+                }
+                lastKey = c.key();
+            }
+        }
+
+        {
+            byte[] lastKey = null;
+
+            Cursor c = view.newCursor(null);
+            for (c.last(); c.key() != null; c.previous()) {
+                if (lastKey != null) {
+                    int result = c.compareKeyTo(lastKey);
+                    assertTrue(result < 0);
+                }
+                lastKey = c.key();
+            }
+        }
+    }
+
+    @Test
+    public void counts() throws Exception {
+        Index ix = mDb.openIndex("test");
+
+        for (int i=100; i<150; i++) {
+            byte[] key = key(i);
+            ix.store(null, key, key);
+        }
+
+        View view = ix;
+        assertEquals(50, view.count(null, null));
+        assertEquals(50, view.count(key(100), null));
+        assertEquals(50, view.count(null, key(150)));
+        assertEquals(50, view.count(key(100), key(150)));
+
+        view = ix.viewGe(key(110));
+        assertEquals(40, view.count(null, null));
+        assertEquals(40, view.count(key(109), null));
+        assertEquals(40, view.count(key(110), null));
+        assertEquals(39, view.count(key(111), null));
+        assertEquals(38, view.count(key(112), null));
+
+        view = ix.viewGt(key(110));
+        assertEquals(39, view.count(null, null));
+        assertEquals(39, view.count(key(109), null));
+        assertEquals(39, view.count(key(110), null));
+        assertEquals(39, view.count(key(111), null));
+        assertEquals(38, view.count(key(112), null));
+
+        view = ix.viewLe(key(140));
+        assertEquals(41, view.count(null, null));
+        assertEquals(41, view.count(null, key(141)));
+        assertEquals(40, view.count(null, key(140)));
+        assertEquals(39, view.count(null, key(139)));
+        assertEquals(38, view.count(null, key(138)));
+
+        view = ix.viewLt(key(140));
+        assertEquals(40, view.count(null, null));
+        assertEquals(40, view.count(null, key(141)));
+        assertEquals(40, view.count(null, key(140)));
+        assertEquals(39, view.count(null, key(139)));
+        assertEquals(38, view.count(null, key(138)));
+
+        view = ix.viewGe(key(110)).viewLe(key(140));
+        assertEquals(31, view.count(null, null));
+        assertEquals(31, view.count(null, key(142)));
+        assertEquals(31, view.count(null, key(141)));
+        assertEquals(30, view.count(null, key(140)));
+        assertEquals(29, view.count(null, key(139)));
+        assertEquals(31, view.count(key(109), null));
+        assertEquals(31, view.count(key(109), key(142)));
+        assertEquals(31, view.count(key(109), key(141)));
+        assertEquals(30, view.count(key(109), key(140)));
+        assertEquals(29, view.count(key(109), key(139)));
+        assertEquals(31, view.count(key(110), null));
+        assertEquals(31, view.count(key(110), key(142)));
+        assertEquals(31, view.count(key(110), key(141)));
+        assertEquals(30, view.count(key(110), key(140)));
+        assertEquals(29, view.count(key(110), key(139)));
+        assertEquals(30, view.count(key(111), null));
+        assertEquals(30, view.count(key(111), key(142)));
+        assertEquals(30, view.count(key(111), key(141)));
+        assertEquals(29, view.count(key(111), key(140)));
+        assertEquals(28, view.count(key(111), key(139)));
+        assertEquals(29, view.count(key(112), null));
+        assertEquals(29, view.count(key(112), key(142)));
+        assertEquals(29, view.count(key(112), key(141)));
+        assertEquals(28, view.count(key(112), key(140)));
+        assertEquals(27, view.count(key(112), key(139)));
+
+        view = ix.viewGe(key(110)).viewLt(key(140));
+        assertEquals(30, view.count(null, null));
+        assertEquals(30, view.count(null, key(142)));
+        assertEquals(30, view.count(null, key(141)));
+        assertEquals(30, view.count(null, key(140)));
+        assertEquals(29, view.count(null, key(139)));
+        assertEquals(30, view.count(key(109), null));
+        assertEquals(30, view.count(key(109), key(142)));
+        assertEquals(30, view.count(key(109), key(141)));
+        assertEquals(30, view.count(key(109), key(140)));
+        assertEquals(29, view.count(key(109), key(139)));
+        assertEquals(30, view.count(key(110), null));
+        assertEquals(30, view.count(key(110), key(142)));
+        assertEquals(30, view.count(key(110), key(141)));
+        assertEquals(30, view.count(key(110), key(140)));
+        assertEquals(29, view.count(key(110), key(139)));
+        assertEquals(29, view.count(key(111), null));
+        assertEquals(29, view.count(key(111), key(142)));
+        assertEquals(29, view.count(key(111), key(141)));
+        assertEquals(29, view.count(key(111), key(140)));
+        assertEquals(28, view.count(key(111), key(139)));
+        assertEquals(28, view.count(key(112), null));
+        assertEquals(28, view.count(key(112), key(142)));
+        assertEquals(28, view.count(key(112), key(141)));
+        assertEquals(28, view.count(key(112), key(140)));
+        assertEquals(27, view.count(key(112), key(139)));
+
+        view = ix.viewGt(key(110)).viewLe(key(140));
+        assertEquals(30, view.count(null, null));
+        assertEquals(30, view.count(null, key(142)));
+        assertEquals(30, view.count(null, key(141)));
+        assertEquals(29, view.count(null, key(140)));
+        assertEquals(28, view.count(null, key(139)));
+        assertEquals(30, view.count(key(109), null));
+        assertEquals(30, view.count(key(109), key(142)));
+        assertEquals(30, view.count(key(109), key(141)));
+        assertEquals(29, view.count(key(109), key(140)));
+        assertEquals(28, view.count(key(109), key(139)));
+        assertEquals(30, view.count(key(110), null));
+        assertEquals(30, view.count(key(110), key(142)));
+        assertEquals(30, view.count(key(110), key(141)));
+        assertEquals(29, view.count(key(110), key(140)));
+        assertEquals(28, view.count(key(110), key(139)));
+        assertEquals(30, view.count(key(111), null));
+        assertEquals(30, view.count(key(111), key(142)));
+        assertEquals(30, view.count(key(111), key(141)));
+        assertEquals(29, view.count(key(111), key(140)));
+        assertEquals(28, view.count(key(111), key(139)));
+        assertEquals(29, view.count(key(112), null));
+        assertEquals(29, view.count(key(112), key(142)));
+        assertEquals(29, view.count(key(112), key(141)));
+        assertEquals(28, view.count(key(112), key(140)));
+        assertEquals(27, view.count(key(112), key(139)));
+
+        view = ix.viewGt(key(110)).viewLt(key(140));
+        assertEquals(29, view.count(null, null));
+        assertEquals(29, view.count(null, key(142)));
+        assertEquals(29, view.count(null, key(141)));
+        assertEquals(29, view.count(null, key(140)));
+        assertEquals(28, view.count(null, key(139)));
+        assertEquals(29, view.count(key(109), null));
+        assertEquals(29, view.count(key(109), key(142)));
+        assertEquals(29, view.count(key(109), key(141)));
+        assertEquals(29, view.count(key(109), key(140)));
+        assertEquals(28, view.count(key(109), key(139)));
+        assertEquals(29, view.count(key(110), null));
+        assertEquals(29, view.count(key(110), key(142)));
+        assertEquals(29, view.count(key(110), key(141)));
+        assertEquals(29, view.count(key(110), key(140)));
+        assertEquals(28, view.count(key(110), key(139)));
+        assertEquals(29, view.count(key(111), null));
+        assertEquals(29, view.count(key(111), key(142)));
+        assertEquals(29, view.count(key(111), key(141)));
+        assertEquals(29, view.count(key(111), key(140)));
+        assertEquals(28, view.count(key(111), key(139)));
+        assertEquals(28, view.count(key(112), null));
+        assertEquals(28, view.count(key(112), key(142)));
+        assertEquals(28, view.count(key(112), key(141)));
+        assertEquals(28, view.count(key(112), key(140)));
+        assertEquals(27, view.count(key(112), key(139)));
+    }
+
+    @Test
+    public void reverseCounts() throws Exception {
+        Index ix = mDb.openIndex("test");
+
+        for (int i=101; i<=150; i++) {
+            byte[] key = key(i);
+            ix.store(null, key, key);
+        }
+
+        View view = ix.viewReverse();
+
+        assertEquals(50, ViewUtils.count(view, false, null, null));
+        assertEquals(50, ViewUtils.count(view, false, key(150), null));
+        assertEquals(50, ViewUtils.count(view, false, null, key(100)));
+        assertEquals(50, ViewUtils.count(view, false, key(150), key(100)));
+
+        assertEquals(50, view.count(null, null));
+        assertEquals(50, view.count(key(150), null));
+        assertEquals(50, view.count(null, key(100)));
+        assertEquals(50, view.count(key(150), key(100)));
+
+        view = ix.viewReverse().viewGe(key(120)).viewLt(key(110));
+
+        assertEquals(10, ViewUtils.count(view, false, null, null));
+        assertEquals(10, view.count(null, null));
+    }
+
+    @Test
+    public void reverseRandom() throws Exception {
+        Index ix = mDb.openIndex("test");
+
+        for (int i=101; i<=110; i++) {
+            byte[] key = key(i);
+            ix.store(null, key, key);
+        }
+
+        View view = ix.viewReverse();
+
+        Cursor c = view.newCursor(null);
+        c.random(key(108), key(107));
+        assertArrayEquals(key(108), c.key());
+        c.reset();
+
+        view = ix.viewReverse().viewGe(key(108)).viewLt(key(107));
+
+        c = view.newCursor(null);
+        c.random(null, null);
+        assertArrayEquals(key(108), c.key()); 
+        c.reset();
     }
 
     @Test

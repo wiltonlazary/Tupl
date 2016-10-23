@@ -1,5 +1,5 @@
 /*
- *  Copyright 2011-2013 Brian S O'Neill
+ *  Copyright 2011-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -84,7 +84,8 @@ public interface Cursor {
     /**
      * By default, values are loaded automatically, as they are seen. When disabled, values
      * might need to be {@link Cursor#load manually loaded}. When a {@link Transformer} is
-     * used, the value might still be loaded automatically.
+     * used, the value might still be loaded automatically. When the value exists but hasn't
+     * been loaded, the value field of the cursor is set to {@link NOT_LOADED}.
      *
      * @param mode false to disable
      * @return prior autoload mode
@@ -104,7 +105,10 @@ public interface Cursor {
      * is less than, equal to, or greater than the rkey.
      * @throws NullPointerException if current key or rkey is null
      */
-    public int compareKeyTo(byte[] rkey);
+    public default int compareKeyTo(byte[] rkey) {
+        byte[] lkey = key();
+        return Utils.compareUnsigned(lkey, 0, lkey.length, rkey, 0, rkey.length);
+    }
 
     /**
      * Compare the current key to the one given.
@@ -116,7 +120,10 @@ public interface Cursor {
      * is less than, equal to, or greater than the rkey.
      * @throws NullPointerException if current key or rkey is null
      */
-    public int compareKeyTo(byte[] rkey, int offset, int length);
+    public default int compareKeyTo(byte[] rkey, int offset, int length) {
+        byte[] lkey = key();
+        return Utils.compareUnsigned(lkey, 0, lkey.length, rkey, offset, length);
+    }
 
     /**
      * Moves the Cursor to find the first available entry. Cursor key and value
@@ -143,8 +150,7 @@ public interface Cursor {
     /**
      * Moves the Cursor by a relative amount of entries. Pass a positive amount
      * to skip forward, and pass a negative amount to skip backwards. If less
-     * than the given amount of entries are available, the Cursor key and value
-     * are set to null, and position will be undefined.
+     * than the given amount of entries are available, the Cursor is reset.
      *
      * <p>Skipping by 1 is equivalent to calling {@link #next next}, and
      * skipping by -1 is equivalent to calling {@link #previous previous}. A
@@ -159,6 +165,33 @@ public interface Cursor {
      * @throws IllegalStateException if position is undefined at invocation time
      */
     public LockResult skip(long amount) throws IOException;
+
+    /**
+     * Moves the Cursor by a relative amount of entries, stopping sooner if the limit key is
+     * reached. Pass a positive amount to skip forward, and pass a negative amount to skip
+     * backwards. If the limit key is reached, or if less than the given amount of entries are
+     * available, the Cursor is reset.
+     *
+     * <p>Skipping by 1 is equivalent to calling {@link #nextLe nextLe}, {@link #nextLt nextLt}
+     * or {@link #next next}, depending on which type of limit was provided. Likewise, skipping
+     * by -1 is equivalent to calling {@link #previousGe previousGe}, {@link #previousGt
+     * previousGt} or {@link #previous previous}. A skip of 0 merely checks and returns the
+     * lock state for the current key. Lock acquisition only applies to the target entry
+     * &mdash; no locks are acquired for entries in between.
+     *
+     * @param limitKey limit key; pass null for no limit
+     * @param inclusive true if limit is inclusive, false for exclusive
+     * @return {@link LockResult#UNOWNED UNOWNED}, {@link LockResult#ACQUIRED
+     * ACQUIRED}, {@link LockResult#OWNED_SHARED OWNED_SHARED}, {@link
+     * LockResult#OWNED_UPGRADABLE OWNED_UPGRADABLE}, or {@link
+     * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
+     * @throws IllegalStateException if position is undefined at invocation time
+     */
+    public default LockResult skip(long amount, byte[] limitKey, boolean inclusive)
+        throws IOException
+    {
+        return ViewUtils.skip(this, amount, limitKey, inclusive);
+    }
 
     /**
      * Moves to the Cursor to the next available entry. Cursor key and value
@@ -184,7 +217,9 @@ public interface Cursor {
      * @throws NullPointerException if limit key is null
      * @throws IllegalStateException if position is undefined at invocation time
      */
-    public LockResult nextLe(byte[] limitKey) throws IOException;
+    public default LockResult nextLe(byte[] limitKey) throws IOException {
+        return ViewUtils.nextCmp(this, limitKey, 1);
+    }
 
     /**
      * Moves to the Cursor to the next available entry, but only when less than
@@ -198,7 +233,9 @@ public interface Cursor {
      * @throws NullPointerException if limit key is null
      * @throws IllegalStateException if position is undefined at invocation time
      */
-    public LockResult nextLt(byte[] limitKey) throws IOException;
+    public default LockResult nextLt(byte[] limitKey) throws IOException {
+        return ViewUtils.nextCmp(this, limitKey, 0);
+    }
 
     /**
      * Moves to the Cursor to the previous available entry. Cursor key and
@@ -226,7 +263,9 @@ public interface Cursor {
      * @throws NullPointerException if limit key is null
      * @throws IllegalStateException if position is undefined at invocation time
      */
-    public LockResult previousGe(byte[] limitKey) throws IOException;
+    public default LockResult previousGe(byte[] limitKey) throws IOException {
+        return ViewUtils.previousCmp(this, limitKey, -1);
+    }
 
     /**
      * Moves to the Cursor to the previous available entry, but only when
@@ -240,7 +279,9 @@ public interface Cursor {
      * @throws NullPointerException if limit key is null
      * @throws IllegalStateException if position is undefined at invocation time
      */
-    public LockResult previousGt(byte[] limitKey) throws IOException;
+    public default LockResult previousGt(byte[] limitKey) throws IOException {
+        return ViewUtils.previousCmp(this, limitKey, 0);
+    }
 
     /**
      * Moves the Cursor to find the given key.
@@ -269,7 +310,16 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findGe(byte[] key) throws IOException;
+    public default LockResult findGe(byte[] key) throws IOException {
+        LockResult result = find(key);
+        if (value() == null) {
+            if (result == LockResult.ACQUIRED) {
+                link().unlock();
+            }
+            result = next();
+        }
+        return result;
+    }
 
     /**
      * Moves the Cursor to find the first available entry greater than the
@@ -284,7 +334,10 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findGt(byte[] key) throws IOException;
+    public default LockResult findGt(byte[] key) throws IOException {
+        ViewUtils.findNoLock(this, key);
+        return next();
+    }
 
     /**
      * Moves the Cursor to find the first available entry less than or equal to
@@ -299,7 +352,16 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findLe(byte[] key) throws IOException;
+    public default LockResult findLe(byte[] key) throws IOException {
+        LockResult result = find(key);
+        if (value() == null) {
+            if (result == LockResult.ACQUIRED) {
+                link().unlock();
+            }
+            result = previous();
+        }
+        return result;
+    }
 
     /**
      * Moves the Cursor to find the first available entry less than the given
@@ -314,7 +376,10 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findLt(byte[] key) throws IOException;
+    public default LockResult findLt(byte[] key) throws IOException {
+        ViewUtils.findNoLock(this, key);
+        return previous();
+    }
 
     /**
      * Optimized version of the regular find method, which can perform fewer search steps if
@@ -330,7 +395,9 @@ public interface Cursor {
      * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
      * @throws NullPointerException if key is null
      */
-    public LockResult findNearby(byte[] key) throws IOException;
+    public default LockResult findNearby(byte[] key) throws IOException {
+        return find(key);
+    }
 
     /**
      * Moves the Cursor to a random entry, but not guaranteed to be chosen from
@@ -347,9 +414,27 @@ public interface Cursor {
     public LockResult random(byte[] lowKey, byte[] highKey) throws IOException;
 
     /**
-     * Loads or reloads the value at the cursor's current position. Cursor
-     * value is set to null if entry no longer exists, but the position remains
-     * unmodified.
+     * Locks the current entry, as if by calling load. Locking is performed automatically
+     * within transactions, and so invocation of this method is necessary only when manually
+     * tweaking the lock mode. If a lock was acquired (even if not retained), the cursor value
+     * field is updated according to the current autoload mode.
+     *
+     * <p>By default, this method simply calls load. Subclasses are encouraged to provide a
+     * more efficient implementation.
+     *
+     * @throws IllegalStateException if position is undefined at invocation time
+     * @return {@link LockResult#UNOWNED UNOWNED}, {@link LockResult#ACQUIRED
+     * ACQUIRED}, {@link LockResult#OWNED_SHARED OWNED_SHARED}, {@link
+     * LockResult#OWNED_UPGRADABLE OWNED_UPGRADABLE}, or {@link
+     * LockResult#OWNED_EXCLUSIVE OWNED_EXCLUSIVE}
+     */
+    public default LockResult lock() throws IOException {
+        return load();
+    }
+
+    /**
+     * Loads or reloads the value at the cursor's current position. Cursor value is set to null
+     * if entry no longer exists, but the position remains unmodified.
      *
      * @throws IllegalStateException if position is undefined at invocation time
      * @return {@link LockResult#UNOWNED UNOWNED}, {@link LockResult#ACQUIRED
@@ -372,6 +457,24 @@ public interface Cursor {
      */
     public void store(byte[] value) throws IOException;
 
+    /**
+     * Combined store and commit to the linked transaction. Although similar to storing and
+     * committing explicitly, additional optimizations can be applied. In particular, no undo
+     * log entry is required when committing the outermost transaction scope. This is the same
+     * optimization used by null transactions (auto-commit).
+     *
+     * @param value value to store; pass null to delete
+     * @throws IllegalStateException if position is undefined at invocation time
+     * @throws ViewConstraintException if value is not permitted
+     */
+    public default void commit(byte[] value) throws IOException {
+        store(value);
+        Transaction txn = link();
+        if (txn != null && txn != Transaction.BOGUS) {
+            txn.commit();
+        }
+    }
+
     //public int read(LockResult[] result,int start,byte[] b, int off, int len) throws IOException;
 
     /**
@@ -388,7 +491,11 @@ public interface Cursor {
      * cursor is unpositioned. When using a cursor for opening streams, {@link #autoload
      * autoload} should be disabled.
      */
-    public Stream newStream();
+    /*
+    public default Stream newStream() {
+        throw new UnsupportedOperationException();
+    }
+    */
 
     /**
      * Returns a new independent Cursor, positioned where this one is, and

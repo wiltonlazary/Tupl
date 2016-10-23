@@ -1,5 +1,5 @@
 /*
- *  Copyright 2014 Brian S O'Neill
+ *  Copyright 2014-2015 Cojen.org
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -49,6 +49,11 @@ final class TransformedView implements View {
     @Override
     public Cursor newCursor(Transaction txn) {
         return new TransformedCursor(mSource.newCursor(txn), mTransformer);
+    }
+
+    @Override
+    public long count(byte[] lowKey, byte[] highKey) throws IOException {
+        return ViewUtils.count(this, mTransformer.requireValue(), lowKey, highKey);
     }
 
     @Override
@@ -243,6 +248,17 @@ final class TransformedView implements View {
     }
 
     @Override
+    public final LockResult tryLockShared(Transaction txn, byte[] tkey, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        byte[] key = inverseTransformKey(tkey);
+        if (key != null) {
+            return mSource.tryLockShared(txn, key, nanosTimeout);
+        }
+        throw fail();
+    }
+
+    @Override
     public final LockResult lockShared(Transaction txn, byte[] tkey)
         throws LockFailureException, ViewConstraintException
     {
@@ -254,12 +270,34 @@ final class TransformedView implements View {
     }
 
     @Override
+    public final LockResult tryLockUpgradable(Transaction txn, byte[] tkey, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        byte[] key = inverseTransformKey(tkey);
+        if (key != null) {
+            return mSource.tryLockUpgradable(txn, key, nanosTimeout);
+        }
+        throw fail();
+    }
+
+    @Override
     public final LockResult lockUpgradable(Transaction txn, byte[] tkey)
         throws LockFailureException, ViewConstraintException
     {
         byte[] key = inverseTransformKey(tkey);
         if (key != null) {
             return mSource.lockUpgradable(txn, key);
+        }
+        throw fail();
+    }
+
+    @Override
+    public final LockResult tryLockExclusive(Transaction txn, byte[] tkey, long nanosTimeout)
+        throws DeadlockException, ViewConstraintException
+    {
+        byte[] key = inverseTransformKey(tkey);
+        if (key != null) {
+            return mSource.tryLockExclusive(txn, key, nanosTimeout);
         }
         throw fail();
     }
@@ -286,10 +324,12 @@ final class TransformedView implements View {
         throw fail();
     }
 
+    /*
     @Override
     public Stream newStream() {
         return new TransformedStream(mSource.newStream(), mTransformer);
     }
+    */
 
     @Override
     public View viewGe(byte[] tkey) {
@@ -408,9 +448,7 @@ final class TransformedView implements View {
     }
 
     private byte[] inverseTransformKey(final byte[] tkey) {
-        if (tkey == null) {
-            throw new NullPointerException("Key is null");
-        }
+        Utils.keyCheck(tkey);
         return mTransformer.inverseTransformKey(tkey);
     }
 
