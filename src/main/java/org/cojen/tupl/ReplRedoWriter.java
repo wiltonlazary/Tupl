@@ -89,6 +89,18 @@ class ReplRedoWriter extends RedoWriter {
     }
 
     @Override
+    public final synchronized void txnRollback(long txnId) throws IOException {
+        super.txnRollback(txnId);
+        flush();
+    }
+
+    @Override
+    public final synchronized void txnRollbackFinal(long txnId) throws IOException {
+        super.txnRollbackFinal(txnId);
+        flush();
+    }
+
+    @Override
     public final long txnCommitFinal(long txnId, DurabilityMode mode) throws IOException {
         return super.txnCommitFinal(txnId, DurabilityMode.SYNC);
     }

@@ -97,6 +97,7 @@ final class _Lock {
         LatchCondition queueSX = mQueueSX;
         if (queueSX != null) {
             if (nanosTimeout == 0) {
+                locker.mWaitingFor = this;
                 return TIMED_OUT_LOCK;
             }
         } else {
@@ -105,6 +106,7 @@ final class _Lock {
                 return r;
             }
             if (nanosTimeout == 0) {
+                locker.mWaitingFor = this;
                 return TIMED_OUT_LOCK;
             }
             mQueueSX = queueSX = new LatchCondition();
@@ -189,6 +191,7 @@ final class _Lock {
         LatchCondition queueU = mQueueU;
         if (queueU != null) {
             if (nanosTimeout == 0) {
+                locker.mWaitingFor = this;
                 return TIMED_OUT_LOCK;
             }
         } else {
@@ -198,6 +201,7 @@ final class _Lock {
                 return ACQUIRED;
             }
             if (nanosTimeout == 0) {
+                locker.mWaitingFor = this;
                 return TIMED_OUT_LOCK;
             }
             mQueueU = queueU = new LatchCondition();
@@ -291,6 +295,7 @@ final class _Lock {
                 if (ur == ACQUIRED) {
                     unlockUpgradable();
                 }
+                locker.mWaitingFor = this;
                 return TIMED_OUT_LOCK;
             }
         } else {
@@ -302,6 +307,7 @@ final class _Lock {
                 if (ur == ACQUIRED) {
                     unlockUpgradable();
                 }
+                locker.mWaitingFor = this;
                 return TIMED_OUT_LOCK;
             }
             mQueueSX = queueSX = new LatchCondition();
@@ -596,6 +602,71 @@ final class _Lock {
 
     boolean matches(long indexId, byte[] key, int hash) {
         return mHashCode == hash && mIndexId == indexId && Arrays.equals(mKey, key);
+    }
+
+    /**
+     * Find an exclusive owner attachment, or the first found shared owner attachment. Might
+     * acquire and release a shared latch to access the shared owner attachment.
+     *
+     * @param locker pass null if already latched
+     * @param lockType TYPE_SHARED, TYPE_UPGRADABLE, or TYPE_EXCLUSIVE
+     */
+    Object findOwnerAttachment(_Locker locker, int lockType, int hash) {
+        // See note in _DeadlockDetector regarding unlatched access to this _Lock.
+
+        _LockOwner owner = mOwner;
+        if (owner != null) {
+            Object att = owner.attachment();
+            if (att != null) {
+                return att;
+            }
+        }
+
+        if (lockType != _LockManager.TYPE_EXCLUSIVE) {
+            // Only an exclusive lock request can be blocked by shared locks.
+            return null;
+        }
+
+        Object sharedObj = mSharedLockOwnersObj;
+        if (sharedObj == null) {
+            return null;
+        }
+
+        if (sharedObj instanceof _LockOwner) {
+            return ((_LockOwner) sharedObj).attachment();
+        }
+
+        if (sharedObj instanceof LockOwnerHTEntry[]) {
+            if (locker != null) {
+                // Need a latch to safely check the shared lock owner hashtable.
+                _LockManager manager = locker.mManager;
+                if (manager != null) {
+                    _LockManager.LockHT ht = manager.getLockHT(hash);
+                    ht.acquireShared();
+                    try {
+                        return findOwnerAttachment(null, lockType, hash);
+                    } finally {
+                        ht.releaseShared();
+                    }
+                }
+            } else {
+                LockOwnerHTEntry[] entries = (LockOwnerHTEntry[]) sharedObj;
+
+                for (int i=entries.length; --i>=0; ) {
+                    for (LockOwnerHTEntry e = entries[i]; e != null; e = e.mNext) {
+                        owner = e.mOwner;
+                        if (owner != null) {
+                            Object att = owner.attachment();
+                            if (att != null) {
+                                return att;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
     }
 
     private boolean isSharedLockOwner(_LockOwner locker) {
