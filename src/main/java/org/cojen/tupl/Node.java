@@ -18,8 +18,6 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
-import org.cojen.tupl.util.Latch;
-
 import static org.cojen.tupl.PageOps.*;
 
 import static org.cojen.tupl.Utils.EMPTY_BYTES;
@@ -33,7 +31,7 @@ import static org.cojen.tupl.Utils.rethrow;
  * @author Brian S O'Neill
  */
 @SuppressWarnings("serial")
-final class Node extends Latch implements DatabaseAccess {
+final class Node extends Clutch implements DatabaseAccess {
     // Note: Changing these values affects how the Database class handles the
     // commit flag. It only needs to flip bit 0 to switch dirty states.
     static final byte

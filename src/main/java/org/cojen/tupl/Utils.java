@@ -856,4 +856,12 @@ class Utils extends org.cojen.tupl.io.Utils {
         // Cause chain is quite long, and so it probably has a cycle.
         return true;
     }
+
+    static void appendMiniString(StringBuilder b, Object obj) {
+        if (obj == null) {
+            b.append("null");
+            return;
+        }
+        b.append(obj.getClass().getName()).append('@').append(Integer.toHexString(obj.hashCode()));
+    }
 }
