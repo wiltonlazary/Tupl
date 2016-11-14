@@ -369,10 +369,7 @@ class AltLatch {
             acquire(new Shared());
             return true;
         }
-        if (UNSAFE.compareAndSwapInt(this, STATE_OFFSET, state, state + 1)) {
-            return true;
-        }
-        return false;
+        return UNSAFE.compareAndSwapInt(this, STATE_OFFSET, state, state + 1);
     }
 
     /**
