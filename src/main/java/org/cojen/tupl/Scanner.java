@@ -158,11 +158,7 @@ public interface Scanner {
      * @throws UnsupportedOperationException if not supported by scanner implementation
      */
     public default void commit(byte[] value) throws IOException {
-        store(value);
-        Transaction txn = link();
-        if (txn != null && txn != Transaction.BOGUS) {
-            txn.commit();
-        }
+        ViewUtils.commit(this, value);
     }
 
     /**

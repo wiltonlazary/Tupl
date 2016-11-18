@@ -475,9 +475,8 @@ public interface Cursor extends Scanner {
      * @throws IllegalStateException if position is undefined at invocation time
      * @throws ViewConstraintException if value is not permitted
      */
-    public default void commit(byte[] value) throws IOException {
-        ViewUtils.commit(this, value);
-    }
+    @Override
+    public void commit(byte[] value) throws IOException;
 
     //public int read(LockResult[] result,int start,byte[] b, int off, int len) throws IOException;
 

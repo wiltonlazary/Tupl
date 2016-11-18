@@ -287,7 +287,7 @@ class ViewUtils {
         }
     }
 
-    static void commit(Cursor c, byte[] value) throws IOException {
+    static void commit(Scanner c, byte[] value) throws IOException {
         try {
             c.store(value);
         } catch (Throwable e) {
