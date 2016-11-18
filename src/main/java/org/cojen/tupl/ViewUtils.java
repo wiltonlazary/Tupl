@@ -287,6 +287,23 @@ class ViewUtils {
         }
     }
 
+    static void commit(Cursor c, byte[] value) throws IOException {
+        try {
+            c.store(value);
+        } catch (Throwable e) {
+            Transaction txn = c.link();
+            if (txn != null) {
+                txn.reset(e);
+            }
+            throw e;
+        }
+
+        Transaction txn = c.link();
+        if (txn != null && txn != Transaction.BOGUS) {
+            txn.commit();
+        }
+    }
+
     @FunctionalInterface
     static interface LockAction {
         LockResult lock(Transaction txn, byte[] key)
