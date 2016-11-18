@@ -42,11 +42,13 @@ public interface View {
 
     /**
      * @param txn optional transaction for Scanner to {@link Scanner#link link} to
+     * @param autoload true to load values as they are seen
      * @return a new scanner positioned at the first entry
      * @throws IllegalArgumentException if transaction belongs to another database instance
      */
-    public default Scanner newScanner(Transaction txn) throws IOException {
+    public default Scanner newScanner(Transaction txn, boolean autoload) throws IOException {
         Cursor c = newCursor(txn);
+        c.autoload(autoload);
         c.first();
         return c;
     }

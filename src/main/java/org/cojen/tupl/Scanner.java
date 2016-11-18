@@ -41,27 +41,19 @@ import java.io.IOException;
  */
 public interface Scanner {
     /**
-     * Empty marker which indicates that value exists but has not been {@link
-     * #load loaded}.
+     * Empty marker which indicates that value exists but has not been {@link #load loaded}.
      */
     public static final byte[] NOT_LOADED = new byte[0];
 
     /**
-     * Link to a transaction, which can be null for auto-commit mode. All
-     * entries visited by the scanner become part of the given transaction.  To
-     * continue using a scanner after the transaction is complete, link it to
-     * null or another transaction. Otherwise, the original transaction will be
-     * resurrected.
-     *
-     * @return prior linked transaction
-     * @throws IllegalArgumentException if transaction belongs to another database instance
-     */
-    public Transaction link(Transaction txn);
-
-    /**
-     * Returns the transaction the scanner is currently linked to.
+     * Returns the transaction the scanner is linked to.
      */
     public Transaction link();
+
+    /**
+     * Returns true if autoload mode is enabled.
+     */
+    public boolean autoload();
 
     /**
      * Returns an uncopied reference to the current key, or null if Scanner is
@@ -74,21 +66,6 @@ public interface Scanner {
      * or {@link #NOT_LOADED}. Array contents can be safely modified.
      */
     public byte[] value();
-
-    /**
-     * By default, values are loaded automatically, as they are seen. When disabled, values
-     * might need to be {@link Scanner#load manually loaded}. When a {@link Transformer} is
-     * used, the value might still be loaded automatically.
-     *
-     * @param mode false to disable
-     * @return prior autoload mode
-     */
-    public boolean autoload(boolean mode);
-
-    /**
-     * Returns the current autoload mode.
-     */
-    public boolean autoload();
 
     /**
      * Moves the Scanner by a relative amount of entries. If less than the given amount of

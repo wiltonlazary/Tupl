@@ -40,8 +40,7 @@ import java.io.IOException;
  */
 public interface Cursor extends Scanner {
     /**
-     * Empty marker which indicates that value exists but has not been {@link
-     * #load loaded}.
+     * Empty marker which indicates that value exists but has not been {@link #load loaded}.
      */
     public static final byte[] NOT_LOADED = Scanner.NOT_LOADED;
 
@@ -60,7 +59,6 @@ public interface Cursor extends Scanner {
      * @return prior linked transaction
      * @throws IllegalArgumentException if transaction belongs to another database instance
      */
-    @Override
     public Transaction link(Transaction txn);
 
     /**
@@ -68,6 +66,23 @@ public interface Cursor extends Scanner {
      */
     @Override
     public Transaction link();
+
+    /**
+     * By default, values are loaded automatically, as they are seen. When disabled, values
+     * might need to be {@link Cursor#load manually loaded}. When a {@link Transformer} is
+     * used, the value might still be loaded automatically. When the value exists but hasn't
+     * been loaded, the value field of the cursor is set to {@link NOT_LOADED}.
+     *
+     * @param mode false to disable
+     * @return prior autoload mode
+     */
+    public boolean autoload(boolean mode);
+
+    /**
+     * Returns the current autoload mode.
+     */
+    @Override
+    public boolean autoload();
 
     /**
      * Returns an uncopied reference to the current key, or null if Cursor is
@@ -82,24 +97,6 @@ public interface Cursor extends Scanner {
      */
     @Override
     public byte[] value();
-
-    /**
-     * By default, values are loaded automatically, as they are seen. When disabled, values
-     * might need to be {@link Cursor#load manually loaded}. When a {@link Transformer} is
-     * used, the value might still be loaded automatically. When the value exists but hasn't
-     * been loaded, the value field of the cursor is set to {@link NOT_LOADED}.
-     *
-     * @param mode false to disable
-     * @return prior autoload mode
-     */
-    @Override
-    public boolean autoload(boolean mode);
-
-    /**
-     * Returns the current autoload mode.
-     */
-    @Override
-    public boolean autoload();
 
     /**
      * Compare the current key to the one given.
