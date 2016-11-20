@@ -2724,8 +2724,7 @@ class _TreeCursor implements CauseCloseable, Cursor {
             txn.lockExclusive(this.mTree.mId, sourceKey, this.keyHash());
             txn.lockExclusive(target.mTree.mId, targetKey, target.keyHash());
 
-            final CommitLock commitLock = mTree.mDatabase.commitLock();
-            commitLock.lock();
+            final CommitLock.Shared shared = mTree.mDatabase.commitLock().acquireShared();
             try {
                 // Latching two nodes is deadlock prone, so fail fast.
 
@@ -2780,7 +2779,7 @@ class _TreeCursor implements CauseCloseable, Cursor {
 
                 throw null;
             } finally {
-                commitLock.unlock();
+                shared.release();
             }
         } finally {
             txn.exit();
