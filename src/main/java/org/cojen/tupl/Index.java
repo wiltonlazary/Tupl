@@ -256,6 +256,20 @@ public interface Index extends View, Closeable {
         }
     }
 
+    @Override
+    public default long estimateSize(byte[] lowKey, byte[] highKey, int quality)
+        throws IOException
+    {
+        Stats stats = analyze(lowKey, highKey);
+        if (quality > 1) {
+            for (int i=1; i<quality; i++) {
+                stats = stats.add(analyze(lowKey, highKey));
+            }
+            stats = stats.divide(quality);
+        }
+        return (long) stats.entryCount();
+    }
+
     /**
      * Verifies the integrity of the index.
      *

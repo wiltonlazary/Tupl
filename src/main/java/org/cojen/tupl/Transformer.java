@@ -18,6 +18,8 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
+import java.util.Comparator;
+
 /**
  * Interface which supports filtering and transforming the entries within a {@link
  * View}. For pure filtering, consider implementing a {@link Filter} instead.
@@ -123,5 +125,44 @@ public interface Transformer {
      */
     public default Ordering transformedOrdering(Ordering original) {
         return original;
+    }
+
+    /**
+     * Returns the view characteristics, after transformation. Default implementation returns
+     * the same characteristics.
+     *
+     * @param original characteristics of view before transformation
+     */
+    public default int transformedCharacteristics(int original) {
+        return original;
+    }
+
+    //public default long transformedEstimateSize(
+
+    /**
+     * Returns the view comparator, after transformation. Default implementation returns the
+     * same comparator.
+     *
+     * @param original comparator of view before transformation
+     * @throws IllegalStateException if transformed view is unordered
+     */
+    public default Comparator<byte[]> transformedComparator(Comparator<byte[]> original) {
+        return original;
+    }
+
+    /**
+     * Non-transactionally estimates of the number of entries within the given range. Returns
+     * MAX_VALUE if infinite, unknown, or too expensive to compute.
+     *
+     * @param view untransformed source view
+     * @param tLowKey transformed inclusive lowest key in the size range; is null for open range
+     * @param tHighKey transformed exclusive highest key in the size range; is null for open
+     * range
+     * @param quality &le; 1 for lowest quality, 2+ for higher quality, etc.
+     */
+    public default long estimateSize(View view, byte[] tLowKey, byte[] tHighKey, int quality)
+        throws IOException
+    {
+        return Long.MAX_VALUE;
     }
 }

@@ -18,8 +18,8 @@
     catch(err) {
     }
 //-->
-var methods = {"i0":6,"i1":6,"i2":6,"i3":6,"i4":6,"i5":6,"i6":6,"i7":6,"i8":6};
-var tabs = {65535:["t0","All Methods"],2:["t2","Instance Methods"],4:["t3","Abstract Methods"]};
+var methods = {"i0":6,"i1":6,"i2":6,"i3":18,"i4":6,"i5":6,"i6":6,"i7":6,"i8":6,"i9":6};
+var tabs = {65535:["t0","All Methods"],2:["t2","Instance Methods"],4:["t3","Abstract Methods"],16:["t5","Default Methods"]};
 var altColor = "altColor";
 var rowColor = "rowColor";
 var tableTab = "tableTab";
@@ -147,7 +147,7 @@ extends <a href="../../../org/cojen/tupl/View.html" title="interface in org.coje
 </a>
 <h3>Method Summary</h3>
 <table class="memberSummary" border="0" cellpadding="3" cellspacing="0" summary="Method Summary table, listing methods, and an explanation">
-<caption><span id="t0" class="activeTableTab"><span>All Methods</span><span class="tabEnd">&nbsp;</span></span><span id="t2" class="tableTab"><span><a href="javascript:show(2);">Instance Methods</a></span><span class="tabEnd">&nbsp;</span></span><span id="t3" class="tableTab"><span><a href="javascript:show(4);">Abstract Methods</a></span><span class="tabEnd">&nbsp;</span></span></caption>
+<caption><span id="t0" class="activeTableTab"><span>All Methods</span><span class="tabEnd">&nbsp;</span></span><span id="t2" class="tableTab"><span><a href="javascript:show(2);">Instance Methods</a></span><span class="tabEnd">&nbsp;</span></span><span id="t3" class="tableTab"><span><a href="javascript:show(4);">Abstract Methods</a></span><span class="tabEnd">&nbsp;</span></span><span id="t5" class="tableTab"><span><a href="javascript:show(16);">Default Methods</a></span><span class="tabEnd">&nbsp;</span></span></caption>
 <tr>
 <th class="colFirst" scope="col">Modifier and Type</th>
 <th class="colLast" scope="col">Method and Description</th>
@@ -172,6 +172,14 @@ extends <a href="../../../org/cojen/tupl/View.html" title="interface in org.coje
 </td>
 </tr>
 <tr id="i3" class="rowColor">
+<td class="colFirst"><code>default long</code></td>
+<td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Index.html#estimateSize-byte:A-byte:A-int-">estimateSize</a></span>(byte[]&nbsp;lowKey,
+            byte[]&nbsp;highKey,
+            int&nbsp;quality)</code>
+<div class="block">Non-transactionally estimates of the number of entries within the given range.</div>
+</td>
+</tr>
+<tr id="i4" class="altColor">
 <td class="colFirst"><code>long</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Index.html#evict-org.cojen.tupl.Transaction-byte:A-byte:A-org.cojen.tupl.Filter-boolean-">evict</a></span>(<a href="../../../org/cojen/tupl/Transaction.html" title="interface in org.cojen.tupl">Transaction</a>&nbsp;txn,
      byte[]&nbsp;lowKey,
@@ -181,23 +189,23 @@ extends <a href="../../../org/cojen/tupl/View.html" title="interface in org.coje
 <div class="block">Select a few entries, and delete them from the index.</div>
 </td>
 </tr>
-<tr id="i4" class="altColor">
+<tr id="i5" class="rowColor">
 <td class="colFirst"><code>long</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Index.html#getId--">getId</a></span>()</code>&nbsp;</td>
 </tr>
-<tr id="i5" class="rowColor">
+<tr id="i6" class="altColor">
 <td class="colFirst"><code>byte[]</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Index.html#getName--">getName</a></span>()</code>&nbsp;</td>
 </tr>
-<tr id="i6" class="altColor">
+<tr id="i7" class="rowColor">
 <td class="colFirst"><code><a href="http://docs.oracle.com/javase/8/docs/api/java/lang/String.html?is-external=true" title="class or interface in java.lang">String</a></code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Index.html#getNameString--">getNameString</a></span>()</code>&nbsp;</td>
 </tr>
-<tr id="i7" class="rowColor">
+<tr id="i8" class="altColor">
 <td class="colFirst"><code>boolean</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Index.html#isClosed--">isClosed</a></span>()</code>&nbsp;</td>
 </tr>
-<tr id="i8" class="altColor">
+<tr id="i9" class="rowColor">
 <td class="colFirst"><code>boolean</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Index.html#verify-org.cojen.tupl.VerificationObserver-">verify</a></span>(<a href="../../../org/cojen/tupl/VerificationObserver.html" title="class in org.cojen.tupl">VerificationObserver</a>&nbsp;observer)</code>
 <div class="block">Verifies the integrity of the index.</div>
@@ -209,7 +217,7 @@ extends <a href="../../../org/cojen/tupl/View.html" title="interface in org.coje
 <!--   -->
 </a>
 <h3>Methods inherited from interface&nbsp;org.cojen.tupl.<a href="../../../org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a></h3>
-<code><a href="../../../org/cojen/tupl/View.html#count-byte:A-byte:A-">count</a>, <a href="../../../org/cojen/tupl/View.html#delete-org.cojen.tupl.Transaction-byte:A-">delete</a>, <a href="../../../org/cojen/tupl/View.html#exchange-org.cojen.tupl.Transaction-byte:A-byte:A-">exchange</a>, <a href="../../../org/cojen/tupl/View.html#getOrdering--">getOrdering</a>, <a href="../../../org/cojen/tupl/View.html#insert-org.cojen.tupl.Transaction-byte:A-byte:A-">insert</a>, <a href="../../../org/cojen/tupl/View.html#isUnmodifiable--">isUnmodifiable</a>, <a href="../../../org/cojen/tupl/View.html#load-org.cojen.tupl.Transaction-byte:A-">load</a>, <a href="../../../org/cojen/tupl/View.html#lockCheck-org.cojen.tupl.Transaction-byte:A-">lockCheck</a>, <a href="../../../org/cojen/tupl/View.html#lockExclusive-org.cojen.tupl.Transaction-byte:A-">lockExclusive</a>, <a href="../../../org/cojen/tupl/View.html#lockShared-org.cojen.tupl.Transaction-byte:A-">lockShared</a>, <a href="../../../org/cojen/tupl/View.html#lockUpgradable-org.cojen.tupl.Transaction-byte:A-">lockUpgradable</a>, <a href="../../../org/cojen/tupl/View.html#newCursor-org.cojen.tupl.Transaction-">newCursor</a>, <a href="../../../org/cojen/tupl/View.html#remove-org.cojen.tupl.Transaction-byte:A-byte:A-">remove</a>, <a href="../../../org/cojen/tupl/View.html#replace-org.cojen.tupl.Transaction-byte:A-byte:A-">replace</a>, <a href="../../../org/cojen/tupl/View.html#store-org.cojen.tupl.Transaction-byte:A-byte:A-">store</a>, <a href="../../../org/cojen/tupl/View.html#tryLockExclusive-org.cojen.tupl.Transaction-byte:A-long-">tryLockExclusive</a>, <a href="../../../org/cojen/tupl/View.html#tryLockShared-org.cojen.tupl.Transaction-byte:A-long-">tryLockShared</a>, <a href="../../../org/cojen/tupl/View.html#tryLockUpgradable-org.cojen.tupl.Transaction-byte:A-long-">tryLockUpgradable</a>, <a href="../../../org/cojen/tupl/View.html#update-org.cojen.tupl.Transaction-byte:A-byte:A-byte:A-">update</a>, <a href="../../../org/cojen/tupl/View.html#viewGe-byte:A-">viewGe</a>, <a href="../../../org/cojen/tupl/View.html#viewGt-byte:A-">viewGt</a>, <a href="../../../org/cojen/tupl/View.html#viewLe-byte:A-">viewLe</a>, <a href="../../../org/cojen/tupl/View.html#viewLt-byte:A-">viewLt</a>, <a href="../../../org/cojen/tupl/View.html#viewPrefix-byte:A-int-">viewPrefix</a>, <a href="../../../org/cojen/tupl/View.html#viewReverse--">viewReverse</a>, <a href="../../../org/cojen/tupl/View.html#viewTransformed-org.cojen.tupl.Transformer-">viewTransformed</a>, <a href="../../../org/cojen/tupl/View.html#viewUnmodifiable--">viewUnmodifiable</a></code></li>
+<code><a href="../../../org/cojen/tupl/View.html#characteristics--">characteristics</a>, <a href="../../../org/cojen/tupl/View.html#count-byte:A-byte:A-">count</a>, <a href="../../../org/cojen/tupl/View.html#delete-org.cojen.tupl.Transaction-byte:A-">delete</a>, <a href="../../../org/cojen/tupl/View.html#exchange-org.cojen.tupl.Transaction-byte:A-byte:A-">exchange</a>, <a href="../../../org/cojen/tupl/View.html#getComparator--">getComparator</a>, <a href="../../../org/cojen/tupl/View.html#getOrdering--">getOrdering</a>, <a href="../../../org/cojen/tupl/View.html#insert-org.cojen.tupl.Transaction-byte:A-byte:A-">insert</a>, <a href="../../../org/cojen/tupl/View.html#isUnmodifiable--">isUnmodifiable</a>, <a href="../../../org/cojen/tupl/View.html#load-org.cojen.tupl.Transaction-byte:A-">load</a>, <a href="../../../org/cojen/tupl/View.html#lockCheck-org.cojen.tupl.Transaction-byte:A-">lockCheck</a>, <a href="../../../org/cojen/tupl/View.html#lockExclusive-org.cojen.tupl.Transaction-byte:A-">lockExclusive</a>, <a href="../../../org/cojen/tupl/View.html#lockShared-org.cojen.tupl.Transaction-byte:A-">lockShared</a>, <a href="../../../org/cojen/tupl/View.html#lockUpgradable-org.cojen.tupl.Transaction-byte:A-">lockUpgradable</a>, <a href="../../../org/cojen/tupl/View.html#newCursor-org.cojen.tupl.Transaction-">newCursor</a>, <a href="../../../org/cojen/tupl/View.html#newScanner-org.cojen.tupl.Transaction-">newScanner</a>, <a href="../../../org/cojen/tupl/View.html#newScannerNoValues-org.cojen.tupl.Transaction-">newScannerNoValues</a>, <a href="../../../org/cojen/tupl/View.html#newUpdater-org.cojen.tupl.Transaction-">newUpdater</a>, <a href="../../../org/cojen/tupl/View.html#newUpdaterNoValues-org.cojen.tupl.Transaction-">newUpdaterNoValues</a>, <a href="../../../org/cojen/tupl/View.html#remove-org.cojen.tupl.Transaction-byte:A-byte:A-">remove</a>, <a href="../../../org/cojen/tupl/View.html#replace-org.cojen.tupl.Transaction-byte:A-byte:A-">replace</a>, <a href="../../../org/cojen/tupl/View.html#store-org.cojen.tupl.Transaction-byte:A-byte:A-">store</a>, <a href="../../../org/cojen/tupl/View.html#tryLockExclusive-org.cojen.tupl.Transaction-byte:A-long-">tryLockExclusive</a>, <a href="../../../org/cojen/tupl/View.html#tryLockShared-org.cojen.tupl.Transaction-byte:A-long-">tryLockShared</a>, <a href="../../../org/cojen/tupl/View.html#tryLockUpgradable-org.cojen.tupl.Transaction-byte:A-long-">tryLockUpgradable</a>, <a href="../../../org/cojen/tupl/View.html#update-org.cojen.tupl.Transaction-byte:A-byte:A-byte:A-">update</a>, <a href="../../../org/cojen/tupl/View.html#viewGe-byte:A-">viewGe</a>, <a href="../../../org/cojen/tupl/View.html#viewGt-byte:A-">viewGt</a>, <a href="../../../org/cojen/tupl/View.html#viewLe-byte:A-">viewLe</a>, <a href="../../../org/cojen/tupl/View.html#viewLt-byte:A-">viewLt</a>, <a href="../../../org/cojen/tupl/View.html#viewPrefix-byte:A-int-">viewPrefix</a>, <a href="../../../org/cojen/tupl/View.html#viewReverse--">viewReverse</a>, <a href="../../../org/cojen/tupl/View.html#viewTransformed-org.cojen.tupl.Transformer-">viewTransformed</a>, <a href="../../../org/cojen/tupl/View.html#viewUnmodifiable--">viewUnmodifiable</a></code></li>
 </ul>
 </li>
 </ul>
@@ -308,6 +316,31 @@ extends <a href="../../../org/cojen/tupl/View.html" title="interface in org.coje
 <dt><span class="paramLabel">Parameters:</span></dt>
 <dd><code>lowKey</code> - inclusive lowest key in the analysis range; pass null for open range</dd>
 <dd><code>highKey</code> - exclusive highest key in the analysis range; pass null for open range</dd>
+<dt><span class="throwsLabel">Throws:</span></dt>
+<dd><code><a href="http://docs.oracle.com/javase/8/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></code></dd>
+</dl>
+</li>
+</ul>
+<a name="estimateSize-byte:A-byte:A-int-">
+<!--   -->
+</a>
+<ul class="blockList">
+<li class="blockList">
+<h4>estimateSize</h4>
+<pre>default&nbsp;long&nbsp;estimateSize(byte[]&nbsp;lowKey,
+                          byte[]&nbsp;highKey,
+                          int&nbsp;quality)
+                   throws <a href="http://docs.oracle.com/javase/8/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
+<div class="block"><span class="descfrmTypeLabel">Description copied from interface:&nbsp;<code><a href="../../../org/cojen/tupl/View.html#estimateSize-byte:A-byte:A-int-">View</a></code></span></div>
+<div class="block">Non-transactionally estimates of the number of entries within the given range. Returns
+ MAX_VALUE if infinite, unknown, or too expensive to compute.</div>
+<dl>
+<dt><span class="overrideSpecifyLabel">Specified by:</span></dt>
+<dd><code><a href="../../../org/cojen/tupl/View.html#estimateSize-byte:A-byte:A-int-">estimateSize</a></code>&nbsp;in interface&nbsp;<code><a href="../../../org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a></code></dd>
+<dt><span class="paramLabel">Parameters:</span></dt>
+<dd><code>lowKey</code> - inclusive lowest key in the size range; pass null for open range</dd>
+<dd><code>highKey</code> - exclusive highest key in the size range; pass null for open range</dd>
+<dd><code>quality</code> - &le; 1 for lowest quality, 2+ for higher quality, etc.</dd>
 <dt><span class="throwsLabel">Throws:</span></dt>
 <dd><code><a href="http://docs.oracle.com/javase/8/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></code></dd>
 </dl>

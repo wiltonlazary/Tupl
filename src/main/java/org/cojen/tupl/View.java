@@ -19,6 +19,7 @@ package org.cojen.tupl;
 import java.io.IOException;
 
 import java.util.Arrays;
+import java.util.Comparator;
 
 /**
  * Mapping of keys to values, in no particular order. Subclasses and
@@ -34,11 +35,77 @@ public interface View {
     public Ordering getOrdering();
 
     /**
+     * Returns {@link java.util.Spliterator Spliterator} characteristics for this view.
+     */
+    public default int characteristics() {
+        return 0;
+    }
+
+    /**
+     * Returns a comparator for the ordering of this view, never null.
+     *
+     * @throws IllegalStateException if view is unordered
+     */
+    public default Comparator<byte[]> getComparator() {
+        throw new IllegalStateException();
+    }
+
+    /**
      * @param txn optional transaction for Cursor to {@link Cursor#link link} to
      * @return a new unpositioned cursor
      * @throws IllegalArgumentException if transaction belongs to another database instance
      */
     public Cursor newCursor(Transaction txn);
+
+    /**
+     * Return a new scanner which receives keys and values.
+     *
+     * @param txn optional transaction for Scanner to use
+     * @return a new scanner positioned at the first entry in the view
+     * @throws IllegalArgumentException if transaction belongs to another database instance
+     */
+    public default Scanner newScanner(Transaction txn) throws IOException {
+        return new ViewScanner(this, newCursor(txn));
+    }
+
+    /**
+     * Return a new scanner which receives keys only. The value portion given to entry
+     * consumers is always {@link Cursor#NOT_LOADED NOT_LOADED}.
+     *
+     * @param txn optional transaction for Scanner to use
+     * @return a new scanner positioned at the first entry in the view
+     * @throws IllegalArgumentException if transaction belongs to another database instance
+     */
+    public default Scanner newScannerNoValues(Transaction txn) throws IOException {
+        Cursor c = newCursor(txn);
+        c.autoload(false);
+        return new ViewScanner(this, c);
+    }
+
+    /**
+     * Return a new updater which receives keys and values.
+     *
+     * @param txn optional transaction for Updater to use
+     * @return a new updater positioned at the first entry in the view
+     * @throws IllegalArgumentException if transaction belongs to another database instance
+     */
+    public default Updater newUpdater(Transaction txn) throws IOException {
+        return new ViewUpdater(this, newCursor(txn));
+    }
+
+    /**
+     * Return a new updater which receives keys only. The value portion given to entry
+     * functions is always {@link Cursor#NOT_LOADED NOT_LOADED}.
+     *
+     * @param txn optional transaction for Updater to use
+     * @return a new updater positioned at the first entry in the view
+     * @throws IllegalArgumentException if transaction belongs to another database instance
+     */
+    public default Updater newUpdaterNoValues(Transaction txn) throws IOException {
+        Cursor c = newCursor(txn);
+        c.autoload(false);
+        return new ViewUpdater(this, c);
+    }
 
     /**
      * Non-transactionally counts the number of entries within the given range. Implementations
@@ -50,6 +117,20 @@ public interface View {
      */
     public default long count(byte[] lowKey, byte[] highKey) throws IOException {
         return ViewUtils.count(this, false, lowKey, highKey);
+    }
+
+    /**
+     * Non-transactionally estimates of the number of entries within the given range. Returns
+     * MAX_VALUE if infinite, unknown, or too expensive to compute.
+     *
+     * @param lowKey inclusive lowest key in the size range; pass null for open range
+     * @param highKey exclusive highest key in the size range; pass null for open range
+     * @param quality &le; 1 for lowest quality, 2+ for higher quality, etc.
+     */
+    public default long estimateSize(byte[] lowKey, byte[] highKey, int quality)
+        throws IOException
+    {
+        return Long.MAX_VALUE;
     }
 
     /**

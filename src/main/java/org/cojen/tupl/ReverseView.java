@@ -18,6 +18,8 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
+import java.util.Comparator;
+
 /**
  * 
  *
@@ -36,6 +38,16 @@ final class ReverseView implements View {
     }
 
     @Override
+    public int characteristics() {
+        return mSource.characteristics();
+    }
+
+    @Override
+    public Comparator<byte[]> getComparator() {
+        return mSource.getComparator().reversed();
+    }
+
+    @Override
     public Cursor newCursor(Transaction txn) {
         return new ReverseCursor(mSource.newCursor(txn));
     }
@@ -43,6 +55,11 @@ final class ReverseView implements View {
     @Override
     public long count(byte[] lowKey, byte[] highKey) throws IOException {
         return mSource.count(appendZero(highKey), appendZero((lowKey)));
+    }
+
+    @Override
+    public long estimateSize(byte[] lowKey, byte[] highKey, int quality) throws IOException {
+        return mSource.estimateSize(lowKey, highKey, quality);
     }
 
     @Override

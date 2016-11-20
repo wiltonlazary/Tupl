@@ -21,6 +21,10 @@ import java.io.DataOutput;
 import java.io.InterruptedIOException;
 import java.io.IOException;
 
+import java.util.Comparator;
+
+import static java.util.Spliterator.*;
+
 import static org.cojen.tupl.DirectPageOps.*;
 import static org.cojen.tupl.Utils.*;
 
@@ -85,6 +89,16 @@ class _Tree implements View, Index {
     @Override
     public final Ordering getOrdering() {
         return Ordering.ASCENDING;
+    }
+
+    @Override
+    public int characteristics() {
+        return ORDERED | DISTINCT | SORTED | NONNULL | CONCURRENT;
+    }
+
+    @Override
+    public Comparator<byte[]> getComparator() {
+        return KeyComparator.THE;
     }
 
     @Override

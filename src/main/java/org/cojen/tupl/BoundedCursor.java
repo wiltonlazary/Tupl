@@ -26,8 +26,8 @@ import static org.cojen.tupl.BoundedView.*;
  * @author Brian S O'Neill
  */
 final class BoundedCursor implements Cursor {
-    private final BoundedView mView;
-    private final Cursor mSource;
+    final BoundedView mView;
+    final Cursor mSource;
 
     BoundedCursor(BoundedView view, Cursor source) {
         mView = view;

@@ -18,6 +18,8 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
+import java.util.Comparator;
+
 /**
  * 
  *
@@ -45,6 +47,16 @@ final class UnmodifiableView implements Index {
     @Override
     public Ordering getOrdering() {
         return mSource.getOrdering();
+    }
+
+    @Override
+    public int characteristics() {
+        return mSource.characteristics() | java.util.Spliterator.IMMUTABLE;
+    }
+
+    @Override
+    public Comparator<byte[]> getComparator() {
+        return mSource.getComparator();
     }
 
     @Override
@@ -79,6 +91,11 @@ final class UnmodifiableView implements Index {
     @Override
     public long count(byte[] lowKey, byte[] highKey) throws IOException {
         return mSource.count(lowKey, highKey);
+    }
+
+    @Override
+    public long estimateSize(byte[] lowKey, byte[] highKey, int quality) throws IOException {
+        return mSource.estimateSize(lowKey, highKey, quality);
     }
 
     @Override

@@ -258,6 +258,30 @@
 <td class="colLast"><span class="typeNameLabel">View.</span><code><span class="memberNameLink"><a href="../../../../org/cojen/tupl/View.html#newCursor-org.cojen.tupl.Transaction-">newCursor</a></span>(<a href="../../../../org/cojen/tupl/Transaction.html" title="interface in org.cojen.tupl">Transaction</a>&nbsp;txn)</code>&nbsp;</td>
 </tr>
 <tr class="altColor">
+<td class="colFirst"><code>default <a href="../../../../org/cojen/tupl/Scanner.html" title="interface in org.cojen.tupl">Scanner</a></code></td>
+<td class="colLast"><span class="typeNameLabel">View.</span><code><span class="memberNameLink"><a href="../../../../org/cojen/tupl/View.html#newScanner-org.cojen.tupl.Transaction-">newScanner</a></span>(<a href="../../../../org/cojen/tupl/Transaction.html" title="interface in org.cojen.tupl">Transaction</a>&nbsp;txn)</code>
+<div class="block">Return a new scanner which receives keys and values.</div>
+</td>
+</tr>
+<tr class="rowColor">
+<td class="colFirst"><code>default <a href="../../../../org/cojen/tupl/Scanner.html" title="interface in org.cojen.tupl">Scanner</a></code></td>
+<td class="colLast"><span class="typeNameLabel">View.</span><code><span class="memberNameLink"><a href="../../../../org/cojen/tupl/View.html#newScannerNoValues-org.cojen.tupl.Transaction-">newScannerNoValues</a></span>(<a href="../../../../org/cojen/tupl/Transaction.html" title="interface in org.cojen.tupl">Transaction</a>&nbsp;txn)</code>
+<div class="block">Return a new scanner which receives keys only.</div>
+</td>
+</tr>
+<tr class="altColor">
+<td class="colFirst"><code>default <a href="../../../../org/cojen/tupl/Updater.html" title="interface in org.cojen.tupl">Updater</a></code></td>
+<td class="colLast"><span class="typeNameLabel">View.</span><code><span class="memberNameLink"><a href="../../../../org/cojen/tupl/View.html#newUpdater-org.cojen.tupl.Transaction-">newUpdater</a></span>(<a href="../../../../org/cojen/tupl/Transaction.html" title="interface in org.cojen.tupl">Transaction</a>&nbsp;txn)</code>
+<div class="block">Return a new updater which receives keys and values.</div>
+</td>
+</tr>
+<tr class="rowColor">
+<td class="colFirst"><code>default <a href="../../../../org/cojen/tupl/Updater.html" title="interface in org.cojen.tupl">Updater</a></code></td>
+<td class="colLast"><span class="typeNameLabel">View.</span><code><span class="memberNameLink"><a href="../../../../org/cojen/tupl/View.html#newUpdaterNoValues-org.cojen.tupl.Transaction-">newUpdaterNoValues</a></span>(<a href="../../../../org/cojen/tupl/Transaction.html" title="interface in org.cojen.tupl">Transaction</a>&nbsp;txn)</code>
+<div class="block">Return a new updater which receives keys only.</div>
+</td>
+</tr>
+<tr class="altColor">
 <td class="colFirst"><code>default boolean</code></td>
 <td class="colLast"><span class="typeNameLabel">View.</span><code><span class="memberNameLink"><a href="../../../../org/cojen/tupl/View.html#remove-org.cojen.tupl.Transaction-byte:A-byte:A-">remove</a></span>(<a href="../../../../org/cojen/tupl/Transaction.html" title="interface in org.cojen.tupl">Transaction</a>&nbsp;txn,
       byte[]&nbsp;key,

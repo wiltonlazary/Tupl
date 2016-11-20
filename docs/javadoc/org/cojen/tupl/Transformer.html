@@ -18,7 +18,7 @@
     catch(err) {
     }
 //-->
-var methods = {"i0":18,"i1":18,"i2":18,"i3":6,"i4":18,"i5":18,"i6":18,"i7":6};
+var methods = {"i0":18,"i1":18,"i2":18,"i3":18,"i4":6,"i5":18,"i6":18,"i7":18,"i8":18,"i9":18,"i10":6};
 var tabs = {65535:["t0","All Methods"],2:["t2","Instance Methods"],4:["t3","Abstract Methods"],16:["t5","Default Methods"]};
 var altColor = "altColor";
 var rowColor = "rowColor";
@@ -129,24 +129,33 @@ var activeTableTab = "activeTableTab";
 <th class="colLast" scope="col">Method and Description</th>
 </tr>
 <tr id="i0" class="altColor">
+<td class="colFirst"><code>default long</code></td>
+<td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#estimateSize-org.cojen.tupl.View-byte:A-byte:A-int-">estimateSize</a></span>(<a href="../../../org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a>&nbsp;view,
+            byte[]&nbsp;tLowKey,
+            byte[]&nbsp;tHighKey,
+            int&nbsp;quality)</code>
+<div class="block">Non-transactionally estimates of the number of entries within the given range.</div>
+</td>
+</tr>
+<tr id="i1" class="rowColor">
 <td class="colFirst"><code>default byte[]</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#inverseTransformKey-byte:A-">inverseTransformKey</a></span>(byte[]&nbsp;tkey)</code>
 <div class="block">Apply an inverse transformation of the given key, if supported.</div>
 </td>
 </tr>
-<tr id="i1" class="rowColor">
+<tr id="i2" class="altColor">
 <td class="colFirst"><code>default byte[]</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#inverseTransformKeyGt-byte:A-">inverseTransformKeyGt</a></span>(byte[]&nbsp;tkey)</code>
 <div class="block">Apply an inverse transformation of the given key, strictly greater than the one given.</div>
 </td>
 </tr>
-<tr id="i2" class="altColor">
+<tr id="i3" class="rowColor">
 <td class="colFirst"><code>default byte[]</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#inverseTransformKeyLt-byte:A-">inverseTransformKeyLt</a></span>(byte[]&nbsp;tkey)</code>
 <div class="block">Apply an inverse transformation of the given key, strictly less than the one given.</div>
 </td>
 </tr>
-<tr id="i3" class="rowColor">
+<tr id="i4" class="altColor">
 <td class="colFirst"><code>byte[]</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#inverseTransformValue-byte:A-byte:A-byte:A-">inverseTransformValue</a></span>(byte[]&nbsp;tvalue,
                      byte[]&nbsp;key,
@@ -154,27 +163,39 @@ var activeTableTab = "activeTableTab";
 <div class="block">Apply an inverse transformation of the given value, if supported.</div>
 </td>
 </tr>
-<tr id="i4" class="altColor">
+<tr id="i5" class="rowColor">
 <td class="colFirst"><code>default boolean</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#requireValue--">requireValue</a></span>()</code>
 <div class="block">Returns true by default, indicating that the transform methods always require a value
  instance to be provided.</div>
 </td>
 </tr>
-<tr id="i5" class="rowColor">
+<tr id="i6" class="altColor">
+<td class="colFirst"><code>default int</code></td>
+<td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#transformedCharacteristics-int-">transformedCharacteristics</a></span>(int&nbsp;original)</code>
+<div class="block">Returns the view characteristics, after transformation.</div>
+</td>
+</tr>
+<tr id="i7" class="rowColor">
+<td class="colFirst"><code>default <a href="http://docs.oracle.com/javase/8/docs/api/java/util/Comparator.html?is-external=true" title="class or interface in java.util">Comparator</a>&lt;byte[]&gt;</code></td>
+<td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#transformedComparator-java.util.Comparator-">transformedComparator</a></span>(<a href="http://docs.oracle.com/javase/8/docs/api/java/util/Comparator.html?is-external=true" title="class or interface in java.util">Comparator</a>&lt;byte[]&gt;&nbsp;original)</code>
+<div class="block">Returns the view comparator, after transformation.</div>
+</td>
+</tr>
+<tr id="i8" class="altColor">
 <td class="colFirst"><code>default <a href="../../../org/cojen/tupl/Ordering.html" title="enum in org.cojen.tupl">Ordering</a></code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#transformedOrdering-org.cojen.tupl.Ordering-">transformedOrdering</a></span>(<a href="../../../org/cojen/tupl/Ordering.html" title="enum in org.cojen.tupl">Ordering</a>&nbsp;original)</code>
 <div class="block">Returns the natural ordering of keys, after they have been transformed.</div>
 </td>
 </tr>
-<tr id="i6" class="altColor">
+<tr id="i9" class="rowColor">
 <td class="colFirst"><code>default byte[]</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#transformKey-byte:A-byte:A-">transformKey</a></span>(byte[]&nbsp;key,
             byte[]&nbsp;value)</code>
 <div class="block">Transform or filter out the given key.</div>
 </td>
 </tr>
-<tr id="i7" class="rowColor">
+<tr id="i10" class="altColor">
 <td class="colFirst"><code>byte[]</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Transformer.html#transformValue-byte:A-byte:A-byte:A-">transformValue</a></span>(byte[]&nbsp;value,
               byte[]&nbsp;key,
@@ -345,7 +366,7 @@ var activeTableTab = "activeTableTab";
 <a name="transformedOrdering-org.cojen.tupl.Ordering-">
 <!--   -->
 </a>
-<ul class="blockListLast">
+<ul class="blockList">
 <li class="blockList">
 <h4>transformedOrdering</h4>
 <pre>default&nbsp;<a href="../../../org/cojen/tupl/Ordering.html" title="enum in org.cojen.tupl">Ordering</a>&nbsp;transformedOrdering(<a href="../../../org/cojen/tupl/Ordering.html" title="enum in org.cojen.tupl">Ordering</a>&nbsp;original)</pre>
@@ -354,6 +375,63 @@ var activeTableTab = "activeTableTab";
 <dl>
 <dt><span class="paramLabel">Parameters:</span></dt>
 <dd><code>original</code> - natural ordering of view before transformation</dd>
+</dl>
+</li>
+</ul>
+<a name="transformedCharacteristics-int-">
+<!--   -->
+</a>
+<ul class="blockList">
+<li class="blockList">
+<h4>transformedCharacteristics</h4>
+<pre>default&nbsp;int&nbsp;transformedCharacteristics(int&nbsp;original)</pre>
+<div class="block">Returns the view characteristics, after transformation. Default implementation returns
+ the same characteristics.</div>
+<dl>
+<dt><span class="paramLabel">Parameters:</span></dt>
+<dd><code>original</code> - characteristics of view before transformation</dd>
+</dl>
+</li>
+</ul>
+<a name="transformedComparator-java.util.Comparator-">
+<!--   -->
+</a>
+<ul class="blockList">
+<li class="blockList">
+<h4>transformedComparator</h4>
+<pre>default&nbsp;<a href="http://docs.oracle.com/javase/8/docs/api/java/util/Comparator.html?is-external=true" title="class or interface in java.util">Comparator</a>&lt;byte[]&gt;&nbsp;transformedComparator(<a href="http://docs.oracle.com/javase/8/docs/api/java/util/Comparator.html?is-external=true" title="class or interface in java.util">Comparator</a>&lt;byte[]&gt;&nbsp;original)</pre>
+<div class="block">Returns the view comparator, after transformation. Default implementation returns the
+ same comparator.</div>
+<dl>
+<dt><span class="paramLabel">Parameters:</span></dt>
+<dd><code>original</code> - comparator of view before transformation</dd>
+<dt><span class="throwsLabel">Throws:</span></dt>
+<dd><code><a href="http://docs.oracle.com/javase/8/docs/api/java/lang/IllegalStateException.html?is-external=true" title="class or interface in java.lang">IllegalStateException</a></code> - if transformed view is unordered</dd>
+</dl>
+</li>
+</ul>
+<a name="estimateSize-org.cojen.tupl.View-byte:A-byte:A-int-">
+<!--   -->
+</a>
+<ul class="blockListLast">
+<li class="blockList">
+<h4>estimateSize</h4>
+<pre>default&nbsp;long&nbsp;estimateSize(<a href="../../../org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a>&nbsp;view,
+                          byte[]&nbsp;tLowKey,
+                          byte[]&nbsp;tHighKey,
+                          int&nbsp;quality)
+                   throws <a href="http://docs.oracle.com/javase/8/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
+<div class="block">Non-transactionally estimates of the number of entries within the given range. Returns
+ MAX_VALUE if infinite, unknown, or too expensive to compute.</div>
+<dl>
+<dt><span class="paramLabel">Parameters:</span></dt>
+<dd><code>view</code> - untransformed source view</dd>
+<dd><code>tLowKey</code> - transformed inclusive lowest key in the size range; is null for open range</dd>
+<dd><code>tHighKey</code> - transformed exclusive highest key in the size range; is null for open
+ range</dd>
+<dd><code>quality</code> - &le; 1 for lowest quality, 2+ for higher quality, etc.</dd>
+<dt><span class="throwsLabel">Throws:</span></dt>
+<dd><code><a href="http://docs.oracle.com/javase/8/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></code></dd>
 </dl>
 </li>
 </ul>

@@ -18,6 +18,8 @@ package org.cojen.tupl;
 
 import java.io.IOException;
 
+import java.util.Comparator;
+
 import static org.cojen.tupl.Utils.*;
 
 /**
@@ -87,6 +89,16 @@ final class BoundedView extends SubView {
     }
 
     @Override
+    public int characteristics() {
+        return mSource.characteristics();
+    }
+
+    @Override
+    public Comparator<byte[]> getComparator() {
+        return mSource.getComparator();
+    }
+
+    @Override
     public Cursor newCursor(Transaction txn) {
         return new BoundedCursor(this, mSource.newCursor(txn));
     }
@@ -94,6 +106,11 @@ final class BoundedView extends SubView {
     @Override
     public long count(byte[] lowKey, byte[] highKey) throws IOException {
         return mSource.count(adjustLowKey(lowKey), adjustHighKey(highKey));
+    }
+
+    @Override
+    public long estimateSize(byte[] lowKey, byte[] highKey, int quality) throws IOException {
+        return mSource.estimateSize(adjustLowKey(lowKey), adjustHighKey(highKey), quality);
     }
 
     @Override

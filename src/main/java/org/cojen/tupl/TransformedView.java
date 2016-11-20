@@ -19,6 +19,7 @@ package org.cojen.tupl;
 import java.io.IOException;
 
 import java.util.Arrays;
+import java.util.Comparator;
 
 /**
  * 
@@ -47,6 +48,16 @@ final class TransformedView implements View {
     }
 
     @Override
+    public int characteristics() {
+        return mTransformer.transformedCharacteristics(mSource.characteristics());
+    }
+
+    @Override
+    public Comparator<byte[]> getComparator() {
+        return mTransformer.transformedComparator(mSource.getComparator());
+    }
+
+    @Override
     public Cursor newCursor(Transaction txn) {
         return new TransformedCursor(mSource.newCursor(txn), mTransformer);
     }
@@ -54,6 +65,11 @@ final class TransformedView implements View {
     @Override
     public long count(byte[] lowKey, byte[] highKey) throws IOException {
         return ViewUtils.count(this, mTransformer.requireValue(), lowKey, highKey);
+    }
+
+    @Override
+    public long estimateSize(byte[] tLowKey, byte[] tHighKey, int quality) throws IOException {
+        return mTransformer.estimateSize(mSource, tLowKey, tHighKey, quality);
     }
 
     @Override
