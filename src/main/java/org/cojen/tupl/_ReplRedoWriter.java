@@ -91,13 +91,16 @@ class _ReplRedoWriter extends _RedoWriter {
     @Override
     public final synchronized void txnRollback(long txnId) throws IOException {
         super.txnRollback(txnId);
-        flush();
+        // Flush rollback as a commit, ensuring no delay in processing of the operation.
+        // Without this, a replica can be stuck holding a lock indefinitely.
+        flushCommit();
     }
 
     @Override
     public final synchronized void txnRollbackFinal(long txnId) throws IOException {
         super.txnRollbackFinal(txnId);
-        flush();
+        // See above comments.
+        flushCommit();
     }
 
     @Override
@@ -160,6 +163,22 @@ class _ReplRedoWriter extends _RedoWriter {
                 pending.rollback(db);
             }
         }
+    }
+
+    @Override
+    public long txnStoreCommitFinal(long txnId, long indexId,
+                                    byte[] key, byte[] value, DurabilityMode mode)
+        throws IOException
+    {
+        return super.txnStoreCommitFinal(txnId, indexId, key, value, DurabilityMode.SYNC);
+    }
+
+    @Override
+    public long txnDeleteCommitFinal(long txnId, long indexId,
+                                     byte[] key, DurabilityMode mode)
+        throws IOException
+    {
+        return super.txnDeleteCommitFinal(txnId, indexId, key, DurabilityMode.SYNC);
     }
 
     protected final void flipped(long commitPos) {

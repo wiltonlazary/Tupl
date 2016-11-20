@@ -775,8 +775,9 @@ class TreeCursor implements CauseCloseable, Cursor {
                                 {
                                     parentNode.releaseShared();
                                 } else {
-                                    CommitLock commitLock = mTree.mDatabase.commitLock();
-                                    if (commitLock.tryLock()) try {
+                                    CommitLock.Shared shared =
+                                        mTree.mDatabase.commitLock().tryAcquireShared();
+                                    if (shared != null) try {
                                         try {
                                             parentNode = notSplitDirty(parentFrame);
                                         } catch (Throwable e) {
@@ -792,7 +793,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                                             continue;
                                         }
                                     } finally {
-                                        commitLock.unlock();
+                                        shared.release();
                                     }
                                     parentNode.releaseExclusive();
                                 }
@@ -1003,8 +1004,9 @@ class TreeCursor implements CauseCloseable, Cursor {
                                 {
                                     parentNode.releaseShared();
                                 } else {
-                                    CommitLock commitLock = mTree.mDatabase.commitLock();
-                                    if (commitLock.tryLock()) try {
+                                    CommitLock.Shared shared =
+                                        mTree.mDatabase.commitLock().tryAcquireShared();
+                                    if (shared != null) try {
                                         try {
                                             parentNode = notSplitDirty(parentFrame);
                                         } catch (Throwable e) {
@@ -1018,7 +1020,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                                         parentNode.downgrade();
                                         continue;
                                     } finally {
-                                        commitLock.unlock();
+                                        shared.release();
                                     }
                                     parentNode.releaseExclusive();
                                 }
@@ -1446,8 +1448,9 @@ class TreeCursor implements CauseCloseable, Cursor {
                                 {
                                     parentNode.releaseShared();
                                 } else {
-                                    CommitLock commitLock = mTree.mDatabase.commitLock();
-                                    if (commitLock.tryLock()) try {
+                                    CommitLock.Shared shared =
+                                        mTree.mDatabase.commitLock().tryAcquireShared();
+                                    if (shared != null) try {
                                         try {
                                             parentNode = notSplitDirty(parentFrame);
                                         } catch (Throwable e) {
@@ -1463,7 +1466,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                                             continue;
                                         }
                                     } finally {
-                                        commitLock.unlock();
+                                        shared.release();
                                     }
                                     parentNode.releaseExclusive();
                                 }
@@ -2196,14 +2199,17 @@ class TreeCursor implements CauseCloseable, Cursor {
                         if (rnd.nextBoolean()) {
                             result = highKey == null ? next(txn, frame)
                                 : nextCmp(highKey, LIMIT_LT, frame);
+                            if (mValue == null) {
+                                // Wrap around.
+                                return first();
+                            }
                         } else {
                             result = lowKey == null ? previous(txn, frame)
                                 : previousCmp(lowKey, LIMIT_GE, frame);
-                        }
-
-                        if (mValue == null) {
-                            // Nothing but ghosts in selected direction, so start over.
-                            continue start;
+                            if (mValue == null) {
+                                // Wrap around.
+                                return last();
+                            }
                         }
                     }
 
@@ -3030,17 +3036,18 @@ class TreeCursor implements CauseCloseable, Cursor {
                 break doDelete;
             }
 
-            final CommitLock commitLock = mTree.mDatabase.commitLock();
+            CommitLock commitLock = mTree.mDatabase.commitLock();
+            CommitLock.Shared shared = commitLock.tryAcquireShared();
 
-            if (!commitLock.tryLock()) {
+            if (shared == null) {
                 leaf.mNode.releaseExclusive();
-                commitLock.lock();
+                shared = commitLock.acquireShared();
                 leaf.acquireExclusive();
 
                 // Need to check if exists again.
                 if (leaf.mNodePos < 0) {
                     node = leaf.mNode;
-                    commitLock.unlock();
+                    shared.release();
                     break doDelete;
                 }
             }
@@ -3082,10 +3089,10 @@ class TreeCursor implements CauseCloseable, Cursor {
                     node = null;
                 }
             } finally {
-                commitLock.unlock();
+                shared.release();
             }
         } else {
-            final CommitLock commitLock = commitLock(leaf);
+            final CommitLock.Shared shared = commitLock(leaf);
             try {
                 // Update and insert always dirty the node. Releases latch if an exception is
                 // thrown.
@@ -3148,7 +3155,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                     node = postInsert(leaf, node, key);
                 }
             } finally {
-                commitLock.unlock();
+                shared.release();
             }
         }
 
@@ -3229,7 +3236,7 @@ class TreeCursor implements CauseCloseable, Cursor {
 
         final CursorFrame leaf = leafExclusive();
 
-        final CommitLock commitLock = commitLock(leaf);
+        final CommitLock.Shared shared = commitLock(leaf);
         try {
             Node node = notSplitDirty(leaf);
 
@@ -3264,7 +3271,7 @@ class TreeCursor implements CauseCloseable, Cursor {
         } catch (Throwable e) {
             throw handleException(e, false);
         } finally {
-            commitLock.unlock();
+            shared.release();
         }
     }
 
@@ -3302,7 +3309,7 @@ class TreeCursor implements CauseCloseable, Cursor {
         final CommitLock commitLock = db.commitLock();
 
         while (true) {
-            commitLock.lock();
+            CommitLock.Shared shared = commitLock.acquireShared();
             try {
                 // Close check is required because this method is called by the trashed tree
                 // deletion task. The tree isn't registered as an open tree, and so closing the
@@ -3333,7 +3340,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                     return;
                 }
             } finally {
-                commitLock.unlock();
+                shared.release();
             }
         }
     }
@@ -3481,14 +3488,15 @@ class TreeCursor implements CauseCloseable, Cursor {
      * @param leaf leaf frame, latched exclusively, which might be released and relatched
      * @return held commitLock
      */
-    final CommitLock commitLock(final CursorFrame leaf) {
+    final CommitLock.Shared commitLock(final CursorFrame leaf) {
         CommitLock commitLock = mTree.mDatabase.commitLock();
-        if (!commitLock.tryLock()) {
+        CommitLock.Shared shared = commitLock.tryAcquireShared();
+        if (shared == null) {
             leaf.mNode.releaseExclusive();
-            commitLock.lock();
+            shared = commitLock.acquireShared();
             leaf.acquireExclusive();
         }
-        return commitLock;
+        return shared;
     }
 
     protected final IOException handleException(Throwable e, boolean reset) throws IOException {
@@ -3763,8 +3771,7 @@ class TreeCursor implements CauseCloseable, Cursor {
 
         if (id > highestNodeId) {
             LocalDatabase db = mTree.mDatabase;
-            CommitLock commitLock = db.commitLock();
-            commitLock.lock();
+            CommitLock.Shared shared = db.commitLock().acquireShared();
             try {
                 node = frame.acquireExclusive();
                 id = node.mId;
@@ -3776,7 +3783,7 @@ class TreeCursor implements CauseCloseable, Cursor {
                 }
                 node.releaseExclusive();
             } finally {
-                commitLock.unlock();
+                shared.release();
             }
         }
 
@@ -4088,18 +4095,13 @@ class TreeCursor implements CauseCloseable, Cursor {
             // If either of those steps fail, all locks are released then acquired in the
             // proper order.
             CommitLock commitLock = mTree.mDatabase.commitLock();
-            boolean commitLocked = commitLock.tryLock();
+            CommitLock.Shared shared = commitLock.tryAcquireShared();
             try {
-                if (!commitLocked || !node.tryUpgrade()) {
+                if (shared == null || !node.tryUpgrade()) {
                     node.releaseShared();
-
-                    if (commitLocked) {
-                        commitLock.unlock();
-                        commitLocked = false;
+                    if (shared == null) {
+                        shared = commitLock.acquireShared();
                     }
-                    commitLock.lock();
-                    commitLocked = true;
-
                     node = frame.acquireExclusive();
                     if (node.mSplit == null) {
                         break doSplit;
@@ -4107,8 +4109,9 @@ class TreeCursor implements CauseCloseable, Cursor {
                 }
                 node = mTree.finishSplit(frame, node);
             } finally {
-                if (commitLocked)
-                    commitLock.unlock();
+                if (shared != null) {
+                    shared.release();
+                }
             }
         }
         node.downgrade();
