@@ -62,6 +62,11 @@ final class TrimmedView implements View {
     }
 
     @Override
+    public Transaction newTransaction(DurabilityMode durabilityMode) {
+        return mSource.newTransaction(durabilityMode);
+    }
+
+    @Override
     public long estimateSize(byte[] lowKey, byte[] highKey, int quality) throws IOException {
         return mSource.estimateSize(lowKey, highKey, quality);
     }

@@ -130,6 +130,11 @@ class Tree implements View, Index {
     }
 
     @Override
+    public Transaction newTransaction(DurabilityMode durabilityMode) {
+        return mDatabase.newTransaction(durabilityMode);
+    }
+
+    @Override
     public long count(byte[] lowKey, byte[] highKey) throws IOException {
         TreeCursor cursor = new TreeCursor(this, Transaction.BOGUS);
         TreeCursor high = null;
