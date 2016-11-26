@@ -23,7 +23,7 @@ import java.io.IOException;
  *
  * @author Brian S O'Neill
  */
-class ViewScanner extends AbstractSplittable<Scanner> implements Scanner {
+class ViewScanner extends CursorSplittable<Scanner> implements Scanner {
     /**
      * @param cursor unpositioned cursor
      */

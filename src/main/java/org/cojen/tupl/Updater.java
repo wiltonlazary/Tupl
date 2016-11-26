@@ -68,7 +68,7 @@ public interface Updater extends Splittable<Updater>, AutoCloseable {
     /**
      * Returns a new scanner which applies the given update action for each visited entry.
      */
-    default Scanner scanner(EntryFunction updateAction) {
+    default Scanner newScanner(EntryFunction updateAction) {
         return new Scanner() {
             @Override
             public boolean step(EntryConsumer action) throws IOException {
@@ -82,7 +82,7 @@ public interface Updater extends Splittable<Updater>, AutoCloseable {
             @Override
             public Scanner trySplit() throws IOException {
                 Updater split = Updater.this.trySplit();
-                return split == null ? null : split.scanner(updateAction);
+                return split == null ? null : split.newScanner(updateAction);
             }
 
             @Override

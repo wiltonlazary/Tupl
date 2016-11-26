@@ -26,20 +26,20 @@ import java.util.Comparator;
  *
  * @author Brian S O'Neill
  */
-abstract class AbstractSplittable<S> implements Splittable<S> { 
+abstract class CursorSplittable<S> implements Splittable<S> { 
     protected View mView;
     protected Cursor mCursor;
 
     /**
      * @param cursor unpositioned cursor
      */
-    AbstractSplittable(View view, Cursor cursor) throws IOException {
+    CursorSplittable(View view, Cursor cursor) throws IOException {
         mView = view;
         mCursor = cursor;
         cursor.first();
     }
 
-    protected AbstractSplittable(Cursor cursor, View view) {
+    protected CursorSplittable(Cursor cursor, View view) {
         mView = view;
         mCursor = cursor;
     }

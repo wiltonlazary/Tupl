@@ -23,7 +23,7 @@ import java.io.IOException;
  *
  * @author Brian S O'Neill
  */
-class ViewUpdater extends AbstractSplittable<Updater> implements Updater {
+class ViewUpdater extends CursorSplittable<Updater> implements Updater {
     /**
      * @param cursor unpositioned cursor
      */
