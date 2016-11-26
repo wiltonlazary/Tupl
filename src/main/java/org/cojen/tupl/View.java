@@ -607,6 +607,34 @@ public interface View {
     }
 
     /**
+     * Returns a view which combines the entries of this view, with the others that are given.
+     * A union eliminates duplicate keys, favoring those encountered in first in the set of
+     * views. If the set of views in the union don't follow a consistent ordering, then
+     * elimination of duplicates doesn't work correctly. The actual behavior is undefined.
+     *
+     * <p>Storing entries in the union is permitted, but final entries are only stored in the
+     * first view (this view). As a side-effect of any successful store operation, the
+     * corresponding entries in the other views are always deleted. The order in which the
+     * underlying operations are performed permits a union to be composed of views which can
+     * map to the same underlying source index. The entire operation is transactional, and so
+     * stores to unions don't support the {@link Transaction#BOGUS "bogus"} transaction.
+     *
+     * <p>Unions don't support cursors. For this reason, unions are typically applied last when
+     * building a view processing pipeline. Also, avoiding creating unions which are composed
+     * of other unions. Such a pipeline might be less efficient than one composed with a single
+     * union step.
+     */
+    public default View viewUnion(View... others) {
+        if (others.length == 0) {
+            return this;
+        }
+        View[] sources = new View[1 + others.length];
+        sources[0] = this;
+        System.arraycopy(others, 0, sources, 1, others.length);
+        return new UnionView(sources);
+    }
+
+    /**
      * Returns a view, backed by this one, whose natural order is reversed.
      */
     public default View viewReverse() {

@@ -117,18 +117,26 @@ class UnionView implements View {
 
     @Override
     public byte[] load(Transaction txn, byte[] key) throws IOException {
-        txn = enterTransaction(txn);
-        try {
-            for (View source : mSources) {
-                byte[] value = source.load(txn, key);
-                if (value != null) {
-                    return value;
-                }
+        if (txn == Transaction.BOGUS) {
+            return doLoad(txn, key);
+        } else {
+            txn = enterTransaction(txn);
+            try {
+                return doLoad(txn, key);
+            } finally {
+                txn.exit();
             }
-            return null;
-        } finally {
-            txn.exit();
         }
+    }
+
+    private byte[] doLoad(Transaction txn, byte[] key) throws IOException {
+        for (View source : mSources) {
+            byte[] value = source.load(txn, key);
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
     }
 
     @Override
@@ -550,6 +558,17 @@ class UnionView implements View {
     @Override
     public View viewTransformed(Transformer transformer) {
         return newView(v -> v.viewTransformed(transformer));
+    }
+
+    @Override
+    public View viewUnion(View... others) {
+        if (others.length == 0) {
+            return this;
+        }
+        View[] combined = new View[mSources.length + others.length];
+        System.arraycopy(mSources, 0, combined, 0, mSources.length);
+        System.arraycopy(others, 0, combined, mSources.length, others.length);
+        return new UnionView(combined);
     }
 
     @Override

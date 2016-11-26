@@ -18,7 +18,7 @@
     catch(err) {
     }
 //-->
-var methods = {"i0":18,"i1":18,"i2":18,"i3":18,"i4":18,"i5":18,"i6":6,"i7":18,"i8":6,"i9":18,"i10":6,"i11":6,"i12":6,"i13":6,"i14":6,"i15":18,"i16":18,"i17":18,"i18":18,"i19":18,"i20":18,"i21":18,"i22":18,"i23":18,"i24":18,"i25":18,"i26":18,"i27":18,"i28":18,"i29":18,"i30":18,"i31":18,"i32":18,"i33":18,"i34":18};
+var methods = {"i0":18,"i1":18,"i2":18,"i3":18,"i4":18,"i5":18,"i6":6,"i7":18,"i8":6,"i9":18,"i10":6,"i11":6,"i12":6,"i13":6,"i14":6,"i15":18,"i16":18,"i17":18,"i18":18,"i19":18,"i20":18,"i21":18,"i22":18,"i23":18,"i24":18,"i25":18,"i26":18,"i27":18,"i28":18,"i29":18,"i30":18,"i31":18,"i32":18,"i33":18,"i34":18,"i35":18};
 var tabs = {65535:["t0","All Methods"],2:["t2","Instance Methods"],4:["t3","Abstract Methods"],16:["t5","Default Methods"]};
 var altColor = "altColor";
 var rowColor = "rowColor";
@@ -372,6 +372,12 @@ var activeTableTab = "activeTableTab";
 </td>
 </tr>
 <tr id="i34" class="altColor">
+<td class="colFirst"><code>default <a href="../../../org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a></code></td>
+<td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/View.html#viewUnion-org.cojen.tupl.View...-">viewUnion</a></span>(<a href="../../../org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a>...&nbsp;others)</code>
+<div class="block">Returns a view which combines the entries of this view, with the others that are given.</div>
+</td>
+</tr>
+<tr id="i35" class="rowColor">
 <td class="colFirst"><code>default <a href="../../../org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a></code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/View.html#viewUnmodifiable--">viewUnmodifiable</a></span>()</code>
 <div class="block">Returns a view, backed by this one, whose entries cannot be modified.</div>
@@ -1125,6 +1131,31 @@ var activeTableTab = "activeTableTab";
 <dt><span class="throwsLabel">Throws:</span></dt>
 <dd><code><a href="http://docs.oracle.com/javase/8/docs/api/java/lang/NullPointerException.html?is-external=true" title="class or interface in java.lang">NullPointerException</a></code> - if transformer is null</dd>
 </dl>
+</li>
+</ul>
+<a name="viewUnion-org.cojen.tupl.View...-">
+<!--   -->
+</a>
+<ul class="blockList">
+<li class="blockList">
+<h4>viewUnion</h4>
+<pre>default&nbsp;<a href="../../../org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a>&nbsp;viewUnion(<a href="../../../org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a>...&nbsp;others)</pre>
+<div class="block">Returns a view which combines the entries of this view, with the others that are given.
+ A union eliminates duplicate keys, favoring those encountered in first in the set of
+ views. If the set of views in the union don't follow a consistent ordering, then
+ elimination of duplicates doesn't work correctly. The actual behavior is undefined.
+
+ <p>Storing entries in the union is permitted, but final entries are only stored in the
+ first view (this view). As a side-effect of any successful store operation, the
+ corresponding entries in the other views are always deleted. The order in which the
+ underlying operations are performed permits a union to be composed of views which can
+ map to the same underlying source index. The entire operation is transactional, and so
+ stores to unions don't support the <a href="../../../org/cojen/tupl/Transaction.html#BOGUS"><code>"bogus"</code></a> transaction.
+
+ <p>Unions don't support cursors. For this reason, unions are typically applied last when
+ building a view processing pipeline. Also, avoiding creating unions which are composed
+ of other unions. Such a pipeline might be less efficient than one composed with a single
+ union step.</div>
 </li>
 </ul>
 <a name="viewReverse--">
