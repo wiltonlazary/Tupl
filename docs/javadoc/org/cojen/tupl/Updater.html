@@ -18,7 +18,7 @@
     catch(err) {
     }
 //-->
-var methods = {"i0":18,"i1":6,"i2":18,"i3":18,"i4":18,"i5":18,"i6":18,"i7":18,"i8":6,"i9":18};
+var methods = {"i0":18,"i1":6,"i2":18,"i3":18,"i4":18,"i5":18,"i6":18,"i7":18,"i8":18,"i9":6,"i10":18};
 var tabs = {65535:["t0","All Methods"],2:["t2","Instance Methods"],4:["t3","Abstract Methods"],16:["t5","Default Methods"]};
 var altColor = "altColor";
 var rowColor = "rowColor";
@@ -191,17 +191,23 @@ extends <a href="http://docs.oracle.com/javase/8/docs/api/java/lang/AutoCloseabl
 </tr>
 <tr id="i7" class="rowColor">
 <td class="colFirst"><code>default <a href="../../../org/cojen/tupl/Scanner.html" title="interface in org.cojen.tupl">Scanner</a></code></td>
-<td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Updater.html#scanner-org.cojen.tupl.EntryFunction-">scanner</a></span>(<a href="../../../org/cojen/tupl/EntryFunction.html" title="interface in org.cojen.tupl">EntryFunction</a>&nbsp;updateAction)</code>
+<td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Updater.html#newScanner-org.cojen.tupl.EntryFunction-">newScanner</a></span>(<a href="../../../org/cojen/tupl/EntryFunction.html" title="interface in org.cojen.tupl">EntryFunction</a>&nbsp;updateAction)</code>
 <div class="block">Returns a new scanner which applies the given update action for each visited entry.</div>
 </td>
 </tr>
 <tr id="i8" class="altColor">
+<td class="colFirst"><code>default void</code></td>
+<td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Updater.html#skip-long-">skip</a></span>(long&nbsp;amount)</code>
+<div class="block">Skips over the requested amount of entries.</div>
+</td>
+</tr>
+<tr id="i9" class="rowColor">
 <td class="colFirst"><code>boolean</code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Updater.html#step-org.cojen.tupl.EntryFunction-">step</a></span>(<a href="../../../org/cojen/tupl/EntryFunction.html" title="interface in org.cojen.tupl">EntryFunction</a>&nbsp;updateAction)</code>
 <div class="block">Step forward and apply the given updating action for just one entry, unless none remain.</div>
 </td>
 </tr>
-<tr id="i9" class="rowColor">
+<tr id="i10" class="altColor">
 <td class="colFirst"><code>default <a href="../../../org/cojen/tupl/Updater.html" title="interface in org.cojen.tupl">Updater</a></code></td>
 <td class="colLast"><code><span class="memberNameLink"><a href="../../../org/cojen/tupl/Updater.html#trySplit--">trySplit</a></span>()</code>
 <div class="block">Attempt to split the remaining set of entries between this updater and a new one.</div>
@@ -270,6 +276,21 @@ extends <a href="http://docs.oracle.com/javase/8/docs/api/java/lang/AutoCloseabl
 </dl>
 </li>
 </ul>
+<a name="skip-long-">
+<!--   -->
+</a>
+<ul class="blockList">
+<li class="blockList">
+<h4>skip</h4>
+<pre>default&nbsp;void&nbsp;skip(long&nbsp;amount)
+           throws <a href="http://docs.oracle.com/javase/8/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
+<div class="block">Skips over the requested amount of entries.</div>
+<dl>
+<dt><span class="throwsLabel">Throws:</span></dt>
+<dd><code><a href="http://docs.oracle.com/javase/8/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></code></dd>
+</dl>
+</li>
+</ul>
 <a name="trySplit--">
 <!--   -->
 </a>
@@ -285,13 +306,13 @@ extends <a href="http://docs.oracle.com/javase/8/docs/api/java/lang/AutoCloseabl
 </dl>
 </li>
 </ul>
-<a name="scanner-org.cojen.tupl.EntryFunction-">
+<a name="newScanner-org.cojen.tupl.EntryFunction-">
 <!--   -->
 </a>
 <ul class="blockList">
 <li class="blockList">
-<h4>scanner</h4>
-<pre>default&nbsp;<a href="../../../org/cojen/tupl/Scanner.html" title="interface in org.cojen.tupl">Scanner</a>&nbsp;scanner(<a href="../../../org/cojen/tupl/EntryFunction.html" title="interface in org.cojen.tupl">EntryFunction</a>&nbsp;updateAction)</pre>
+<h4>newScanner</h4>
+<pre>default&nbsp;<a href="../../../org/cojen/tupl/Scanner.html" title="interface in org.cojen.tupl">Scanner</a>&nbsp;newScanner(<a href="../../../org/cojen/tupl/EntryFunction.html" title="interface in org.cojen.tupl">EntryFunction</a>&nbsp;updateAction)</pre>
 <div class="block">Returns a new scanner which applies the given update action for each visited entry.</div>
 </li>
 </ul>

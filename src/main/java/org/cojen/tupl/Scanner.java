@@ -55,6 +55,14 @@ public interface Scanner extends Splittable<Scanner>, AutoCloseable {
     }
 
     /**
+     * Skips over the requested amount of entries.
+     */
+    @Override
+    default void skip(long amount) throws IOException {
+        while (--amount >= 0 && step((key, value) -> {}));
+    }
+
+    /**
      * Attempt to split the remaining set of entries between this scanner and a new one.
      */
     @Override

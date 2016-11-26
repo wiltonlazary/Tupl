@@ -45,6 +45,11 @@ abstract class CursorSplittable<S> implements Splittable<S> {
     }
 
     @Override
+    public void skip(long amount) throws IOException {
+        mCursor.skip(amount);
+    }
+
+    @Override
     public S trySplit() throws IOException {
         try {
             View view = mView;

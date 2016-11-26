@@ -1647,6 +1647,10 @@
 <div class="block">Called to instantiate a <a href="http://docs.oracle.com/javase/8/docs/api/javax/crypto/Cipher.html?is-external=true" title="class or interface in javax.crypto"><code>Cipher</code></a> for encrypting and decrypting database pages,
  using the fixed instance <a href="org/cojen/tupl/CipherCrypto.html#algorithm--"><code>algorithm</code></a>.</div>
 </dd>
+<dt><span class="memberNameLink"><a href="org/cojen/tupl/Updater.html#newScanner-org.cojen.tupl.EntryFunction-">newScanner(EntryFunction)</a></span> - Method in interface org.cojen.tupl.<a href="org/cojen/tupl/Updater.html" title="interface in org.cojen.tupl">Updater</a></dt>
+<dd>
+<div class="block">Returns a new scanner which applies the given update action for each visited entry.</div>
+</dd>
 <dt><span class="memberNameLink"><a href="org/cojen/tupl/View.html#newScanner-org.cojen.tupl.Transaction-">newScanner(Transaction)</a></span> - Method in interface org.cojen.tupl.<a href="org/cojen/tupl/View.html" title="interface in org.cojen.tupl">View</a></dt>
 <dd>
 <div class="block">Return a new scanner which receives keys and values.</div>
@@ -2061,10 +2065,6 @@
 <dd>
 <div class="block">Scans through all entries in a view, similar to a <a href="http://docs.oracle.com/javase/8/docs/api/java/util/Spliterator.html?is-external=true" title="class or interface in java.util"><code>Spliterator</code></a>.</div>
 </dd>
-<dt><span class="memberNameLink"><a href="org/cojen/tupl/Updater.html#scanner-org.cojen.tupl.EntryFunction-">scanner(EntryFunction)</a></span> - Method in interface org.cojen.tupl.<a href="org/cojen/tupl/Updater.html" title="interface in org.cojen.tupl">Updater</a></dt>
-<dd>
-<div class="block">Returns a new scanner which applies the given update action for each visited entry.</div>
-</dd>
 <dt><span class="memberNameLink"><a href="org/cojen/tupl/DatabaseConfig.html#secondaryCacheSize-long-">secondaryCacheSize(long)</a></span> - Method in class org.cojen.tupl.<a href="org/cojen/tupl/DatabaseConfig.html" title="class in org.cojen.tupl">DatabaseConfig</a></dt>
 <dd>
 <div class="block">Set the size of the secondary off-heap cache, which is empty by default.</div>
@@ -2126,6 +2126,14 @@
 <dd>
 <div class="block">Moves the Cursor by a relative amount of entries, stopping sooner if the limit key is
  reached.</div>
+</dd>
+<dt><span class="memberNameLink"><a href="org/cojen/tupl/Scanner.html#skip-long-">skip(long)</a></span> - Method in interface org.cojen.tupl.<a href="org/cojen/tupl/Scanner.html" title="interface in org.cojen.tupl">Scanner</a></dt>
+<dd>
+<div class="block">Skips over the requested amount of entries.</div>
+</dd>
+<dt><span class="memberNameLink"><a href="org/cojen/tupl/Updater.html#skip-long-">skip(long)</a></span> - Method in interface org.cojen.tupl.<a href="org/cojen/tupl/Updater.html" title="interface in org.cojen.tupl">Updater</a></dt>
+<dd>
+<div class="block">Skips over the requested amount of entries.</div>
 </dd>
 <dt><span class="memberNameLink"><a href="org/cojen/tupl/WrappedCursor.html#skip-long-">skip(long)</a></span> - Method in class org.cojen.tupl.<a href="org/cojen/tupl/WrappedCursor.html" title="class in org.cojen.tupl">WrappedCursor</a></dt>
 <dd>

@@ -58,6 +58,14 @@ public interface Updater extends Splittable<Updater>, AutoCloseable {
     }
 
     /**
+     * Skips over the requested amount of entries.
+     */
+    @Override
+    default void skip(long amount) throws IOException {
+        while (--amount >= 0 && step((key, value) -> NO_CHANGE));
+    }
+
+    /**
      * Attempt to split the remaining set of entries between this updater and a new one.
      */
     @Override

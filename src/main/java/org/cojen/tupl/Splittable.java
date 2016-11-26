@@ -28,6 +28,11 @@ import java.util.Spliterator;
  */
 interface Splittable<S> extends AutoCloseable {
     /**
+     * Skips over the requested amount of entries.
+     */
+    public void skip(long amount) throws IOException;
+
+    /**
      * Attempt to split the remaining set of entries between this scanner and a new one.
      */
     public default S trySplit() throws IOException {
