@@ -16,20 +16,22 @@
 
 package org.cojen.tupl;
 
+import java.util.concurrent.ThreadLocalRandom;
+
 /**
  * Base class for any object which can own or acquire locks.
  *
  * @author Brian S O'Neill
  */
 /*P*/
-abstract class LockOwner {
+abstract class LockOwner implements DatabaseAccess { // weak access to database
     private final int mHash;
 
     // LockOwner is currently waiting to acquire this lock. Used for deadlock detection.
     Lock mWaitingFor;
 
     LockOwner() {
-        mHash = Utils.cheapRandom();
+        mHash = ThreadLocalRandom.current().nextInt();
     }
 
     @Override

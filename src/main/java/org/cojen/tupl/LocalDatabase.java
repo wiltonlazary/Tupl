@@ -44,10 +44,10 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Map;
-import java.util.Random;
 import java.util.Set;
 
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -496,6 +496,10 @@ final class LocalDatabase extends AbstractDatabase {
                     }
                 }
 
+                // Magic constant was determined emperically against the G1 collector. A higher
+                // constant increases memory thrashing.
+                long usedRate = Utils.roundUpPower2((long) Math.ceil(maxCache / 32768)) - 1;
+
                 int stripes = roundUpPower2(procCount * 4);
 
                 int stripeSize;
@@ -510,14 +514,14 @@ final class LocalDatabase extends AbstractDatabase {
                 int rem = maxCache % stripes;
 
                 usageLists = new NodeUsageList[stripes];
-  
+
                 for (int i=0; i<stripes; i++) {
                     int size = stripeSize;
                     if (rem > 0) {
                         size++;
                         rem--;
                     }
-                    usageLists[i] = new NodeUsageList(this, size);
+                    usageLists[i] = new NodeUsageList(this, usedRate, size);
                 }
 
                 stripeSize = minCache / stripes;
@@ -2558,7 +2562,7 @@ final class LocalDatabase extends AbstractDatabase {
 
                 if (treeIdMaskBytes == null) {
                     treeIdMaskBytes = new byte[8];
-                    new Random().nextBytes(treeIdMaskBytes);
+                    ThreadLocalRandom.current().nextBytes(treeIdMaskBytes);
                     mRegistryKeyMap.store(txn, key, treeIdMaskBytes);
                 }
 
@@ -2888,7 +2892,7 @@ final class LocalDatabase extends AbstractDatabase {
         if (node != null) {
             node.acquireShared();
             if (nodeId == node.mId) {
-                node.used();
+                node.used(ThreadLocalRandom.current());
                 return node;
             }
             node.releaseShared();
@@ -2959,7 +2963,7 @@ final class LocalDatabase extends AbstractDatabase {
         if (node != null) {
             node.acquireExclusive();
             if (nodeId == node.mId) {
-                node.used();
+                node.used(ThreadLocalRandom.current());
                 return node;
             }
             node.releaseExclusive();
@@ -3156,6 +3160,13 @@ final class LocalDatabase extends AbstractDatabase {
         node.type(TYPE_FRAGMENT);
         /*P*/ // ]
         return node;
+    }
+
+    /**
+     * Caller must hold commit lock and any latch on node.
+     */
+    boolean isMutable(Node node) {
+        return node.mCachedState == mCommitState && node.mId > 1;
     }
 
     /**
