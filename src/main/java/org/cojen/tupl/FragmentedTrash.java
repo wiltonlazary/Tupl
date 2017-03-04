@@ -133,6 +133,8 @@ final class FragmentedTrash {
     /**
      * Remove an entry from the trash, as an undo operation. Original entry is
      * stored back into index.
+     *
+     * @param index index to store entry into; pass null to fully delete it instead
      */
     void remove(long txnId, Tree index, byte[] undoEntry) throws IOException {
         // Extract the index and trash keys.
@@ -153,29 +155,40 @@ final class FragmentedTrash {
             p_delete(undo);
         }
 
-        byte[] fragmented;
-        TreeCursor cursor = new TreeCursor(mTrash, Transaction.BOGUS);
-        try {
-            cursor.find(trashKey);
-            fragmented = cursor.value();
-            if (fragmented == null) {
-                // Nothing to remove, possibly caused by double undo.
-                cursor.reset();
-                return;
-            }
-            cursor.store(null);
-            cursor.reset();
-        } catch (Throwable e) {
-            throw closeOnFailure(cursor, e);
-        }
+        remove(index, indexKey, trashKey);
+    }
 
-        cursor = new TreeCursor(index, Transaction.BOGUS);
+    /**
+     * Remove an entry from the trash, as an undo operation. Original entry is
+     * stored back into index.
+     *
+     * @param index index to store entry into; pass null to fully delete it instead
+     */
+    void remove(Tree index, byte[] indexKey, byte[] trashKey) throws IOException {
+        TreeCursor trashCursor = new TreeCursor(mTrash, Transaction.BOGUS);
         try {
-            cursor.find(indexKey);
-            cursor.storeFragmented(fragmented);
-            cursor.reset();
+            trashCursor.find(trashKey);
+
+            if (index == null) {
+                deleteFragmented(mTrash.mDatabase, trashCursor);
+            } else {
+                byte[] fragmented = trashCursor.value();
+                if (fragmented != null) {
+                    TreeCursor ixCursor = new TreeCursor(index, Transaction.BOGUS);
+                    try {
+                        ixCursor.find(indexKey);
+                        ixCursor.storeFragmented(fragmented);
+                        ixCursor.reset();
+                    } catch (Throwable e) {
+                        throw closeOnFailure(ixCursor, e);
+                    }
+                    trashCursor.store(null);
+                }
+            }
+
+            trashCursor.reset();
         } catch (Throwable e) {
-            throw closeOnFailure(cursor, e);
+            throw closeOnFailure(trashCursor, e);
         }
     }
 
@@ -189,28 +202,28 @@ final class FragmentedTrash {
 
         LocalDatabase db = mTrash.mDatabase;
         final CommitLock commitLock = db.commitLock();
+
         TreeCursor cursor = new TreeCursor(mTrash, Transaction.BOGUS);
         try {
             cursor.autoload(false);
             cursor.findGt(prefix);
+
             while (true) {
                 byte[] key = cursor.key();
                 if (key == null || compareUnsigned(key, 0, 8, prefix, 0, 8) != 0) {
                     break;
                 }
-                cursor.load();
-                byte[] value = cursor.value();
-                /*P*/ byte[] fragmented = p_transfer(value);
+
                 CommitLock.Shared shared = commitLock.acquireShared();
                 try {
-                    db.deleteFragments(fragmented, 0, value.length);
-                    cursor.store(null);
+                    deleteFragmented(db, cursor);
                 } finally {
                     shared.release();
-                    p_delete(fragmented);
                 }
+
                 cursor.next();
             }
+
             cursor.reset();
         } catch (Throwable e) {
             throw closeOnFailure(cursor, e);
@@ -218,45 +231,62 @@ final class FragmentedTrash {
     }
 
     /**
-     * Non-transactionally deletes all fragmented values. Expected to be called
-     * only during recovery.
+     * Non-transactionally deletes all fragmented values. Expected to be called only during
+     * recovery, and never when other calls into the trash are being made concurrently.
      *
      * @return true if any trash was found
      */
     boolean emptyAllTrash(EventListener listener) throws IOException {
         boolean found = false;
+
         LocalDatabase db = mTrash.mDatabase;
         final CommitLock commitLock = db.commitLock();
+
         TreeCursor cursor = new TreeCursor(mTrash, Transaction.BOGUS);
         try {
+            cursor.autoload(false);
             cursor.first();
+
             if (cursor.key() != null) {
                 if (listener != null) {
                     listener.notify(EventType.RECOVERY_DELETE_FRAGMENTS,
                                     "Deleting unused large fragments");
                 }
-                found = true;
+
                 do {
-                    byte[] value = cursor.value();
-                    /*P*/ byte[] fragmented = p_transfer(value);
+                    CommitLock.Shared shared = commitLock.acquireShared();
                     try {
-                        CommitLock.Shared shared = commitLock.acquireShared();
-                        try {
-                            db.deleteFragments(fragmented, 0, value.length);
-                            cursor.store(null);
-                        } finally {
-                            shared.release();
-                        }
+                        found |= deleteFragmented(db, cursor);
                     } finally {
-                        p_delete(fragmented);
+                        shared.release();
                     }
+
                     cursor.next();
                 } while (cursor.key() != null);
             }
+
             cursor.reset();
         } catch (Throwable e) {
             throw closeOnFailure(cursor, e);
         }
+
         return found;
+    }
+
+    private static boolean deleteFragmented(LocalDatabase db, Cursor cursor) throws IOException {
+        cursor.load();
+        byte[] value = cursor.value();
+        if (value == null) {
+            return false;
+        } else {
+            /*P*/ byte[] fragmented = p_transfer(value);
+            try {
+                db.deleteFragments(fragmented, 0, value.length);
+                cursor.store(null);
+            } finally {
+                p_delete(fragmented);
+            }
+            return true;
+        }
     }
 }

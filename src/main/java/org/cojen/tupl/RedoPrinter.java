@@ -27,7 +27,7 @@ class RedoPrinter implements RedoVisitor {
     public static void main(String[] args) throws Exception {
         java.io.File baseFile = new java.io.File(args[0]);
         long logId = Long.parseLong(args[1]);
-        new RedoLog(null, baseFile, null, logId, 0, true)
+        new RedoLog(null, baseFile, null, logId, 0, null)
             .replay(new RedoPrinter(), null, null, null);
     }
 
@@ -137,6 +137,27 @@ class RedoPrinter implements RedoVisitor {
     public boolean txnStoreCommitFinal(long txnId, long indexId, byte[] key, byte[] value) {
         txnStore(txnId, indexId, key, value);
         return txnCommit(txnId);
+    }
+
+    @Override
+    public boolean txnLockShared(long txnId, long indexId, byte[] key) {
+        mOut.println("txnLockShared: txnId=" + txnId + ", indexId=" + indexId +
+                     ", key=" + toHex(key));
+        return true;
+    }
+
+    @Override
+    public boolean txnLockUpgradable(long txnId, long indexId, byte[] key) {
+        mOut.println("txnLockUpgradable: txnId=" + txnId + ", indexId=" + indexId +
+                     ", key=" + toHex(key));
+        return true;
+    }
+
+    @Override
+    public boolean txnLockExclusive(long txnId, long indexId, byte[] key) {
+        mOut.println("txnLockExclusive: txnId=" + txnId + ", indexId=" + indexId +
+                     ", key=" + toHex(key));
+        return true;
     }
 
     @Override

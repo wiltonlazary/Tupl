@@ -381,7 +381,7 @@ abstract class RedoDecoder {
                 }
                 if (!verifyTerminator(in)
                     || !visitor.txnStore(txnId, indexId, key, null)
-                    || !visitor.txnCommitFinal(txnId))
+                    || !visitor.txnCommit(txnId))
                 {
                     return false;
                 }
@@ -398,6 +398,45 @@ abstract class RedoDecoder {
                 if (!verifyTerminator(in)
                     || !visitor.txnStoreCommitFinal(txnId, indexId, key, null))
                 {
+                    return false;
+                }
+                break;
+
+            case OP_TXN_LOCK_SHARED:
+                try {
+                    txnId = readTxnId(in);
+                    indexId = in.readLongLE();
+                    key = in.readBytes();
+                } catch (EOFException e) {
+                    return true;
+                }
+                if (!verifyTerminator(in) || !visitor.txnLockShared(txnId, indexId, key)) {
+                    return false;
+                }
+                break;
+
+            case OP_TXN_LOCK_UPGRADABLE:
+                try {
+                    txnId = readTxnId(in);
+                    indexId = in.readLongLE();
+                    key = in.readBytes();
+                } catch (EOFException e) {
+                    return true;
+                }
+                if (!verifyTerminator(in) || !visitor.txnLockUpgradable(txnId, indexId, key)) {
+                    return false;
+                }
+                break;
+
+            case OP_TXN_LOCK_EXCLUSIVE:
+                try {
+                    txnId = readTxnId(in);
+                    indexId = in.readLongLE();
+                    key = in.readBytes();
+                } catch (EOFException e) {
+                    return true;
+                }
+                if (!verifyTerminator(in) || !visitor.txnLockExclusive(txnId, indexId, key)) {
                     return false;
                 }
                 break;

@@ -83,7 +83,7 @@ public class LargeKeyTest {
 
         byte[] value = new byte[0];
 
-        final int max = Math.min(16383, (pageSize / 2) - 22);
+        final int max = Math.min(16383, ((pageSize - 22) >> 1) - 13);
 
         byte[][] keys = new byte[1000][];
         Random rnd = new Random(87324);
@@ -232,6 +232,40 @@ public class LargeKeyTest {
             System.arraycopy(key, 0, value, 0, amt);
             byte[] found = ix.load(Transaction.BOGUS, key);
             fastAssertArrayEquals(value, found);
+        }
+    }
+
+    @Test
+    public void unsafeRollback() throws Exception {
+        // Tests that large keys are stored fully expanded in the undo log. If not, the
+        // database appears to be corrupt when trying to reconstruct the key.
+
+        Database db = newTempDatabase(decorate(new DatabaseConfig()));
+        Index ix = db.openIndex("test");
+ 
+        Random rnd = new Random(18732);
+ 
+        // Test with various key and value sizes.
+
+        int[] keySizes = {0, 50, 100, 2000, 4000, 10000, 1_000_000};
+        int[] valueSizes = {0, 50, 200, 4000, 10000};
+
+        for (int keySize : keySizes) {
+            for (int valueSize : valueSizes) {
+                byte[] key = randomStr(rnd, keySize);
+                byte[] value = randomStr(rnd, valueSize);
+                ix.store(null, key, value);
+ 
+                Transaction txn = db.newTransaction();
+                byte[] value2 = randomStr(rnd, valueSize);
+                ix.store(txn, key, value2);
+ 
+                ix.delete(Transaction.BOGUS, key);
+ 
+                txn.reset();
+ 
+                fastAssertArrayEquals(value, ix.load(null, key));
+            }
         }
     }
 }

@@ -22,7 +22,7 @@ package org.cojen.tupl;
  * @author Brian S O'Neill
  */
 class RedoOps {
-    // Note: When updating the opcodes, be sure to update RedoWriter and RedoDecoder.
+    // Note: When updating the opcodes, be sure to update RedoDecoder and TransactionContext.
 
     static final byte
         /** no operands */
@@ -81,6 +81,15 @@ class RedoOps {
 
         /** txnId: delta */
         OP_TXN_COMMIT_FINAL = 28,
+
+        /** txnId: delta, indexId: long, keyLength: varInt, key: bytes */
+        OP_TXN_LOCK_SHARED = 29,
+
+        /** txnId: delta, indexId: long, keyLength: varInt, key: bytes */
+        OP_TXN_LOCK_UPGRADABLE = 30,
+
+        /** txnId: delta, indexId: long, keyLength: varInt, key: bytes */
+        OP_TXN_LOCK_EXCLUSIVE = 31,
 
         /** txnId: delta, indexId: long, keyLength: varInt, key: bytes,
             valueLength: varInt, value: bytes */

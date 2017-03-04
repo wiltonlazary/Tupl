@@ -18,6 +18,9 @@ package org.cojen.tupl;
 
 import java.util.Arrays;
 
+import org.cojen.tupl.util.Latch;
+import org.cojen.tupl.util.LatchCondition;
+
 import static org.cojen.tupl.LockResult.*;
 
 /**
@@ -46,17 +49,17 @@ final class Lock {
     // Exclusive or upgradable locker.
     LockOwner mOwner;
 
-    // LockOwner instance if one shared locker, or else a hashtable for more.
-    // Field is re-used to indicate when an exclusive lock has ghosted an
-    // entry, which should be deleted when the transaction commits. A C-style
-    // union type would be handy. Object is a Tree if entry is ghosted.
-    Object mSharedLockOwnersObj;
+    // LockOwner instance if one shared locker, or else a hashtable for more. Field is re-used
+    // to indicate when an exclusive lock has ghosted an entry, which should be deleted when
+    // the transaction commits. A C-style union type would be handy. Object is a
+    // CursorFrame.Ghost if entry is ghosted.
+    private Object mSharedLockOwnersObj;
 
     // Waiters for upgradable lock. Contains only regular waiters.
-    AltLatchCondition mQueueU;
+    LatchCondition mQueueU;
 
     // Waiters for shared and exclusive locks. Contains regular and shared waiters.
-    AltLatchCondition mQueueSX;
+    LatchCondition mQueueSX;
 
     /**
      * @param locker optional locker
@@ -86,12 +89,12 @@ final class Lock {
      * OWNED_UPGRADABLE, or OWNED_EXCLUSIVE
      * @throws IllegalStateException if too many shared locks
      */
-    LockResult tryLockShared(AltLatch latch, LockOwner locker, long nanosTimeout) {
+    LockResult tryLockShared(Latch latch, Locker locker, long nanosTimeout) {
         if (mOwner == locker) {
             return mLockCount == ~0 ? OWNED_EXCLUSIVE : OWNED_UPGRADABLE;
         }
 
-        AltLatchCondition queueSX = mQueueSX;
+        LatchCondition queueSX = mQueueSX;
         if (queueSX != null) {
             if (nanosTimeout == 0) {
                 locker.mWaitingFor = this;
@@ -106,7 +109,7 @@ final class Lock {
                 locker.mWaitingFor = this;
                 return TIMED_OUT_LOCK;
             }
-            mQueueSX = queueSX = new AltLatchCondition();
+            mQueueSX = queueSX = new LatchCondition();
         }
 
         locker.mWaitingFor = this;
@@ -117,8 +120,14 @@ final class Lock {
             int w = queueSX.awaitShared(latch, nanosTimeout, nanosEnd);
             queueSX = mQueueSX;
 
+            if (queueSX == null) {
+                // Assume LockManager was closed.
+                locker.mWaitingFor = null;
+                return INTERRUPTED;
+            }
+
             // After consuming one signal, next shared waiter must be signaled, and so on.
-            if (queueSX != null && !queueSX.signalNextShared()) {
+            if (!queueSX.signalNextShared()) {
                 // Indicate that last signal has been consumed, and also free memory.
                 mQueueSX = null;
             }
@@ -151,10 +160,6 @@ final class Lock {
             if (nanosTimeout >= 0 && (nanosTimeout = nanosEnd - System.nanoTime()) <= 0) {
                 return TIMED_OUT_LOCK;
             }
-
-            if (mQueueSX == null) {
-                mQueueSX = queueSX = new AltLatchCondition();
-            }
         }
     }
 
@@ -166,7 +171,7 @@ final class Lock {
      * @return ILLEGAL, INTERRUPTED, TIMED_OUT_LOCK, ACQUIRED,
      * OWNED_UPGRADABLE, or OWNED_EXCLUSIVE
      */
-    LockResult tryLockUpgradable(AltLatch latch, Locker locker, long nanosTimeout) {
+    LockResult tryLockUpgradable(Latch latch, Locker locker, long nanosTimeout) {
         if (mOwner == locker) {
             return mLockCount == ~0 ? OWNED_EXCLUSIVE : OWNED_UPGRADABLE;
         }
@@ -185,7 +190,7 @@ final class Lock {
             }
         }
 
-        AltLatchCondition queueU = mQueueU;
+        LatchCondition queueU = mQueueU;
         if (queueU != null) {
             if (nanosTimeout == 0) {
                 locker.mWaitingFor = this;
@@ -201,7 +206,7 @@ final class Lock {
                 locker.mWaitingFor = this;
                 return TIMED_OUT_LOCK;
             }
-            mQueueU = queueU = new AltLatchCondition();
+            mQueueU = queueU = new LatchCondition();
         }
 
         locker.mWaitingFor = this;
@@ -212,7 +217,13 @@ final class Lock {
             int w = queueU.await(latch, nanosTimeout, nanosEnd);
             queueU = mQueueU;
 
-            if (queueU != null && queueU.isEmpty()) {
+            if (queueU == null) {
+                // Assume LockManager was closed.
+                locker.mWaitingFor = null;
+                return INTERRUPTED;
+            }
+
+            if (queueU.isEmpty()) {
                 // Indicate that last signal has been consumed, and also free memory.
                 mQueueU = null;
             }
@@ -265,10 +276,6 @@ final class Lock {
             if (nanosTimeout >= 0 && (nanosTimeout = nanosEnd - System.nanoTime()) <= 0) {
                 return TIMED_OUT_LOCK;
             }
-
-            if (mQueueU == null) {
-                mQueueU = queueU = new AltLatchCondition();
-            }
         }
     }
 
@@ -280,13 +287,13 @@ final class Lock {
      * @return ILLEGAL, INTERRUPTED, TIMED_OUT_LOCK, ACQUIRED, UPGRADED, or
      * OWNED_EXCLUSIVE
      */
-    LockResult tryLockExclusive(AltLatch latch, Locker locker, long nanosTimeout) {
+    LockResult tryLockExclusive(Latch latch, Locker locker, long nanosTimeout) {
         final LockResult ur = tryLockUpgradable(latch, locker, nanosTimeout);
         if (!ur.isHeld() || ur == OWNED_EXCLUSIVE) {
             return ur;
         }
 
-        AltLatchCondition queueSX = mQueueSX;
+        LatchCondition queueSX = mQueueSX;
         if (queueSX != null) {
             if (nanosTimeout == 0) {
                 if (ur == ACQUIRED) {
@@ -307,7 +314,7 @@ final class Lock {
                 locker.mWaitingFor = this;
                 return TIMED_OUT_LOCK;
             }
-            mQueueSX = queueSX = new AltLatchCondition();
+            mQueueSX = queueSX = new LatchCondition();
         }
 
         locker.mWaitingFor = this;
@@ -318,7 +325,13 @@ final class Lock {
             int w = queueSX.await(latch, nanosTimeout, nanosEnd);
             queueSX = mQueueSX;
 
-            if (queueSX != null && queueSX.isEmpty()) {
+            if (queueSX == null) {
+                // Assume LockManager was closed.
+                locker.mWaitingFor = null;
+                return INTERRUPTED;
+            }
+
+            if (queueSX.isEmpty()) {
                 // Indicate that last signal has been consumed, and also free memory.
                 mQueueSX = null;
             }
@@ -354,10 +367,6 @@ final class Lock {
             if (nanosTimeout >= 0 && (nanosTimeout = nanosEnd - System.nanoTime()) <= 0) {
                 return TIMED_OUT_LOCK;
             }
-
-            if (mQueueSX == null) {
-                mQueueSX = queueSX = new AltLatchCondition();
-            }
         }
     }
 
@@ -368,7 +377,7 @@ final class Lock {
      */
     private void unlockUpgradable() {
         mOwner = null;
-        AltLatchCondition queueU = mQueueU;
+        LatchCondition queueU = mQueueU;
         if (queueU != null) {
             // Signal at most one upgradable lock waiter.
             queueU.signal();
@@ -387,7 +396,7 @@ final class Lock {
             deleteGhost(ht);
 
             mOwner = null;
-            AltLatchCondition queueU = mQueueU;
+            LatchCondition queueU = mQueueU;
             int count = mLockCount;
 
             if (count != ~0) {
@@ -404,7 +413,7 @@ final class Lock {
             } else {
                 // Unlocking an exclusive lock.
                 mLockCount = 0;
-                AltLatchCondition queueSX = mQueueSX;
+                LatchCondition queueSX = mQueueSX;
                 if (queueSX == null) {
                     if (queueU == null) {
                         // Lock is now completely unused.
@@ -453,7 +462,7 @@ final class Lock {
 
             mLockCount = --count;
 
-            AltLatchCondition queueSX = mQueueSX;
+            LatchCondition queueSX = mQueueSX;
             if (count == 0x80000000) {
                 if (queueSX != null) {
                     // Signal any exclusive lock waiter. Queue shouldn't contain any shared
@@ -478,12 +487,12 @@ final class Lock {
      * @param latch briefly released and re-acquired for deleting a ghost
      * @throws IllegalStateException if lock not held or too many shared locks
      */
-    void unlockToShared(LockOwner locker, AltLatch latch) {
+    void unlockToShared(LockOwner locker, Latch latch) {
         if (mOwner == locker) {
             deleteGhost(latch);
 
             mOwner = null;
-            AltLatchCondition queueU = mQueueU;
+            LatchCondition queueU = mQueueU;
             int count = mLockCount;
 
             if (count != ~0) {
@@ -497,7 +506,7 @@ final class Lock {
             } else {
                 // Unlocking exclusive lock into shared.
                 addSharedLockOwner(0, locker);
-                AltLatchCondition queueSX = mQueueSX;
+                LatchCondition queueSX = mQueueSX;
                 if (queueSX != null) {
                     if (queueU != null) {
                         // Signal at most one upgradable lock waiter, and keep the latch.
@@ -530,7 +539,7 @@ final class Lock {
      * @param latch briefly released and re-acquired for deleting a ghost
      * @throws IllegalStateException if lock not held
      */
-    void unlockToUpgradable(LockOwner locker, AltLatch latch) {
+    void unlockToUpgradable(LockOwner locker, Latch latch) {
         if (mOwner != locker) {
             String message = "Exclusive or upgradable lock not held";
             if (mLockCount == 0 || !isSharedLockOwner(locker)) {
@@ -545,7 +554,7 @@ final class Lock {
         }
         deleteGhost(latch);
         mLockCount = 0x80000000;
-        AltLatchCondition queueSX = mQueueSX;
+        LatchCondition queueSX = mQueueSX;
         if (queueSX == null || !queueSX.signalSharedRelease(latch)) {
             latch.releaseExclusive();
         }
@@ -554,7 +563,7 @@ final class Lock {
     /**
      * @param latch might be briefly released and re-acquired
      */
-    void deleteGhost(AltLatch latch) {
+    void deleteGhost(Latch latch) {
         // TODO: Unlock due to rollback can be optimized. It never needs to actually delete
         // ghosts, because the undo actions replaced them.
 
@@ -563,14 +572,15 @@ final class Lock {
             return;
         }
 
+        final CursorFrame.Ghost frame = (CursorFrame.Ghost) obj;
+        mSharedLockOwnersObj = null;
+
         final LocalDatabase db = mOwner.getDatabase();
         if (db == null) {
             // Database was closed.
             return;
         }
 
-        final CursorFrame.Ghost frame = (CursorFrame.Ghost) obj;
-        mSharedLockOwnersObj = null;
         byte[] key = mKey;
         boolean unlatched = false;
 
@@ -753,13 +763,46 @@ final class Lock {
     }
 
     /**
+     * Must hold exclusive lock to be valid.
+     */
+    void setGhostFrame(CursorFrame.Ghost frame) {
+        mSharedLockOwnersObj = frame;
+    }
+
+    void setSharedLockOwner(LockOwner owner) {
+        mSharedLockOwnersObj = owner;
+    }
+
+    /**
+     * Is null, a LockOwner, a LockOwnerHTEntry[], or a CursorFrame.Ghost.
+     */
+    Object getSharedLockOwner() {
+        return mSharedLockOwnersObj;
+    }
+
+    /**
+     * @param lockType TYPE_SHARED, TYPE_UPGRADABLE, or TYPE_EXCLUSIVE
+     */
+    void detectDeadlock(Locker locker, int lockType, long nanosTimeout)
+        throws DeadlockException
+    {
+        DeadlockDetector detector = new DeadlockDetector(locker);
+        if (detector.scan()) {
+            Object att = findOwnerAttachment(locker, lockType);
+            throw new DeadlockException(nanosTimeout, att,
+                                        detector.mGuilty,
+                                        detector.newDeadlockSet(lockType));
+        }
+    }
+
+    /**
      * Find an exclusive owner attachment, or the first found shared owner attachment. Might
      * acquire and release a shared latch to access the shared owner attachment.
      *
      * @param locker pass null if already latched
      * @param lockType TYPE_SHARED, TYPE_UPGRADABLE, or TYPE_EXCLUSIVE
      */
-    Object findOwnerAttachment(Locker locker, int lockType, int hash) {
+    Object findOwnerAttachment(Locker locker, int lockType) {
         // See note in DeadlockDetector regarding unlatched access to this Lock.
 
         LockOwner owner = mOwner;
@@ -789,10 +832,10 @@ final class Lock {
                 // Need a latch to safely check the shared lock owner hashtable.
                 LockManager manager = locker.mManager;
                 if (manager != null) {
-                    LockManager.LockHT ht = manager.getLockHT(hash);
+                    LockManager.LockHT ht = manager.getLockHT(mHashCode);
                     ht.acquireShared();
                     try {
-                        return findOwnerAttachment(null, lockType, hash);
+                        return findOwnerAttachment(null, lockType);
                     } finally {
                         ht.releaseShared();
                     }
